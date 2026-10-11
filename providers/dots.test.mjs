@@ -426,12 +426,14 @@ test("live same-session concurrent asks attach without a second enqueue", () => 
 }))
 
 test("tunnel down includes only bounded redacted child output", () => withTunnel(async ({ tunnel }) => {
-  tunnel.command = [process.execPath, "-e", 'const crypto = require("node:crypto"); console.error("connection failed\\nhttps://private-edge.trycloudflare.com/mcp/" + crypto.randomBytes(24).toString("base64url") + " Bearer " + crypto.randomBytes(32).toString("hex") + "\\u001b[31m timeout"); process.exit(1)']
+  const secret = mintToken()
+  tunnel.command = [process.execPath, "-e", 'require("node:fs").writeSync(2, "connection failed\\n".repeat(1000) + process.argv[1] + "\\nhttps://private-edge.trycloudflare.com/mcp/" + process.argv[1] + "\\nBearer " + process.argv[1] + "\\u001b[31m\\nconnection failed"); process.exit(1)', secret]
   tunnel.fetcher = async () => ({ status: 502 })
   let failure
   try { await tunnel.start() } catch (error) { failure = error }
   expect(Boolean(failure)).toBe(true)
   expect(failure.message).toContain("connection failed")
+  expect(failure.message.includes(secret)).toBe(false)
   expect(failure.message.includes("trycloudflare.com")).toBe(false)
   expect(/[A-Za-z0-9_-]{24,}/.test(failure.message)).toBe(false)
   expect(/[\x00-\x1f\x7f-\x9f]/.test(failure.message)).toBe(false)
@@ -476,7 +478,7 @@ for (const scenario of ["split", "truncated", "controls", "ansi", "cookie", "bou
   } else if (scenario === "cookie") {
     child.stderr.emit("data", Buffer.from("connection failed\nCookie: session=" + secret.slice(0, 10) + "; access_token=" + secret.slice(10) + "\ntimeout"))
   } else if (scenario === "bounded") {
-    child.stderr.emit("data", Buffer.from("connection failed\n".repeat(1000)))
+    child.stderr.emit("data", Buffer.from("connection failed\n".repeat(1000) + secret))
   } else {
     tunnel.fetcher = async () => ({ status: 200 })
     child.stderr.emit("data", Buffer.from("connection failed\n" + publicUrl))
@@ -549,8 +551,38 @@ for (const text of [
 
 test("wrapped token with label on second half is redacted", async () => {
   const secret = mintToken(), halves = [secret.slice(0, 16), secret.slice(16)]
-  const message = await diagnosticMessage(halves[0] + "\nBearer " + halves[1])
+  const message = await diagnosticMessage(halves[0] + "\ntoken=" + halves[1])
   expect(halves.some(part => message.includes(part))).toBe(false)
+})
+
+for (const shape of ["token-second", "secret-second", "connection-first", "connection-first-tail", "token-first", "connection-second", "internal-equals", "padded-base64", "short-credential", "bare-label", "credential-bridge"]) test(`equals secret regression ${shape}`, async () => {
+  const secret = mintToken(), halves = [secret.slice(0, 16), secret.slice(16)]
+  let fragments = halves
+  const inputs = {
+    "token-second": halves[0] + "\ntoken=" + halves[1],
+    "secret-second": halves[0] + "\nsecret=" + halves[1],
+    "connection-first": "connection=" + halves.join("\n"),
+    "connection-first-tail": "connection=" + halves.join("\n") + "\nlocation=lax01",
+    "token-first": "token=" + halves.join("\n"),
+    "connection-second": halves[0] + "\nconnection=" + halves[1],
+    "internal-equals": halves[0].slice(0, 8).replace(/[^A-Za-z]/g, "a") + "=" + halves[0].slice(9) + "\n" + halves[1],
+    "padded-base64": Buffer.from(secret.slice(0, 16)).toString("base64").match(/.{1,12}/g).join("\n"),
+    "short-credential": secret.slice(0, 24) + "\naccess_token=" + secret.slice(24),
+    "bare-label": halves[0] + "\nBearer " + halves[1],
+    "credential-bridge": halves[0] + "\nkey=" + secret.slice(16, 20).toLowerCase() + "\n" + secret.slice(20),
+  }
+  if (shape === "internal-equals") fragments = [inputs[shape].slice(0, 8), halves[0].slice(9), halves[1]]
+  if (shape === "padded-base64") fragments = inputs[shape].split("\n")
+  if (shape === "credential-bridge") fragments = [halves[0], secret.slice(20)]
+  if (shape === "short-credential") fragments = [secret.slice(0, 24), secret.slice(24)]
+  const message = await diagnosticMessage(inputs[shape])
+  expect(fragments.some(part => message.includes(part))).toBe(false)
+})
+
+for (const width of [18, 19, 20, 21]) test(`isolated diagnostic floor ${width}`, async () => {
+  let secret
+  do { secret = mintToken().slice(0, width) } while (!/[A-Z0-9]/.test(secret))
+  expect((await diagnosticMessage(secret)).includes(secret)).toBe(width < 20)
 })
 
 test("metadata values still redact standalone long tokens", async () => {
@@ -579,7 +611,7 @@ test("Dot error is quoted as untrusted and has no terminal controls", () => with
   expect(message.includes('Untrusted Dot error: "Dots: not set up')).toBe(true)
 }))
 
-test("Dot Unicode format controls are stripped while multilingual text survives", () => withProvider(async ({ plugin, auth }) => {
+test("Dot bidi and line controls are replaced while multilingual text survives", () => withProvider(async ({ plugin, auth }) => {
   const driver = plugin._internal.driver, run = await driver.create(auth, { prompt: "unicode" })
   const queue = plugin._internal.resources.get(auth.dot_token).queue
   const lease = queue.claim(run.ref)
@@ -587,7 +619,26 @@ test("Dot Unicode format controls are stripped while multilingual text survives"
   queue.release(run.ref, lease.lease_token, false, text + String.fromCodePoint(0x202e, 0x2066, 0x2028, 0x2029))
   const outcome = await driver.poll(auth, run)
   expect(/[\p{Cf}\p{Zl}\p{Zp}]/u.test(outcome.progress)).toBe(false)
-  expect(outcome.progress).toBe("Untrusted Dot error: " + JSON.stringify(text))
+  expect(outcome.progress).toBe("Untrusted Dot error: " + JSON.stringify(text + "    "))
+}))
+
+for (const [name, text] of [
+  ["Devanagari ZWJ", "क्‍ष"], ["Arabic ZWNJ", "عرب‌ية"],
+  ["emoji ZWJ", "\u{1f469}‍\u{1f469}‍\u{1f467}"], ["soft hyphen", "Silben­trennung"],
+  ["Arabic number sign", "؀123"], ["BOM", "﻿message"],
+  ["Persian ZWNJ", "می‌روم"], ["Thai ZWJ", "ก‍ข"],
+]) test(`Dot joining text preserved: ${name}`, () => withProvider(async ({ plugin, auth }) => {
+  const driver = plugin._internal.driver, run = await driver.create(auth, { prompt: "joining text" })
+  const queue = plugin._internal.resources.get(auth.dot_token).queue, lease = queue.claim(run.ref)
+  queue.release(run.ref, lease.lease_token, false, text)
+  expect((await driver.poll(auth, run)).progress).toBe("Untrusted Dot error: " + JSON.stringify(text))
+}))
+
+test("Dot removed controls retain word boundaries", () => withProvider(async ({ plugin, auth }) => {
+  const driver = plugin._internal.driver, run = await driver.create(auth, { prompt: "boundaries" })
+  const queue = plugin._internal.resources.get(auth.dot_token).queue, lease = queue.claim(run.ref)
+  queue.release(run.ref, lease.lease_token, false, "safe‮Dots: not set up evil")
+  expect((await driver.poll(auth, run)).progress).toBe('Untrusted Dot error: "safe Dots: not set up evil"')
 }))
 
 describe("Dots queue", () => {

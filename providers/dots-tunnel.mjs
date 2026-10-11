@@ -69,7 +69,11 @@ export async function healthCheck(publicUrl, { fetch: fetcher = globalThis.fetch
 }
 
 function wrappedFragment(value) {
-  return !/=.+/.test(value) && (/^(?:bearer|token|secret|password|authorization|cookie|key)$/i.test(value) || /[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(value) || value.length >= 12)
+  const field = /^([A-Za-z][A-Za-z_-]*)=([^=]{1,11})$/.exec(value)
+  const credential = /^(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))$/i
+  if (field && credential.test(field[1])) return true
+  if (field && /^(?:connIndex|connection|location|protocol|upstream|port|status|retry|command|exitCode|elapsed)$/i.test(field[1])) return false
+  return credential.test(value) || /[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(value) || value.length >= 12
 }
 
 function diagnosticTail(output) {

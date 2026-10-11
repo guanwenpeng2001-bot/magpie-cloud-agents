@@ -91,7 +91,7 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
       const task = resource.queue.get(run.ref)
       if (!task) return { state: "failed", progress: "Dots: the task record is gone; asking again sends it as a new task" }
       if (task.status === "completed") return { state: "succeeded", text: task.result.content }
-      if (task.status === "failed" || task.status === "cancelled") return { state: "failed", progress: task.error ? "Untrusted Dot error: " + JSON.stringify(task.error.replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")) : "task cancelled" }
+      if (task.status === "failed" || task.status === "cancelled") return { state: "failed", progress: task.error ? "Untrusted Dot error: " + JSON.stringify(task.error.replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "").replace(/[\p{Cc}\u{061c}\u{200e}\u{200f}\u{2028}-\u{202e}\u{2066}-\u{2069}]/gu, " ")) : "task cancelled" }
       if (task.status === "expired") {
         const message = task.attempts ? "Dots: the Dot took the task but didn't finish; asking again sends it as a new task" : `Dots: no Dot claimed the task within ${ttlMinutes} min. Confirm the connector is added and the account has Dots; asking again sends it as a new task`
         return { state: "failed", progress: message }
