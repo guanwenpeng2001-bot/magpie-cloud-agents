@@ -95,7 +95,7 @@ test("409 agent_id_conflict converts to attach-by-GET and still answers", async 
     const agentId = url.pathname.split("/").at(-1)
     if (request.method === "GET" && /^bc-/.test(agentId)) return Response.json({ id: agentId, status: "IDLE", latestRunId: "run-newer", url: url.origin + "/cursor/agents/" + agentId })
     if (url.pathname.endsWith("/runs")) return Response.json({ items: [{ id: "run-1", createdAt: "2026-01-01T00:00:00Z" }, { id: "run-newer", createdAt: "2026-01-02T00:00:00Z" }] })
-    if (url.pathname.includes("/runs/")) return Response.json({ id: url.pathname.split("/").at(-1), status: "FINISHED", result: url.pathname.endsWith("run-1") ? "Reattached answer" : "Wrong newer answer" })
+    if (url.pathname.includes("/runs/")) return Response.json({ id: url.pathname.split("/").at(-1), agentId: url.pathname.split("/")[4], prompt: { text: url.pathname.endsWith("run-1") ? "Current request:\nFix the failing test" : "Another request" }, status: "FINISHED", result: url.pathname.endsWith("run-1") ? "Reattached answer" : "Wrong newer answer" })
   }, async ({ fetch, server }) => {
     const body = await (await chat(fetch, {}, withSession)).json()
     expect(body.choices[0].message.content).toBe("Reattached answer")
@@ -577,13 +577,15 @@ test("poll transport failures use three attempts before returning 502 kept", asy
   } finally { globalThis.fetch = nativeFetch }
 })
 
-function restartFixture({ firstStatus = "FINISHED", recon = false, active = false } = {}) {
+function restartFixture({ firstStatus = "FINISHED", recon = false, active = false, listing = rows => ({ items: rows }), recordPrompt = true, progress = true } = {}) {
   const agents = new Map(), runs = new Map(), calls = []
   const server = startFakeCloud({ scenario: ({ request, url, body }) => {
     calls.push({ method: request.method, path: url.pathname, body })
     const mint = (agent, prompt) => {
       const run = { id: "owned-" + (runs.size + 1), agentId: agent.id, createdAt: new Date(runs.size * 1000).toISOString(), status: runs.size ? "FINISHED" : firstStatus, result: prompt.includes("Second question") ? "answer-2" : "answer-1" }
       if (run.status !== "FINISHED") run.result = ""
+      if (recordPrompt) run.prompt = { text: prompt }
+      run.url = server.url + "/cursor/agents/" + agent.id + "/runs/" + run.id
       runs.set(run.id, run); agent.latestRunId = run.id; return run
     }
     if (url.pathname.endsWith("/v1/agents") && request.method === "POST") {
@@ -597,13 +599,168 @@ function restartFixture({ firstStatus = "FINISHED", recon = false, active = fals
     if (url.pathname.endsWith("/stream")) return new Response("offline", { status: 503 })
     if (url.pathname.endsWith("/runs")) {
       if (request.method === "POST") return Response.json({ run: mint(agent, body.prompt.text) })
-      return Response.json({ items: [...runs.values()].filter(run => run.agentId === id).reverse() })
+      return Response.json(listing([...runs.values()].filter(run => run.agentId === id).reverse()))
     }
-    if (url.pathname.includes("/runs/")) return Response.json(runs.get(url.pathname.split("/").at(-1)))
+    if (url.pathname.includes("/runs/")) {
+      const run = runs.get(url.pathname.split("/").at(-1))
+      return run ? Response.json(run) : new Response("run not found", { status: 404 })
+    }
     return Response.json(recon ? { id, status: agent.status, name: "agent" } : agent)
   } })
-  return { server, agents, runs, calls, loader: () => makeCursorCloud({ apiBase: { "cursor-cloud": server.url + "/cursor" } }).auth.loader(() => AUTH) }
+  return { server, agents, runs, calls, loader: () => makeCursorCloud({ apiBase: { "cursor-cloud": server.url + "/cursor" }, progress }).auth.loader(() => AUTH) }
 }
+
+test.each([
+  ["markerless creation dropped", rows => ({ items: rows.filter(row => row.id !== "owned-1") })],
+  ["cursor partial page", rows => ({ items: rows.slice(0, 1), cursor: "page-2" })],
+  ["single newest row", rows => [rows[0]]],
+])("ownership recovery never answers another question: %s", async (_name, listing) => {
+  const fixture = restartFixture({ listing })
+  try {
+    const loader = await fixture.loader()
+    const original = [{ role: "user", content: "First question" }]
+    await chat(loader.fetch, { messages: original }, withSession)
+    let history = [...original, { role: "assistant", content: "answer-1" }]
+    for (let index = 0; index < 3; index++) {
+      history.push({ role: "user", content: "Second question " + index })
+      await chat(loader.fetch, { messages: history }, withSession)
+      history.push({ role: "assistant", content: "answer-2" })
+    }
+    const response = await chat((await fixture.loader()).fetch, { messages: original }, withSession)
+    expect(response.status).toBe(200)
+    const content = (await response.json()).choices[0].message.content
+    expect(content).toContain("answer-1")
+    expect(content).not.toContain("answer-2")
+    expect(fixture.runs.size).toBe(5)
+    expect(fixture.runs.get("owned-5").prompt.text).toBe("Current request:\nFirst question")
+  } finally { fixture.server.stop() }
+})
+
+test("ownership recovery discloses billable run and URL in user-visible progress", async () => {
+  const fixture = restartFixture({ listing: () => ({ items: [] }) })
+  try {
+    await chat((await fixture.loader()).fetch, {}, withSession)
+    const response = await chat((await fixture.loader()).fetch, { stream: true }, withSession)
+    const { events } = await streamed(response)
+    const progress = events.flatMap(event => event.choices?.[0]?.delta?.reasoning_content ?? []).join("\n")
+    expect(progress).toContain("previous run cannot be recovered")
+    expect(progress).toContain("new billable run")
+    expect(progress).toContain(fixture.runs.get("owned-2").url)
+  } finally { fixture.server.stop() }
+})
+
+test.each([
+  ["missing creation", rows => ({ items: rows.slice(0, 1) }), true],
+  ["tied timestamps", rows => ({ items: rows.map(row => ({ ...row, createdAt: "2026-01-01T00:00:00Z" })) }), false],
+  ["foreign earliest", rows => ({ items: [{ id: "foreign", createdAt: "2000-01-01T00:00:00Z" }, ...rows] }), false],
+  ["markerless complete", rows => ({ items: rows }), false],
+  ["unknown cursor", rows => ({ items: rows.slice(0, 1), cursor: "more" }), true],
+  ["invalid timestamp", rows => ({ items: rows.map(row => ({ ...row, createdAt: "invalid" })) }), false],
+  ["empty", () => ({ items: [] }), true],
+  ["unknown envelope", rows => ({ data: rows }), true],
+  ["hasMore with owned run", rows => ({ items: rows, hasMore: true }), false],
+  ["null cursor", rows => ({ items: rows, nextCursor: null }), false],
+  ["truncated markerless", rows => ({ runs: rows.slice(0, 1) }), true],
+  ["single owned row", rows => [rows.at(-1)], false],
+])("ownership constructed listing %s", async (_name, listing, recovery) => {
+  const fixture = restartFixture({ listing })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "listing", textsHash: "same" } }
+  const driver = () => _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  try {
+    const first = driver()
+    const created = await first.create(AUTH, input)
+    await first.followUp(AUTH, created, ["Second question"])
+    const attached = await driver().create(AUTH, input)
+    expect(attached.runId).toBe(recovery ? "owned-3" : created.runId)
+    expect(fixture.runs.size).toBe(recovery ? 3 : 2)
+  } finally { fixture.server.stop() }
+})
+
+test.each([
+  ["no prompt", rows => ({ items: rows })],
+  ["single no prompt", rows => [rows[0]]],
+  ["explicit end marker without prompt", rows => ({ items: rows, hasMore: false, nextCursor: null })],
+  ["tied unknown prompts", rows => ({ items: rows.map(row => ({ ...row, createdAt: "same" })) })],
+])("ownership cannot be inferred from %s", async (_name, listing) => {
+  const fixture = restartFixture({ listing, recordPrompt: false })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "unknown", textsHash: "same" } }
+  const driver = () => _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  try {
+    const first = await driver().create(AUTH, input)
+    const recovered = await driver().create(AUTH, input)
+    expect(recovered.runId).not.toBe(first.runId)
+    expect(fixture.runs.size).toBe(2)
+  } finally { fixture.server.stop() }
+})
+
+test("ownership matching list prompt cannot override a different run GET prompt", async () => {
+  const fixture = restartFixture({ listing: rows => ({ items: rows.slice(0, 1).map(row => ({ ...row, prompt: { text: "First question" } })) }) })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "conflicting", textsHash: "same" } }
+  const driver = () => _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  try {
+    const first = driver(), created = await first.create(AUTH, input)
+    await first.followUp(AUTH, created, ["Second question"])
+    expect((await driver().create(AUTH, input)).runId).toBe("owned-3")
+  } finally { fixture.server.stop() }
+})
+
+test.each([true, false])("ownership recovery final answer discloses spend with progress=%s", async progress => {
+  const fixture = restartFixture({ listing: () => ({ items: [] }), progress })
+  try {
+    await chat((await fixture.loader()).fetch, {}, withSession)
+    const content = (await (await chat((await fixture.loader()).fetch, {}, withSession)).json()).choices[0].message.content
+    expect(content).toContain("previous run cannot be recovered")
+    expect(content).toContain("new billable run was started for this message")
+    expect(content).toContain(fixture.runs.get("owned-2").url)
+    expect(content).toContain("answer-1")
+  } finally { fixture.server.stop() }
+})
+
+test("ownership memory keeps in-flight duplicates attached without listing evidence", async () => {
+  const fixture = restartFixture({ firstStatus: "RUNNING", active: true, recordPrompt: false, listing: () => ({ items: [] }) })
+  const driver = _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "memory", textsHash: "same" } }
+  try {
+    const first = await driver.create(AUTH, input)
+    expect((await driver.create(AUTH, input)).runId).toBe(first.runId)
+    expect(fixture.runs.size).toBe(1)
+    expect(fixture.calls.some(call => call.method === "GET" && call.path.endsWith("/runs"))).toBe(false)
+  } finally { fixture.server.stop() }
+})
+
+test("ownership unknown ACTIVE run refuses before billable recovery", async () => {
+  const fixture = restartFixture({ active: true, recordPrompt: false })
+  const driver = () => _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "active", textsHash: "same" } }
+  try {
+    const first = await driver().create(AUTH, input)
+    await expect(driver().create(AUTH, input)).rejects.toMatchObject({ status: 409, message: expect.stringContaining(first.ref) })
+    expect(fixture.runs.size).toBe(1)
+  } finally { fixture.server.stop() }
+})
+
+test("ownership recovered prompt reattaches after another restart without extra spend", async () => {
+  const fixture = restartFixture({ firstStatus: "ERROR" })
+  const driver = () => _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "recovered", textsHash: "same" } }
+  try {
+    await driver().create(AUTH, input)
+    const recovered = await driver().create(AUTH, input)
+    expect((await driver().create(AUTH, input)).runId).toBe(recovered.runId)
+    expect(fixture.runs.size).toBe(2)
+  } finally { fixture.server.stop() }
+})
+
+test("ownership recovery poll alone carries disclosure without stream", async () => {
+  const fixture = restartFixture({ listing: () => ({ items: [] }) })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "poll-only", textsHash: "same" } }
+  const driver = () => _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  try {
+    await driver().create(AUTH, input)
+    const restarted = driver(), run = await restarted.create(AUTH, input)
+    expect((await restarted.poll(AUTH, run)).text).toContain("new billable run")
+  } finally { fixture.server.stop() }
+})
 
 test("F1 older transcript after restart never receives the newer run answer", async () => {
   const fixture = restartFixture()
@@ -624,7 +781,7 @@ test.each(["ERROR", "CANCELLED", "EXPIRED"])("F1 %s can recover on identical re-
     expect((await chat((await fixture.loader()).fetch, {}, withSession)).status).toBe(502)
     const response = await chat((await fixture.loader()).fetch, {}, withSession)
     expect(response.status).toBe(200)
-    expect((await response.json()).choices[0].message.content).toBe("answer-1")
+    expect((await response.json()).choices[0].message.content).toEndWith("\n\nanswer-1")
     expect(fixture.agents.size).toBe(1)
     expect(fixture.runs.size).toBe(2)
   } finally { fixture.server.stop() }
@@ -673,7 +830,7 @@ test.each(["IDLE", "ACTIVE"])("F2 unavailable run list safely degrades for %s ag
     const response = await chat(fetch, {}, withSession)
     expect(response.status).toBe(status === "IDLE" ? 200 : 409)
     expect(posts).toBe(status === "IDLE" ? 1 : 0)
-    if (status === "IDLE") expect((await response.json()).choices[0].message.content).toBe("new answer for requested prompt")
+    if (status === "IDLE") expect((await response.json()).choices[0].message.content).toEndWith("\n\nnew answer for requested prompt")
   })
 })
 test("F4 two archived generations remain bounded at four create POSTs", async () => {

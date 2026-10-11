@@ -85,7 +85,14 @@ function makeDriver(options) {
     if (typeof agent?.id !== "string" || !agent.id || typeof run?.id !== "string" || !run.id) throw chatError(502, "Cursor returned no agent or run identifier")
     return { ref: agent.id, runId: run.id, url: agent.url }
   }
-  const readRun = async (credential, run, signal) => outcome(await json(credential, pathOf(run), { signal }), run)
+  const recoveryNotices = new SessionMap()
+  const noticeFor = (credential, run) => recoveryNotices.get(deadKey(credential, run.ref + "/" + run.runId))
+  const readRun = async (credential, run, signal) => {
+    const result = outcome(await json(credential, pathOf(run), { signal }), run)
+    const notice = noticeFor(credential, run)
+    if (notice && result.state === "succeeded") result.text = notice + "\n\n" + result.text
+    return result
+  }
   const remember = (credential, agent, run) => {
     const attached = runFrom(agent, run)
     requestRuns.set(deadKey(credential, agent.id), attached)
@@ -98,10 +105,15 @@ function makeDriver(options) {
       try { listing = await json(credential, "/v1/agents/" + segment(agent.id) + "/runs", { signal }) }
       catch (error) { if (![404, 405, 501].includes(error.status)) throw error }
       const rows = Array.isArray(listing) ? listing : listing?.items ?? listing?.runs
-      // Only a complete, chronologically unambiguous list identifies the creation run.
-      if (Array.isArray(rows) && rows.length && !listing.nextCursor && !listing.hasMore && rows.every(row => typeof row?.id === "string" && Number.isFinite(Date.parse(row.createdAt)))) {
-        const ordered = [...rows].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
-        if (ordered.length === 1 || Date.parse(ordered[0].createdAt) < Date.parse(ordered[1].createdAt)) original = runFrom(agent, ordered[0])
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          if (typeof row?.id !== "string" || !row.id || (row.agentId !== undefined && row.agentId !== agent.id) || (row.prompt !== undefined && row.prompt?.text !== prompt)) continue
+          const candidate = runFrom(agent, row)
+          let recorded
+          try { recorded = await json(credential, pathOf(candidate), { signal }) }
+          catch (error) { if (error.status === 404) continue; throw error }
+          if (recorded.id === row.id && recorded.agentId === agent.id && recorded.prompt?.text === prompt) { original = candidate; break }
+        }
       }
     }
     if (original) {
@@ -110,7 +122,10 @@ function makeDriver(options) {
     }
     if (agent.status !== "IDLE") throw chatError(409, "this Cursor agent is still working on the previous request — wait for it, or cancel it at " + (agent.url || agent.id))
     const data = await json(credential, "/v1/agents/" + segment(agent.id) + "/runs", { method: "POST", body: JSON.stringify({ prompt: { text: prompt } }), signal })
-    return remember(credential, agent, data.run)
+    const attached = remember(credential, agent, data.run)
+    const location = typeof data.run.url === "string" && data.run.url ? data.run.url : (agent.url ? agent.url + " (run " + attached.runId + ")" : attached.runId)
+    recoveryNotices.set(deadKey(credential, attached.ref + "/" + attached.runId), "The previous run cannot be recovered; a new billable run was started for this message — " + location)
+    return attached
   }
   return {
     id: ID, name: NAME, staticModels: MODELS, methods,
@@ -170,6 +185,8 @@ function makeDriver(options) {
     },
     poll: readRun,
     async stream(credential, run, emit, signal) {
+      const notice = noticeFor(credential, run)
+      if (notice) emit(notice)
       let lastEventId = ""
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
