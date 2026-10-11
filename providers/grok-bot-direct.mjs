@@ -71,7 +71,6 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
   const fetcher = dependencies.fetch ?? globalThis.fetch
   const now = dependencies.now ?? Date.now
   const uuid = dependencies.randomUUID ?? randomUUID
-  const sessionId = uuid()
   let disposed = false
   const safeMessage = (message, token) => String(message).split(new TextDecoder().decode(token)).join("[redacted]")
   const request = async (method, body, signal, retryAuth = true) => {
@@ -125,18 +124,18 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     if (!Array.isArray(result.agents)) throw protocolError("Invalid bot list response")
     return result.agents.filter(record).map(agent => ({ id: agent.agentId ?? agent.agent_id ?? agent.id, name: agent.name })).filter(agent => typeof agent.id === "string" && agent.id && typeof agent.name === "string")
   }
-  const tail = async (agentId, session, signal) => {
-    const result = await request("ListGrokBotTranscriptEntries", { agent_id: agentId, limit: 50, session_id: session }, signal)
+  const tail = async (agentId, signal) => {
+    const result = await request("ListGrokBotTranscriptEntries", { agent_id: agentId, limit: 50 }, signal)
     if (!Array.isArray(result.entries)) throw protocolError("Invalid transcript response")
     return result.entries
   }
-  const send = async (agentId, session, prompt, identity, signal) => {
-    const baseline = await tail(agentId, session, signal)
+  const send = async (agentId, prompt, identity, signal) => {
+    const baseline = await tail(agentId, signal)
     const messageId = identity?.key ? createHash("sha256").update(identity.key).digest("hex").replace(/^(.{8})(.{4})(.{4})(.{4})(.{12}).*$/, "$1-$2-$3-$4-$5") : uuid()
-    const response = await request("SendGrokBotUserMessage", { agent_id: agentId, message_id: messageId, text: prompt, sent_at_ms: String(now()), is_fork: false, session_id: session }, signal)
+    const response = await request("SendGrokBotUserMessage", { agent_id: agentId, message_id: messageId, text: prompt, sent_at_ms: String(now()), is_fork: false }, signal)
     if (response.refusal || response.delivery === 4 || response.delivery === "REFUSED") throw protocolError(response.refusal?.message ?? "Message refused")
     if (response.dispatched !== true && ![1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE"].includes(response.delivery)) throw protocolError("Message dispatch was not acknowledged")
-    return { url: agentId, ref: { agentId, messageId, sessionId: session }, view: { baseline: new Set(baseline.map(row => row.entryId ?? row.entry_id ?? String(row.seq))), stable: undefined } }
+    return { url: agentId, ref: { agentId, messageId }, view: { baseline: new Set(baseline.map(row => row.entryId ?? row.entry_id ?? String(row.seq))), stable: undefined } }
   }
   const driver = {
     id: "grok-bot", name: "Grok Bot direct", staticModels: { "app-bot": { name: "App bot", tool_call: false } },
@@ -144,7 +143,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     async verify({ signal, retryAuth = true } = {}) { return list(signal, retryAuth) },
     async liveModels(credential, signal) { return Object.fromEntries((await list(signal)).map(agent => [agent.id, { name: agent.name, tool_call: false }])) },
     authorize() {
-      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first. If bot status is unavailable or a stale running row is demoted, completion falls back to transcript stability: a paused bot's partial answer may be delivered as final when its transcript stops growing. A flat idle reading is not trusted while the bot's nested live state still shows work in progress. The live status response itself has not been observed from the server, so that reading follows the app's own schema.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first. If bot status is unavailable or a stale running row is demoted, completion falls back to transcript stability: a paused bot's partial answer may be delivered as final when its transcript stops growing. A flat idle reading is not trusted while the bot's nested live state still shows work in progress. Observed status rows contain only agentId and client, without live or is_running, so completion uses the transcript stability fallback for those rows.", callback: async () => {
         try {
           await store.get()
           return { type: "success", refresh: "dpapi-derive", access: "derived-in-memory", expires: 0, accountId: "grok-bot-direct" }
@@ -158,23 +157,19 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
         if (agents.length !== 1) throw chatError(400, "Grok Bot direct: select a bot from the model list", "kept")
         agentId = agents[0].id
       }
-      return send(agentId, sessionId, prompt, identity, signal)
+      return send(agentId, prompt, identity, signal)
     },
     async followUp(credential, run, suffix, signal) {
-      return send(run.ref.agentId, run.ref.sessionId, suffix.join("\n\n"), undefined, signal)
+      return send(run.ref.agentId, suffix.join("\n\n"), undefined, signal)
     },
     async poll(credential, run, signal) {
-      const { agentId, messageId, sessionId: session } = run.ref
-      const status = await request("GetGrokBotSendStatus", { agent_id: agentId, message_id: messageId, session_id: session }, signal)
+      const { agentId, messageId } = run.ref
+      const status = await request("GetGrokBotSendStatus", { agent_id: agentId, message_id: messageId }, signal)
       if ([3, "REJECTED"].includes(status.status)) throw protocolError(status.rejectionCode ?? status.rejection_code ?? "Message rejected")
       let running, stale = false
       try {
         const result = await request("ListGrokBotAgentStatuses", { agent_ids: [agentId] }, signal, false)
-        const matches = Array.isArray(result.statuses) ? result.statuses.filter(row => {
-          if (!record(row) || (row.agentId ?? row.agent_id) !== agentId) return false
-          const rowSession = row.live?.sessionId ?? row.live?.session_id
-          return rowSession == null || rowSession === "" || rowSession === session
-        }) : []
+        const matches = Array.isArray(result.statuses) ? result.statuses.filter(row => record(row) && (row.agentId ?? row.agent_id) === agentId) : []
         run.view.seen ??= {}
         const states = matches.map(row => liveActivity(row, now(), run.view.seen))
         stale = states.some(state => state.stale)
@@ -184,7 +179,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
         if (signal?.aborted) throw signal.reason
         if (error?.status === 401 || error?.signIn === "expired") throw error
       }
-      const entries = await tail(agentId, session, signal)
+      const entries = await tail(agentId, signal)
       const echoId = status.echoEntryId ?? status.echo_entry_id
       const ordered = entries.filter(record).slice().sort((left, right) => {
         try { const difference = BigInt(left.seq) - BigInt(right.seq); return difference < 0n ? -1 : difference > 0n ? 1 : 0 } catch { return 0 }
@@ -203,7 +198,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       run.view.stable = accepted && text ? fingerprint : undefined
       return { state: "running", progress: running === undefined ? `Grok Bot direct: ${stale ? "stale running status demoted" : "status unavailable"}; using transcript stability — a paused bot's partial answer may be delivered as final` : "Grok Bot direct: waiting for the bot" }
     },
-    async cancel(credential, run) { await request("InterruptGrokBotAgentRun", { agent_id: run.ref.agentId, reason: "user-cancel", session_id: run.ref.sessionId }) },
+    async cancel(credential, run) { await request("InterruptGrokBotAgentRun", { agent_id: run.ref.agentId, reason: "user-cancel" }) },
     dispose() { disposed = true; store.dispose() },
   }
   driver.methods = [{ type: "oauth", label: "Direct Connect protocol (reads the app's local sign-in)", authorize: driver.authorize }]

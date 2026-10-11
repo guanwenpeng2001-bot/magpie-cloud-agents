@@ -221,6 +221,49 @@ test("transcript extraction rejects malformed, tool and peer rows", () => {
   for (const row of [null, {}, { body: "%%%" }, { body: Buffer.from("{").toString("base64") }, entry(1, []), entry(1, { kind: "message", content: "unknown" }), entry(1, { kind: "message", role: "assistant", fromAgent: {}, content: "peer" }), entry(1, { kind: "send-message", message: { type: "tool-call", content: "tool" } })]) expect(transcriptEntry(row)).toBeNull()
 })
 
+for (const method of ["ListGrokBotTranscriptEntries", "SendGrokBotUserMessage", "GetGrokBotSendStatus", "InterruptGrokBotAgentRun"]) test(`room-scoped exact body: ${method}`, async () => {
+  const { driver, calls } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: [] } : method === "GetGrokBotSendStatus" ? { status: 2 } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  await driver.poll({}, run)
+  await driver.cancel({}, run)
+  const expected = {
+    ListGrokBotTranscriptEntries: { agent_id: "bot-one", limit: 50 },
+    SendGrokBotUserMessage: { agent_id: "bot-one", message_id: "fixture-session", text: "question", sent_at_ms: "1723456789000", is_fork: false },
+    GetGrokBotSendStatus: { agent_id: "bot-one", message_id: "fixture-session" },
+    InterruptGrokBotAgentRun: { agent_id: "bot-one", reason: "user-cancel" },
+  }
+  for (const call of calls.filter(call => call.url.endsWith(method))) {
+    expect(call.body).toEqual(expected[method])
+    expect(Object.hasOwn(call.body, "session_id")).toBe(false)
+  }
+})
+
+test("randomUUID is used only for messages, never for a session", async () => {
+  let generated = 0
+  const { driver, calls } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: [] } : { dispatched: true }, {}, { randomUUID: () => `message-${++generated}` })
+  expect(generated).toBe(0)
+  const run = await driver.create({}, { model: "bot-one", prompt: "question", identity: { key: "stable-identity" } })
+  expect(generated).toBe(0)
+  const next = await driver.followUp({}, run, ["next question"])
+  expect(generated).toBe(1)
+  expect(next.ref).toEqual({ agentId: "bot-one", messageId: "message-1" })
+  for (const call of calls) expect(Object.hasOwn(call.body, "session_id")).toBe(false)
+})
+
+test("observed client-only status requires a stable room transcript", async () => {
+  let rows = [assistant(1, "old answer")]
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", client: {} }] } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  for (let poll = 0; poll < 2; poll++) expect((await driver.poll({}, run)).state).toBe("running")
+  rows.push(assistant(2, "partial"))
+  expect((await driver.poll({}, run)).state).toBe("running")
+  rows[1] = assistant(2, "partial answer growing")
+  expect((await driver.poll({}, run)).state).toBe("running")
+  rows.push(assistant(3, "complete answer"))
+  expect((await driver.poll({}, run)).state).toBe("running")
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "complete answer" })
+})
+
 test("send fields, two stable polls, multi-turn same bot and cancel", async () => {
   let rows = [assistant(1, "old reply")]
   const { driver, calls } = harness(method => {
@@ -231,7 +274,7 @@ test("send fields, two stable polls, multi-turn same bot and cancel", async () =
   })
   const run = await driver.create({}, { model: "bot-one", prompt: "question", identity: { key: "stable-identity" } })
   const sent = calls.find(call => call.url.endsWith("SendGrokBotUserMessage")).body
-  expect(Object.keys(sent).sort()).toEqual(["agent_id", "message_id", "text", "sent_at_ms", "is_fork", "session_id"].sort())
+  expect(Object.keys(sent).sort()).toEqual(["agent_id", "message_id", "text", "sent_at_ms", "is_fork"].sort())
   expect(sent.agent_id).toBe("bot-one"); expect(sent.text).toBe("question")
   expect(sent.sent_at_ms).toBe("1723456789000"); expect(sent.is_fork).toBe(false)
   expect((await driver.poll({}, run)).state).toBe("running")
@@ -242,12 +285,12 @@ test("send fields, two stable polls, multi-turn same bot and cancel", async () =
   expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "changed reply" })
   const next = await driver.followUp({}, run, ["next question"])
   expect(calls.filter(call => call.url.endsWith("SendGrokBotUserMessage")).at(-1).body.text).toBe("next question")
-  expect(next.ref.agentId).toBe(run.ref.agentId); expect(next.ref.sessionId).toBe(run.ref.sessionId)
+  expect(next.ref.agentId).toBe(run.ref.agentId)
   expect((await driver.poll({}, next)).state).toBe("running")
   await driver.cancel({}, next)
-  expect(calls.at(-1).body).toEqual({ agent_id: "bot-one", reason: "user-cancel", session_id: "fixture-session" })
-  expect(calls.find(call => call.url.endsWith("GetGrokBotSendStatus")).body).toEqual({ agent_id: "bot-one", message_id: run.ref.messageId, session_id: "fixture-session" })
-  expect(calls[0].body).toEqual({ agent_id: "bot-one", limit: 50, session_id: "fixture-session" })
+  expect(calls.at(-1).body).toEqual({ agent_id: "bot-one", reason: "user-cancel" })
+  expect(calls.find(call => call.url.endsWith("GetGrokBotSendStatus")).body).toEqual({ agent_id: "bot-one", message_id: run.ref.messageId })
+  expect(calls[0].body).toEqual({ agent_id: "bot-one", limit: 50 })
 })
 
 test("pending cannot finish; rejected status maps to exact protocol error", async () => {
@@ -489,7 +532,7 @@ for (const [name, live] of nestedBusy.filter(([name]) => name !== "live.isRunnin
   for (let poll = 0; poll < 3; poll++) expect((await driver.poll({}, run)).state).toBe("running")
 })
 
-for (const sessionField of ["sessionId", "session_id"]) test(`foreign ${sessionField} cannot override this run's idle row`, async () => {
+for (const sessionField of ["sessionId", "session_id"]) test(`agent-wide busy row applies regardless of ${sessionField}`, async () => {
   let rows = []
   const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [
     { agentId: "bot-one", isRunning: true, live: { [sessionField]: "other-session", isRunning: true, updatedAtMs: "1" } },
@@ -498,7 +541,7 @@ for (const sessionField of ["sessionId", "session_id"]) test(`foreign ${sessionF
   ] } : { dispatched: true })
   const run = await driver.create({}, { model: "bot-one", prompt: "question" })
   rows = [assistant(1, "answer")]
-  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "answer" })
+  for (let poll = 0; poll < 2; poll++) expect((await driver.poll({}, run)).state).toBe("running")
 })
 
 for (const flat of [false, true]) test(`stale running with flat ${flat} demotes while fresh idle still wins`, async () => {
