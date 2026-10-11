@@ -1,8 +1,8 @@
 // Behavioral pins for the OAuth clauses scripts/check.mjs enforces under --stubs.
 //
-// Each test builds a temporary fixture tree outside the repository — a full copy
-// of the package (index.mjs, providers/, lib/, scripts/, package.json) with one
-// provider module replaced — and runs the repository's own gate from that copy
+// Each test builds a temporary fixture tree with a fixed provider roster and
+// matching EXPECTED membership, independent of new production providers.
+// It replaces selected provider modules and runs the repository's gate copy
 // against the fixture, asserting the gate's exit status and message. The gate
 // reads its own location, so the copy of scripts/check.mjs inside the fixture
 // tree is the gate under test; deleting a clause from it changes what these
@@ -16,7 +16,7 @@
 // the gate process. No test writes into the repository.
 
 import { describe, test, expect, afterEach } from "bun:test"
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -24,6 +24,13 @@ import { fileURLToPath } from "node:url"
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url))
 const fixtureDirs = []
+const fixturePlugins = {
+  CodexCloudPlugin: ["codex-cloud", "makeCodexCloud", "options ?? {}"],
+  CodexAgentsPlugin: ["codex-agents", "makeCodexAgents", "options ?? {}"],
+  CursorCloudPlugin: ["cursor-cloud", "makeCursorCloud", "options ?? {}"],
+  DevinCloudPlugin: ["devin-cloud", "makeDevinCloud", "options ?? {}"],
+  GrokBotPlugin: ["grok-bot", "makeGrokBotDriver", "input, options ?? {}"],
+}
 
 const GATE_ENV = {
   ...process.env,
@@ -35,11 +42,20 @@ const GATE_ENV = {
 async function buildFixtureTree(replacements) {
   const dir = await mkdtemp(join(tmpdir(), "gate-clause-pin-"))
   fixtureDirs.push(dir)
-  await cp(join(repoRoot, "index.mjs"), join(dir, "index.mjs"))
+  await writeFile(join(dir, "index.mjs"), Object.entries(fixturePlugins).map(([plugin, [id, factory, args]]) =>
+    `import { ${factory} } from "./providers/${id}.mjs"\nexport async function ${plugin}(input, options) { return ${factory}(${args}) }`,
+  ).join("\n"))
   await cp(join(repoRoot, "package.json"), join(dir, "package.json"))
   await cp(join(repoRoot, "lib"), join(dir, "lib"), { recursive: true })
-  await cp(join(repoRoot, "providers"), join(dir, "providers"), { recursive: true })
-  await cp(join(repoRoot, "scripts"), join(dir, "scripts"), { recursive: true })
+  await mkdir(join(dir, "providers"))
+  for (const id of [...Object.values(fixturePlugins).map(([id]) => id), "grok-bot-cdp", "grok-bot-direct", "grok-bot-token"])
+    await cp(join(repoRoot, "providers", `${id}.mjs`), join(dir, "providers", `${id}.mjs`))
+  await mkdir(join(dir, "scripts"))
+  const gate = await readFile(join(repoRoot, "scripts/check.mjs"), "utf8")
+  const importBoundary = 'const mod = await import(pathToFileURL(join(root, "index.mjs")).href)'
+  if (gate.split(importBoundary).length !== 2) throw new Error("gate fixture import boundary changed")
+  const retainFixturePlugins = `for (const key of Object.keys(EXPECTED)) if (!${JSON.stringify(Object.keys(fixturePlugins))}.includes(key)) delete EXPECTED[key]`
+  await writeFile(join(dir, "scripts/check.mjs"), gate.replace(importBoundary, `${retainFixturePlugins}\n${importBoundary}`))
   for (const [relativePath, content] of Object.entries(replacements))
     await writeFile(join(dir, relativePath), content)
   return dir
