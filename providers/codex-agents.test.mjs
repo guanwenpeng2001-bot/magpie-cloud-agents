@@ -1,14 +1,24 @@
 import { afterEach, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { _internal, makeCodexAgents } from "./codex-agents.mjs"
 import { startFakeCloud } from "../scripts/fake-cloud.mjs"
 
-const eventResponse = (type, extra = {}) => new Response(`event: ${type}\r\ndata: ${JSON.stringify({ type, ...extra })}\r\n\r\n`, { headers: { "Content-Type": "text/event-stream" } })
+const eventResponse = (type, extra = {}) => new Response(`event: ${type}\r\ndata: ${JSON.stringify({ type, turn_id: "turn_synthetic", ...extra })}\r\n\r\n`, { headers: { "Content-Type": "text/event-stream" } })
 const servers = []
 afterEach(() => { for (const server of servers.splice(0)) server.stop() })
 const auth = { type: "api", key: "SYNTHETIC-ONLY" }
 const messages = [{ role: "user", content: "Hello cloud" }]
 async function setup(scenario, options = {}, getAuth = () => auth) {
-  const server = startFakeCloud({ scenario })
+  const server = startFakeCloud({ scenario: async context => {
+    const response = await scenario?.(context)
+    if (response) return response
+    const { request, url, sessions } = context
+    if (request.method === "GET" && url.pathname.endsWith("/events")) return eventResponse("agent.session.turn.completed")
+    if (url.pathname.endsWith("/turns/turn_synthetic/items")) {
+      const session = sessions.get(url.pathname.split("/")[5])
+      return Response.json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: session?.text ?? "Synthetic OpenAI answer" }] }] })
+    }
+  } })
   servers.push(server)
   const plugin = makeCodexAgents({ ...options, apiBase: { "codex-agents": server.url + "/openai" } })
   const loader = await plugin.auth.loader(getAuth)
@@ -31,7 +41,7 @@ test("create sends the Agents contract and returns the fake answer through chat"
   expect(server.requests).toEqual([
     { method: "POST", path: "/openai/v1/agents/sessions", body: { agent: { model: "gpt-6-astra" }, input: [{ role: "user", content: [{ type: "input_text", text: "Current request:\nHello cloud" }] }] } },
     { method: "GET", path: "/openai/v1/agents/sessions/session_1/events", body: undefined },
-    { method: "GET", path: "/openai/v1/agents/sessions/session_1/items", body: undefined },
+    { method: "GET", path: "/openai/v1/agents/sessions/session_1/turns/turn_synthetic/items", body: undefined },
   ])
 })
 
@@ -50,11 +60,11 @@ test("action_required names the unsupported action and fails rather than succeed
   expect((await response.json()).error.message).toContain("can't perform (environment_connection)")
 })
 test.each([
-  [[{ type: "message", role: "assistant", content: [{ text: "old" }] }, { role: "assistant", output_text: "new" }], "new"],
-  [[{ type: "message", content: [{ text: { value: "nested" } }, { output_text: "second" }] }], "nested\nsecond"],
-  [[{ type: "artifact", text: "not a reply" }], "session session_1"],
-  [[{ role: "user", type: "message", content: "echoed input" }], "session session_1"],
-])("defensive item extraction %#", async (items, expected) => {
+  [[{ type: "message", role: "assistant", content: [{ type: "output_text", text: "old" }] }, { type: "message", role: "assistant", content: [{ type: "output_text", text: "new" }] }], 200, "new"],
+  [[{ type: "message", role: "assistant", content: [{ type: "output_text", text: "first" }, { type: "output_text", text: "second" }] }], 200, "first\nsecond"],
+  [[{ type: "artifact", text: "not a reply" }], 502, "session session_1"],
+  [[{ role: "user", type: "message", content: "echoed input" }], 502, "session session_1"],
+])("defensive item extraction %#", async (items, status, expected) => {
   const { request } = await setup(({ url }) => {
     if (url.pathname.endsWith("/items")) {
       expect(url.search).toBe("?order=asc&limit=100")
@@ -62,13 +72,15 @@ test.each([
     }
   })
   const response = await request()
-  expect(response.status).toBe(200)
-  expect((await response.json()).choices[0].message.content).toContain(expected)
+  expect(response.status).toBe(status)
+  const body = await response.json()
+  expect((status === 200 ? body.choices[0].message.content : body.error.message)).toContain(expected)
 })
 test("idle disconnect reconnects three times then reads the latest terminal turn", async () => {
   const { server, request } = await setup(({ url }) => {
     if (url.pathname.endsWith("/events")) return eventResponse("agent.session.idle")
-    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ status: "failed" }, { state: { execution_status: "completed" } }] })
+    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ id: "turn_synthetic", status: "completed", state: { execution_status: "running" } }, { status: "failed" }] })
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "latest turn answer" }] }] })
   })
   expect((await request()).status).toBe(200)
   expect(server.requests.filter(row => row.path.endsWith("/events"))).toHaveLength(4)
@@ -181,6 +193,8 @@ test("create and follow-up keys exist before send and survive failed submission 
   const run = await driver.create(auth, submission)
   expect(keys[0]).toMatch(/^[0-9a-f]{64}$/)
   expect(keys[1]).toBe(keys[0])
+  const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex")
+  expect(keys[0]).toBe(digest([digest(auth.key), "session", 0, "content-hash"]))
   reject = true
   await expect(driver.followUp(auth, run, ["Next"])).rejects.toMatchObject({ status: 503 })
   reject = false
@@ -223,7 +237,7 @@ test("stream emits content stop usage DONE and embeds terminal errors after 200"
 test("stream recognizes type-only events across chunk boundaries", async () => {
   const { request } = await setup(({ url }) => {
     if (!url.pathname.endsWith("/events")) return undefined
-    const bytes = new TextEncoder().encode('data: {"type":"agent.session.turn.completed"}\n\n')
+    const bytes = new TextEncoder().encode('data: {"type":"agent.session.turn.completed","turn_id":"turn_synthetic"}\n\n')
     return new Response(new ReadableStream({ start(controller) {
       controller.enqueue(bytes.slice(0, 20))
       controller.enqueue(bytes.slice(20))
@@ -254,9 +268,143 @@ test.each([401, 500])("models HTTP %s expires or falls back", async status => {
 test("poll accepts a single defensive turn object", async () => {
   const { request } = await setup(({ url }) => {
     if (url.pathname.endsWith("/events")) return new Response("")
-    if (url.pathname.endsWith("/turns")) return Response.json({ execution_status: "completed" })
+    if (url.pathname.endsWith("/turns")) return Response.json({ id: "turn_synthetic", status: "completed" })
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "bare turn answer" }] }] })
   }, { maxRunMinutes: 0.002 })
   expect((await request()).status).toBe(200)
+})
+const answerItem = text => ({ type: "message", role: "assistant", content: [{ type: "output_text", text }] })
+async function reviewedPoll(turn) {
+  const { server } = await setup(({ url }) => url.pathname.endsWith("/turns") ? Response.json({ data: [turn] }) : url.pathname.endsWith("/items") ? Response.json({ data: [answerItem("previous answer")] }) : undefined)
+  return _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } }).poll(auth, { ref: "session_1" })
+}
+test.each([
+  { status_message: "complete soon", status: "running" },
+  { status: "incomplete" }, { status: "not_completed" },
+  { status: "in_progress", tools: [{ status: "completed" }] },
+  { status: "in_progress", tools: [{ status: "failed" }] },
+  { status: "running", activity_status_text: "complete this" },
+])("review F1 rejects prose substrings and tool statuses %#", async turn => {
+  expect((await reviewedPoll(turn)).state).toBe("running")
+})
+test("review R1 failed turn outranks earlier completion prose", async () => {
+  expect((await reviewedPoll({ status_message: "Could not complete", status: "failed" })).state).toBe("failed")
+})
+test("review F6 poll action_required names plural required actions", async () => {
+  const result = await reviewedPoll({ status: "action_required", required_actions: [{ type: "function_call" }] })
+  expect(result.state).toBe("failed")
+  expect(result.progress).toContain("function_call")
+})
+test("review F4 poll never spends time on its own scheduling", async () => {
+  const { server } = await setup(({ url }) => url.pathname.endsWith("/turns") ? Response.json({ data: [{ status: "running" }] }) : undefined)
+  const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
+  const run = { ref: "session_1", pollAfter: Date.now() + 10000 }
+  const signal = AbortSignal.timeout(200)
+  const result = await Promise.race([
+    driver.poll(auth, run, signal).catch(error => ({ state: error.name })),
+    new Promise(resolve => signal.addEventListener("abort", () => resolve({ state: "deadline exceeded" }), { once: true })),
+  ])
+  expect(result.state).toBe("running")
+})
+test("review AE5 scopes items to terminal turn and follows every page", async () => {
+  const paths = []
+  const { request } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return eventResponse("agent.session.turn.completed", { turn_id: "turn_current" })
+    if (url.pathname.endsWith("/items")) {
+      paths.push(url.pathname + url.search)
+      return Response.json(url.searchParams.has("after") ? { data: [answerItem("current answer")] } : { data: [answerItem("first page")], has_more: true, last_id: "item_100" })
+    }
+  })
+  const response = await request()
+  expect((await response.json()).choices[0].message.content).toBe("current answer")
+  expect(paths).toEqual(["/openai/v1/agents/sessions/session_1/turns/turn_current/items?order=asc&limit=100", "/openai/v1/agents/sessions/session_1/turns/turn_current/items?order=asc&limit=100&after=item_100"])
+})
+test("review AE3 empty current turn fails without using prior session text", async () => {
+  const { request } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return eventResponse("agent.session.turn.completed", { turn_id: "turn_empty" })
+    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ id: "turn_empty", status: "completed" }] })
+    if (url.pathname.includes("/turns/turn_empty/items")) return Response.json({ data: [] })
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [answerItem("previous answer")] })
+  })
+  const response = await request()
+  expect(response.status).toBe(502)
+  expect((await response.json()).error.message).toContain("without a message-shaped reply")
+})
+test("review F2 poll scopes items to the latest turn's own id", async () => {
+  const paths = []
+  const { server } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return new Response("")
+    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ id: "turn_9", status: "completed" }] })
+    paths.push(url.pathname + url.search)
+    return Response.json({ data: [answerItem("turn nine answer")] })
+  })
+  const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
+  const result = await driver.poll(auth, { ref: "session_1" })
+  expect(result.state).toBe("succeeded")
+  expect(result.text).toBe("turn nine answer")
+  expect(paths).toEqual(["/openai/v1/agents/sessions/session_1/turns/turn_9/items?order=asc&limit=100"])
+})
+test("review F2 follow-up drops the previous turn's id so the next read is not scoped to it", async () => {
+  const { server } = await setup(({ url, body }) => url.pathname.endsWith("/events") && body?.events?.[0]?.type === "agent.session.input.message" ? Response.json({}) : undefined)
+  const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
+  const next = await driver.followUp(auth, { ref: "session_1", turnId: "turn_1", submissionKey: "k" }, ["again"])
+  expect(next.turnId).toBeUndefined()
+})
+test.each([
+  { ...answerItem("real answer"), metadata: { debug: { text: "private trace" } } },
+  { type: "message", role: "human", content: [{ type: "output_text", text: "echo" }] },
+  { type: "reasoning", role: "assistant", summary: [{ text: "reasoning" }] },
+])("review Q4 F3 F9 only answer content is harvested %#", async item => {
+  const { request } = await setup(({ url }) => url.pathname.endsWith("/items") ? Response.json({ data: [answerItem("real answer"), item] }) : undefined)
+  expect((await (await request()).json()).choices[0].message.content).toBe("real answer")
+})
+test("review F5 live model list preserves floor and rejects substring collisions", async () => {
+  const { plugin } = await setup(() => Response.json({ data: [{ id: "gpt-6-sol" }, { id: "gpt-4o-consolidated-preview" }, { id: "gpt-5.1-terrarium" }] }))
+  const models = await plugin.provider.models({ models: {} }, { auth })
+  expect(Object.keys(models).sort()).toEqual(["gpt-6-astra", "gpt-6-sol"])
+  expect(models["gpt-6-astra"].tool_call).toBe(false)
+})
+test("review M15 event line alone terminates without polling", async () => {
+  const { server, request } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return new Response('event: agent.session.turn.failed\ndata: {}\n\n')
+    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ status: "running" }] })
+  }, { maxRunMinutes: 0.002 })
+  const response = await request()
+  expect(response.status).toBe(502)
+  expect(server.requests.filter(row => row.path.endsWith("/turns"))).toHaveLength(0)
+})
+test("missing turn identity fails without reading session history", async () => {
+  const result = await reviewedPoll({ status: "completed" })
+  expect(result.state).toBe("failed")
+  expect(result.progress).toContain("turn id")
+})
+test("incomplete item pagination fails instead of returning an old page", async () => {
+  const { server } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ id: "turn_1", status: "completed" }] })
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [answerItem("old page")], has_more: true, last_id: "same_cursor" })
+  })
+  const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
+  await expect(driver.poll(auth, { ref: "session_1" })).rejects.toMatchObject({ status: 502 })
+})
+test("model lookup retains configured models when no live list is available", async () => {
+  const { plugin } = await setup()
+  const configured = { "gpt-6-sol": { name: "GPT-6 Sol", tool_call: false } }
+  expect(await plugin.provider.models({ models: configured })).toEqual(configured)
+})
+test("poll ignores an earlier unknown status message before the failed status", async () => {
+  expect((await reviewedPoll({ status_message: "working", status: "failed" })).state).toBe("failed")
+})
+test("poll selects the newest turn even when older turns fill a page", async () => {
+  const { server } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/turns")) {
+      const latest = { id: "turn_current", status: "running" }
+      const old = { id: "turn_old", status: "completed" }
+      return Response.json({ data: url.searchParams.get("order") === "desc" ? [latest, old] : [old], has_more: true, last_id: "turn_old" })
+    }
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [answerItem("stale answer")] })
+  })
+  const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
+  expect((await driver.poll(auth, { ref: "session_1" })).state).toBe("running")
 })
 test("environment opt-in and folded system instructions are retained", async () => {
   const environment = { type: "openai_hosted" }

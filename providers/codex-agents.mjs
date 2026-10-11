@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, FollowupRejected } from "../lib/errors.mjs"
-import { fetchWithTimeout, sleep } from "../lib/http.mjs"
+import { fetchWithTimeout } from "../lib/http.mjs"
 import { canonical, sessionOf, SESSION_HEADER } from "../lib/sessions.mjs"
 
 const ID = "codex-agents"
@@ -14,26 +14,20 @@ const hash = value => createHash("sha256").update(canonical(value)).digest("hex"
 const inputOf = texts => texts.map(text => ({ role: "user", content: [{ type: "input_text", text }] }))
 const credentialOf = auth => auth?.type === "api" && typeof auth.key === "string" && auth.key.trim() ? { type: "api", key: auth.key } : null
 const rowsOf = value => Array.isArray(value) ? value : value?.data ?? value?.items ?? value?.turns ?? []
-
-function textLeaves(value, selected = false) {
-  if (typeof value === "string") return selected ? [value] : []
-  if (Array.isArray(value)) return value.flatMap(item => textLeaves(item, selected))
-  if (!value || typeof value !== "object") return []
-  return Object.entries(value).flatMap(([key, child]) => textLeaves(child, /^(text|content|output_text)$/.test(key) || (selected && key === "value")))
+const SUCCESS = new Set(["completed", "complete", "succeeded", "finished"])
+const FAILURE = new Set(["failed", "failure", "error", "cancelled", "canceled", "timed_out"])
+const EXPIRED = new Set(["expired"])
+const ACTION = new Set(["action_required", "requires_action"])
+function answerText(item) {
+  if (item?.type !== "message" || item.role !== "assistant" || !Array.isArray(item.content)) return ""
+  return item.content.filter(part => part?.type === "output_text" && typeof part.text === "string").map(part => part.text.trim()).filter(Boolean).join("\n")
 }
 function lastText(payload) {
-  const rows = rowsOf(payload)
-  if (!Array.isArray(rows)) return ""
-  return rows.filter(item => /message|assistant/i.test(`${item?.type ?? ""} ${item?.role ?? ""}`) && item?.role !== "user")
-    .map(item => textLeaves(item).filter(text => text.trim()).join("\n")).findLast(Boolean) ?? ""
+  return rowsOf(payload).map(answerText).findLast(Boolean) ?? ""
 }
 function turnStatus(value) {
-  if (!value || typeof value !== "object") return ""
-  for (const [key, child] of Object.entries(value)) {
-    if (/status/i.test(key) && typeof child === "string" && /complete|fail|cancel|expir/i.test(child)) return child
-    if (child && typeof child === "object") { const status = turnStatus(child); if (status) return status }
-  }
-  return ""
+  const status = typeof value?.status === "string" ? value.status.trim() : ""
+  return new Set([...SUCCESS, ...FAILURE, ...EXPIRED, ...ACTION]).has(status) ? status : ""
 }
 
 function makeDriver(options) {
@@ -60,13 +54,34 @@ function makeDriver(options) {
     }
   }
   const pathOf = run => `/agents/sessions/${encodeURIComponent(run.ref)}`
+  async function readItems(cred, run, turnId, signal) {
+    const pages = []
+    const turn = encodeURIComponent(turnId)
+    let after = ""
+    for (let page = 0; page < 20; page++) {
+      const path = `${pathOf(run)}/turns/${turn}/items` + `?order=asc&limit=100${after ? `&after=${encodeURIComponent(after)}` : ""}`
+      const payload = await (await request(cred, path, { signal })).json()
+      pages.push(...rowsOf(payload))
+      if (!payload?.has_more) return pages
+      if (!payload.last_id || payload.last_id === after) throw chatError(502, "Agents API item pagination did not advance")
+      after = payload.last_id
+    }
+    throw chatError(502, "Agents API item pagination exceeded 20 pages")
+  }
   async function outcome(cred, run, status, signal, detail) {
-    if (/action_required/.test(status)) return { state: "failed", progress: `the agent needs an action this plugin can't perform (${detail?.required_action?.type ?? detail?.data?.required_action?.type ?? "unknown required_action"}) — open ${run.ref}` }
-    if (/expir/i.test(status)) return { state: "expired" }
-    if (/fail|cancel/i.test(status)) return { state: "failed", progress: `${status}${detail?.error ? ": " + JSON.stringify(detail.error) : ""}` }
-    if (!/complete/i.test(status)) return { state: "running" }
-    const items = await (await request(cred, pathOf(run) + "/items?order=asc&limit=100", { signal })).json()
-    return { state: "succeeded", text: lastText(items) || `${NAME} turn ${status} without a message-shaped reply — session ${run.ref}` }
+    const normalized = String(status ?? "").trim()
+    if (ACTION.has(normalized)) {
+      const action = detail?.required_action?.type ?? detail?.data?.required_action?.type ?? detail?.required_actions?.[0]?.type ?? detail?.data?.required_actions?.[0]?.type ?? "unknown required_action"
+      return { state: "failed", progress: `the agent needs an action this plugin can't perform (${action}) — open ${run.ref}` }
+    }
+    if (EXPIRED.has(normalized)) return { state: "expired" }
+    if (FAILURE.has(normalized)) return { state: "failed", progress: `${detail?.type ?? normalized}${detail?.error ? ": " + JSON.stringify(detail.error) : ""}` }
+    if (!SUCCESS.has(normalized)) return { state: "running" }
+    const turnId = detail?.turn_id ?? detail?.data?.turn_id ?? (detail?.type ? undefined : detail?.id)
+    if (typeof turnId !== "string" || !turnId) return { state: "failed", progress: "completed without a turn id — session " + run.ref }
+    const text = lastText(await readItems(cred, run, turnId, signal))
+    if (!text) return { state: "failed", progress: "turn " + normalized + " without a message-shaped reply — session " + run.ref }
+    return { state: "succeeded", text }
   }
   return {
     id: ID, name: NAME, staticModels: MODELS, methods: METHODS,
@@ -75,8 +90,9 @@ function makeDriver(options) {
         const payload = await (await request(cred, "/models", { signal })).json()
         const rows = rowsOf(payload)
         if (!Array.isArray(rows)) return null
-        const entries = rows.filter(model => typeof model?.id === "string" && /astra|sol|terra/i.test(model.id)).map(model => [model.id, { id: model.id, name: model.name ?? MODELS[model.id]?.name ?? model.id, tool_call: false, reasoning: false, capabilities: { toolcall: false, reasoning: false, attachment: false, input: { text: true }, output: { text: true } } }])
-        return entries.length ? Object.fromEntries(entries) : null
+        const entries = rows.filter(model => typeof model?.id === "string" && /(?:^|[-_/])(?:astra|sol|terra)(?:[-_/]|$)/i.test(model.id)).map(model => [model.id, { id: model.id, name: model.name ?? MODELS[model.id]?.name ?? model.id, tool_call: false, reasoning: false, capabilities: { toolcall: false, reasoning: false, attachment: false, input: { text: true }, output: { text: true } } }])
+        const live = Object.fromEntries(entries)
+        return { ...MODELS, ...live }
       } catch (error) { if (error.status === 401 || error.signIn === "expired") throw error; return null }
     },
     async create(cred, { model, prompt, identity }, signal) {
@@ -91,7 +107,7 @@ function makeDriver(options) {
       try {
         await request(cred, pathOf(run) + "/events", { signal, key, body: { events: [{ type: "agent.session.input.message", input: inputOf(texts) }] } })
       } catch (error) { if (error.status === 404) throw new FollowupRejected(); throw error }
-      return { ...run, submissionKey: key, pollAfter: 0 }
+      return { ref: run.ref, identity: run.identity, submissionKey: key }
     },
     async stream(cred, run, emit, signal) {
       for (let attempt = 0; attempt < 4; attempt++) {
@@ -114,7 +130,8 @@ function makeDriver(options) {
               let payload
               try { payload = data ? JSON.parse(data) : {} } catch { continue }
               const type = payload.type ?? event
-              if (["agent.session.turn.completed", "agent.session.turn.failed", "agent.session.turn.cancelled", "agent.session.failed", "agent.session.action_required"].includes(type)) return await outcome(cred, run, type, signal, payload)
+              const status = { "agent.session.turn.completed": "completed", "agent.session.turn.failed": "failed", "agent.session.failed": "failed", "agent.session.turn.cancelled": "cancelled", "agent.session.action_required": "action_required" }[type]
+              if (status) return await outcome(cred, run, status, signal, payload)
               if (type) emit(type)
             }
             if (done) break
@@ -126,11 +143,9 @@ function makeDriver(options) {
       return null
     },
     async poll(cred, run, signal) {
-      if (run.pollAfter) await sleep(Math.max(0, run.pollAfter - Date.now()), signal)
-      const payload = await (await request(cred, pathOf(run) + "/turns", { signal })).json()
-      run.pollAfter = Date.now() + 10000
+      const payload = await (await request(cred, pathOf(run) + "/turns?order=desc&limit=1", { signal })).json()
       const rows = Array.isArray(payload) ? payload : payload?.data ?? payload?.turns ?? payload
-      const latest = Array.isArray(rows) ? rows.at(-1) : rows
+      const latest = Array.isArray(rows) ? rows[0] : rows
       return outcome(cred, run, turnStatus(latest), signal, latest)
     },
     async cancel(cred, run) {
