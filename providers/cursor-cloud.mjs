@@ -65,6 +65,7 @@ function outcome(data, run) {
 function makeDriver(options) {
   const base = (options.apiBase?.[ID] ?? "https://api.cursor.com").replace(/\/+$/, "")
   const deadAgents = new SessionMap()
+  const requestRuns = new SessionMap()
   const deadKey = (credential, ref) => createHash("sha256").update(JSON.stringify([credential.key, ref])).digest("hex")
   const pathOf = run => `/v1/agents/${segment(run.ref)}/runs/${segment(run.runId)}`
   async function request(credential, path, init = {}) {
@@ -85,10 +86,38 @@ function makeDriver(options) {
     return { ref: agent.id, runId: run.id, url: agent.url }
   }
   const readRun = async (credential, run, signal) => outcome(await json(credential, pathOf(run), { signal }), run)
+  const remember = (credential, agent, run) => {
+    const attached = runFrom(agent, run)
+    requestRuns.set(deadKey(credential, agent.id), attached)
+    return attached
+  }
+  async function attach(credential, agent, prompt, signal) {
+    let original = requestRuns.get(deadKey(credential, agent.id))
+    if (!original) {
+      let listing
+      try { listing = await json(credential, "/v1/agents/" + segment(agent.id) + "/runs", { signal }) }
+      catch (error) { if (![404, 405, 501].includes(error.status)) throw error }
+      const rows = Array.isArray(listing) ? listing : listing?.items ?? listing?.runs
+      // Only a complete, chronologically unambiguous list identifies the creation run.
+      if (Array.isArray(rows) && rows.length && !listing.nextCursor && !listing.hasMore && rows.every(row => typeof row?.id === "string" && Number.isFinite(Date.parse(row.createdAt)))) {
+        const ordered = [...rows].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
+        if (ordered.length === 1 || Date.parse(ordered[0].createdAt) < Date.parse(ordered[1].createdAt)) original = runFrom(agent, ordered[0])
+      }
+    }
+    if (original) {
+      const result = await readRun(credential, original, signal)
+      if (!["failed", "expired"].includes(result.state)) return remember(credential, agent, { id: original.runId })
+    }
+    if (agent.status !== "IDLE") throw chatError(409, "this Cursor agent is still working on the previous request — wait for it, or cancel it at " + (agent.url || agent.id))
+    const data = await json(credential, "/v1/agents/" + segment(agent.id) + "/runs", { method: "POST", body: JSON.stringify({ prompt: { text: prompt } }), signal })
+    return remember(credential, agent, data.run)
+  }
   return {
     id: ID, name: NAME, staticModels: MODELS, methods,
     async create(credential, { model, prompt, identity }, signal) {
-      const body = { prompt: { text: prompt }, model: { id: model }, name: "magpie: " + prompt.slice(0, 60) }
+      const marker = "Current request:\n"
+      const currentRequest = prompt.includes(marker) ? prompt.slice(prompt.lastIndexOf(marker) + marker.length) : prompt
+      const body = { prompt: { text: prompt }, model: { id: model }, name: "magpie: " + currentRequest.slice(0, 60) }
       let generation = 0
       let escalated = false
       if (identity?.sessionKey) {
@@ -99,7 +128,7 @@ function makeDriver(options) {
       for (let attempt = 0; ; attempt++) {
         try {
           const data = await json(credential, "/v1/agents", { method: "POST", body: JSON.stringify(body), signal })
-          return runFrom(data.agent, data.run)
+          return remember(credential, data.agent, data.run)
         } catch (error) {
           if (error.status === 409 && body.agentId && /agent_id_conflict/.test(error.message)) {
             if (escalated) throw error
@@ -112,7 +141,7 @@ function makeDriver(options) {
               escalated = true
               continue
             }
-            return runFrom(agent, data.run ?? { id: agent.latestRunId })
+            return attach(credential, agent, prompt, signal)
           }
           // Only a caller-supplied agentId makes a retry safe after an uncertain POST.
           if (!body.agentId || attempt || error.status || signal?.aborted) throw error
@@ -170,7 +199,7 @@ function makeDriver(options) {
         const rows = Array.isArray(data) ? data : Array.isArray(data?.models) ? data.models : []
         const models = Object.fromEntries(rows.flatMap(row => {
           const id = [row?.id, row?.model, row?.name].find(value => typeof value === "string" && value)
-          return id ? [[id, { id, name: typeof row.name === "string" && row.name ? row.name : id, capabilities: { toolcall: false, reasoning: false } }]] : []
+          return id ? [[id, { ...MODELS[id], id, tool_call: false, reasoning: false, name: typeof row.name === "string" && row.name ? row.name : id, capabilities: { toolcall: false, reasoning: false } }]] : []
         }))
         return Object.keys(models).length ? models : null
       } catch (error) {

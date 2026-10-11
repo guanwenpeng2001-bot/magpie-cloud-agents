@@ -93,8 +93,9 @@ test("409 agent_id_conflict converts to attach-by-GET and still answers", async 
   await withHarness(async ({ request, url }) => {
     if (request.method === "POST" && url.pathname.endsWith("/v1/agents")) return new Response(JSON.stringify({ error: "agent_id_conflict" }), { status: 409 })
     const agentId = url.pathname.split("/").at(-1)
-    if (request.method === "GET" && /^bc-/.test(agentId)) return Response.json({ id: agentId, status: "IDLE", latestRunId: "run-1", url: `${url.origin}/cursor/agents/${agentId}` })
-    if (url.pathname.includes("/runs/")) return Response.json({ id: "run-1", status: "FINISHED", result: "Reattached answer" })
+    if (request.method === "GET" && /^bc-/.test(agentId)) return Response.json({ id: agentId, status: "IDLE", latestRunId: "run-newer", url: url.origin + "/cursor/agents/" + agentId })
+    if (url.pathname.endsWith("/runs")) return Response.json({ items: [{ id: "run-1", createdAt: "2026-01-01T00:00:00Z" }, { id: "run-newer", createdAt: "2026-01-02T00:00:00Z" }] })
+    if (url.pathname.includes("/runs/")) return Response.json({ id: url.pathname.split("/").at(-1), status: "FINISHED", result: url.pathname.endsWith("run-1") ? "Reattached answer" : "Wrong newer answer" })
   }, async ({ fetch, server }) => {
     const body = await (await chat(fetch, {}, withSession)).json()
     expect(body.choices[0].message.content).toBe("Reattached answer")
@@ -574,4 +575,118 @@ test("poll transport failures use three attempts before returning 502 kept", asy
     expect(response.headers.get("X-Magpie-Sign-In")).toBe("kept")
     expect((await response.json()).error.message).toContain("can't reach 127.0.0.1")
   } finally { globalThis.fetch = nativeFetch }
+})
+
+function restartFixture({ firstStatus = "FINISHED", recon = false, active = false } = {}) {
+  const agents = new Map(), runs = new Map(), calls = []
+  const server = startFakeCloud({ scenario: ({ request, url, body }) => {
+    calls.push({ method: request.method, path: url.pathname, body })
+    const mint = (agent, prompt) => {
+      const run = { id: "owned-" + (runs.size + 1), agentId: agent.id, createdAt: new Date(runs.size * 1000).toISOString(), status: runs.size ? "FINISHED" : firstStatus, result: prompt.includes("Second question") ? "answer-2" : "answer-1" }
+      if (run.status !== "FINISHED") run.result = ""
+      runs.set(run.id, run); agent.latestRunId = run.id; return run
+    }
+    if (url.pathname.endsWith("/v1/agents") && request.method === "POST") {
+      if (agents.has(body.agentId)) return new Response("agent_id_conflict", { status: 409 })
+      const agent = { id: body.agentId, status: active ? "ACTIVE" : "IDLE" }
+      agents.set(agent.id, agent)
+      return Response.json({ agent, run: mint(agent, body.prompt.text) })
+    }
+    const id = url.pathname.split("/")[4], agent = agents.get(id)
+    if (!agent) return undefined
+    if (url.pathname.endsWith("/stream")) return new Response("offline", { status: 503 })
+    if (url.pathname.endsWith("/runs")) {
+      if (request.method === "POST") return Response.json({ run: mint(agent, body.prompt.text) })
+      return Response.json({ items: [...runs.values()].filter(run => run.agentId === id).reverse() })
+    }
+    if (url.pathname.includes("/runs/")) return Response.json(runs.get(url.pathname.split("/").at(-1)))
+    return Response.json(recon ? { id, status: agent.status, name: "agent" } : agent)
+  } })
+  return { server, agents, runs, calls, loader: () => makeCursorCloud({ apiBase: { "cursor-cloud": server.url + "/cursor" } }).auth.loader(() => AUTH) }
+}
+
+test("F1 older transcript after restart never receives the newer run answer", async () => {
+  const fixture = restartFixture()
+  try {
+    const first = await fixture.loader()
+    const original = [{ role: "user", content: "First question" }]
+    expect((await (await chat(first.fetch, { messages: original }, withSession)).json()).choices[0].message.content).toBe("answer-1")
+    const next = [...original, { role: "assistant", content: "answer-1" }, { role: "user", content: "Second question" }]
+    expect((await (await chat(first.fetch, { messages: next }, withSession)).json()).choices[0].message.content).toBe("answer-2")
+    const restarted = await fixture.loader()
+    expect((await (await chat(restarted.fetch, { messages: original }, withSession)).json()).choices[0].message.content).toBe("answer-1")
+    expect(fixture.runs.size).toBe(2)
+  } finally { fixture.server.stop() }
+})
+test.each(["ERROR", "CANCELLED", "EXPIRED"])("F1 %s can recover on identical re-ask after restart", async firstStatus => {
+  const fixture = restartFixture({ firstStatus })
+  try {
+    expect((await chat((await fixture.loader()).fetch, {}, withSession)).status).toBe(502)
+    const response = await chat((await fixture.loader()).fetch, {}, withSession)
+    expect(response.status).toBe(200)
+    expect((await response.json()).choices[0].message.content).toBe("answer-1")
+    expect(fixture.agents.size).toBe(1)
+    expect(fixture.runs.size).toBe(2)
+  } finally { fixture.server.stop() }
+})
+test("F2 recon agent GET and in-flight duplicate attach without another run", async () => {
+  const fixture = restartFixture({ recon: true, firstStatus: "RUNNING", active: true })
+  const input = { model: "composer-2", prompt: "First question", identity: { sessionKey: "inflight", textsHash: "same" } }
+  try {
+    const make = () => _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+    const first = await make().create(AUTH, input)
+    const retry = await make().create(AUTH, input)
+    expect(retry.runId).toBe(first.runId)
+    expect(fixture.agents.size).toBe(1)
+    expect(fixture.runs.size).toBe(1)
+  } finally { fixture.server.stop() }
+})
+test.each([[[]], [[{ role: "system", content: "Private instructions" }]]])("F3 name uses current user request with system=%j", async prefix => {
+  await withHarness(undefined, async ({ fetch, server }) => {
+    await chat(fetch, { messages: [...prefix, { role: "user", content: "Specific request" }] })
+    expect(server.requests[0].body.name).toBe("magpie: Specific request")
+  })
+})
+test("F5 live floor model retains declared reasoning and tool_call flags", async () => {
+  await withHarness(undefined, async ({ plugin }) => {
+    const config = {}; await plugin.config(config)
+    const models = await plugin.provider.models(config.provider["cursor-cloud"], { auth: AUTH })
+    expect(models["composer-2"].reasoning).toBe(false)
+    expect(models["composer-2"].tool_call).toBe(false)
+  })
+})
+
+test.each(["IDLE", "ACTIVE"])("F2 unavailable run list safely degrades for %s agent", async status => {
+  let posts = 0
+  await withHarness(({ request, url, body }) => {
+    if (url.pathname.endsWith("/v1/agents")) return new Response("agent_id_conflict", { status: 409 })
+    if (url.pathname.endsWith("/runs")) {
+      if (request.method === "GET") return Response.json({ unexpected: true })
+      posts++
+      expect(body.prompt.text).toBe("Current request:\nFix the failing test")
+      return Response.json({ run: { id: "fresh-run" } })
+    }
+    if (url.pathname.endsWith("/stream")) return new Response("offline", { status: 503 })
+    if (url.pathname.includes("/runs/")) return Response.json({ status: "FINISHED", result: "new answer for requested prompt" })
+    return Response.json({ id: url.pathname.split("/").at(-1), status })
+  }, async ({ fetch }) => {
+    const response = await chat(fetch, {}, withSession)
+    expect(response.status).toBe(status === "IDLE" ? 200 : 409)
+    expect(posts).toBe(status === "IDLE" ? 1 : 0)
+    if (status === "IDLE") expect((await response.json()).choices[0].message.content).toBe("new answer for requested prompt")
+  })
+})
+test("F4 two archived generations remain bounded at four create POSTs", async () => {
+  const fixture = restartFixture()
+  const driver = _internal.makeDriver({ apiBase: { "cursor-cloud": fixture.server.url + "/cursor" } })
+  const input = { model: "composer-2", prompt: "hello", identity: { sessionKey: "bound", textsHash: "same" } }
+  try {
+    const first = await driver.create(AUTH, input)
+    fixture.agents.get(first.ref).status = "ARCHIVED"
+    const second = await driver.create(AUTH, input)
+    fixture.agents.get(second.ref).status = "ARCHIVED"
+    await expect(driver.create(AUTH, input)).rejects.toMatchObject({ status: 409, message: "agent_id_conflict" })
+    expect(fixture.agents.size).toBe(2)
+    expect(fixture.calls.filter(call => call.method === "POST" && call.path.endsWith("/v1/agents"))).toHaveLength(4)
+  } finally { fixture.server.stop() }
 })
