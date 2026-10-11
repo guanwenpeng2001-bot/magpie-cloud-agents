@@ -16,7 +16,7 @@ export const DOTS_FAILURES = {
   rotated: "Dots: the tunnel URL changed — copy the new one from magpie plugin login dots (re-run sign-in) into the ChatGPT connector",
   lapsed: "Dots: The Dot's queue subscription lapsed. Ask the Dot to re-subscribe (or re-run setup).",
   noDot: "Dots: Your ChatGPT account doesn't have Dots enabled. This provider needs a Dot on the account.",
-  restarted: "Dots: the bridge restarted; ask again",
+  restarted: "Dots: the bridge restarted; asking again sends it as a new task",
 }
 export const dotsFailure = kind => chatError(["rotated", "lapsed", "noDot"].includes(kind) ? 503 : 502, DOTS_FAILURES[kind], "kept")
 export const dotsStateDir = (env = process.env) => join(env.XDG_CONFIG_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".config"), "magpie", "cloud-agents", "dots")
@@ -72,9 +72,19 @@ function diagnosticTail(output) {
   return output
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/[\p{C}]/gu, character => /[\n\r\t]/.test(character) ? character : "")
+    .replace(/[A-Za-z0-9_+\/=.%\-]+(?:\s+[A-Za-z0-9_+\/=.%\-]+)*/g, span => {
+      const parts = span.split(/(\s+)/)
+      for (let start = 0; start < parts.length; start += 2) {
+        if (!/[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(parts[start]) && parts[start].length < 12) continue
+        let end = start, length = parts[start].length
+        while (end + 2 < parts.length && (/[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(parts[end + 2]) || parts[end + 2].length >= 12)) { end += 2; length += parts[end].length }
+        if (length >= 20 && /[A-Z0-9]/.test(parts.slice(start, end + 1).join(""))) { parts.splice(start, end - start + 1, "[redacted]") }
+        else start = end
+      }
+      return parts.join("")
+    })
     .replace(/https?:\/\/\S+/gi, "[url]")
     .replace(/\b(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))\b[^\r\n]*/gi, "[credential]")
-    .replace(/[A-Za-z0-9_+\/=.%-]{20,}/g, "[redacted]")
     .replace(/[\p{C}\p{Z}]+/gu, " ").trim().slice(-200)
 }
 

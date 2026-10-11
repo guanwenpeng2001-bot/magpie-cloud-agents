@@ -3,7 +3,7 @@ import { chatError, errorResponse } from "../lib/errors.mjs"
 import { SESSION_HEADER, sessionOf } from "../lib/sessions.mjs"
 import { DotsQueue, mintToken } from "./dots-queue.mjs"
 import { startMcp } from "./dots-mcp.mjs"
-import { DotsTunnel, dotsFailure } from "./dots-tunnel.mjs"
+import { DotsTunnel, dotsFailure, DOTS_FAILURES } from "./dots-tunnel.mjs"
 
 const ID = "dots", NAME = "ChatGPT Dot", BASE = "https://dots.cloud-agents.invalid/v1"
 const MODELS = { dot: { name: "ChatGPT Dot (replies in minutes)", tool_call: false } }
@@ -87,11 +87,11 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
     },
     async poll(auth, run) {
       const resource = resources.get(auth.dot_token)
-      if (!resource) return { state: "failed", progress: "Dots: the bridge restarted; asking again sends it as a new task" }
+      if (!resource) return { state: "failed", progress: DOTS_FAILURES.restarted }
       const task = resource.queue.get(run.ref)
       if (!task) return { state: "failed", progress: "Dots: the task record is gone; asking again sends it as a new task" }
       if (task.status === "completed") return { state: "succeeded", text: task.result.content }
-      if (task.status === "failed" || task.status === "cancelled") return { state: "failed", progress: task.error || "task cancelled" }
+      if (task.status === "failed" || task.status === "cancelled") return { state: "failed", progress: task.error ? "Untrusted Dot error: " + JSON.stringify(task.error.replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f-\x9f]/g, "")) : "task cancelled" }
       if (task.status === "expired") {
         const message = task.attempts ? "Dots: the Dot took the task but didn't finish; asking again sends it as a new task" : `Dots: no Dot claimed the task within ${ttlMinutes} min. Confirm the connector is added and the account has Dots; asking again sends it as a new task`
         return { state: "failed", progress: message }

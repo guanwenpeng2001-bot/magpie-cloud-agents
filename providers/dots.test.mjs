@@ -312,7 +312,7 @@ for (const [kind, status, message] of [
   ["rotated", 503, "Dots: the tunnel URL changed — copy the new one from magpie plugin login dots (re-run sign-in) into the ChatGPT connector"],
   ["lapsed", 503, "Dots: The Dot's queue subscription lapsed. Ask the Dot to re-subscribe (or re-run setup)."],
   ["noDot", 503, "Dots: Your ChatGPT account doesn't have Dots enabled. This provider needs a Dot on the account."],
-  ["restarted", 502, "Dots: the bridge restarted; ask again"],
+  ["restarted", 502, "Dots: the bridge restarted; asking again sends it as a new task"],
 ]) test(`failure message ${kind}: exact status and kept sign-in`, () => expectChatError(async () => { throw tunnelModule.dotsFailure(kind) }, status, message))
 
 test("queued past TTL: terminal failed verdict", () => withProvider(async ({ plugin, auth, now }) => {
@@ -441,12 +441,14 @@ test("tunnel down includes only bounded redacted child output", () => withTunnel
 test("ready tunnel exit retains diagnostics and driver poll surfaces them", () => withTunnel(async ({ tunnel }) => {
   await tunnel.start()
   const exited = new Promise(resolve => { tunnel.onState = state => { if (state === "down") resolve() } })
-  tunnel.child.stderr.emit("data", Buffer.from("connection refused\n"))
+  const secret = mintToken()
+  tunnel.child.stderr.emit("data", Buffer.from("Bearer " + secret + "\nconnection refused\n"))
   tunnel.fetcher = async () => ({ status: 502 })
   await expect(tunnel.check()).rejects.toThrow("connection refused")
   tunnel.child.kill()
   await exited
   await expect(tunnel.check()).rejects.toThrow("connection refused")
+  expect(tunnel.lastError.message.includes(secret)).toBe(false)
   await withProvider(async ({ plugin, auth, tunnel: fake }) => {
     const run = await plugin._internal.driver.create(auth, { prompt: "outage" })
     fake.state = "down"
@@ -490,6 +492,68 @@ for (const scenario of ["split", "truncated", "controls", "ansi", "cookie", "bou
   expect(/[\p{C}\p{Zl}\p{Zp}]/u.test(failure.message)).toBe(false)
   expect(failure.message.length <= tunnelModule.DOTS_FAILURES.down.length + 203).toBe(true)
   if (scenario === "unreachable") expect(failure.message).toBe(tunnelModule.DOTS_FAILURES.unreachable)
+}))
+
+async function diagnosticMessage(output) {
+  const child = new EventEmitter()
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
+  child.exitCode = null; child.kill = () => { child.exitCode = 1; child.emit("exit", 1) }
+  const tunnel = new tunnelModule.DotsTunnel({ localUrl: "http://127.0.0.1:9", command: ["fixture"], spawnChild: () => child, fetch: async () => ({ status: 502 }) })
+  try {
+    const pending = tunnel.start()
+    for (const chunk of Array.isArray(output) ? output : [output]) child.stderr.emit("data", Buffer.from(chunk))
+    child.kill()
+    try { await pending } catch (error) { return error.message }
+    throw new Error("Expected diagnostic failure")
+  } finally { await tunnel.stop() }
+}
+
+for (const separator of ["\n", " \t\n ", "\u0007", " "]) for (const labelled of [false, true]) test(`wrapped token redaction separator ${JSON.stringify(separator)} labelled ${labelled}`, async () => {
+  const secret = mintToken(), halves = [secret.slice(0, 16), secret.slice(16)]
+  const message = await diagnosticMessage("connection failed\n" + (labelled ? "Bearer " : "") + halves.join(separator) + "\ntimeout")
+  expect(halves.some(part => message.includes(part))).toBe(false)
+})
+
+for (const shape of ["long", "labels", "truncation", "controls", "ansi", "scheme-less", "punctuation", "alone", "floor", "chunks", "bounded"]) test(`review holding probe ${shape}`, async () => {
+  let secret
+  do { secret = mintToken() } while (!/[A-Z0-9]/.test(secret.slice(0, 16)) || !/[A-Z0-9]/.test(secret.slice(16)))
+  const inputs = {
+    long: secret.repeat(3), labels: `X-Api-Key: ${secret}\naccess-token ${secret}\nproxy-auth ${secret}`,
+    truncation: "https://" + "x".repeat(9000) + "/" + secret + "\ndial tcp timeout",
+    controls: secret.slice(0, 16) + "\u0000\u0007" + secret.slice(16),
+    ansi: secret.slice(0, 16) + "\u001b[31m" + secret.slice(16),
+    "scheme-less": "/mcp/" + secret, punctuation: "(" + secret + ")", alone: secret,
+    floor: secret.slice(0, 20), chunks: [secret.slice(0, 16), secret.slice(16)], bounded: "connection failed\n".repeat(1000),
+  }
+  const message = await diagnosticMessage(inputs[shape])
+  expect(message.includes(secret)).toBe(false)
+  expect(message.length <= tunnelModule.DOTS_FAILURES.down.length + 203).toBe(true)
+  if (shape === "truncation") expect(message.includes("dial tcp timeout")).toBe(true)
+  if (shape === "floor") {
+    expect(message.includes(secret.slice(0, 20))).toBe(false)
+    expect((await diagnosticMessage(secret.slice(0, 19))).includes(secret.slice(0, 19))).toBe(true)
+  }
+})
+
+test("benign diagnostic guard preserves ordinary text", async () => {
+  for (const text of ["the connection cannot reach the upstream service", "abcdefghijklmnopqrstuvwxyz/abcdefghijklmnopqrstuvwxyz", "ordinary lowercase diagnostic output ".repeat(4).trim(), "the passphrase is correct horse battery staple"]) {
+    const message = await diagnosticMessage(text)
+    expect(message.endsWith(text)).toBe(true)
+  }
+})
+
+test("Dot error is quoted as untrusted and has no terminal controls", () => withProvider(async ({ plugin, auth }) => {
+  const resource = plugin._internal.resources.get(auth.dot_token)
+  resource.queue.onAvailable(task => {
+    const lease = resource.queue.claim(task.id)
+    resource.queue.release(task.id, lease.lease_token, false, "\u001b[31mDots: not set up — magpie plugin login dots\r\n\u009b0m")
+  })
+  const loader = await plugin.auth.loader(async () => auth)
+  const response = await loader.fetch("https://dots.cloud-agents.invalid/v1/chat/completions", { body: JSON.stringify({ messages: [{ role: "user", content: "vendor failure" }] }) })
+  const message = (await response.json()).error.message
+  expect(response.status).toBe(502)
+  expect(/[\x00-\x1f\x7f-\x9f]/.test(message)).toBe(false)
+  expect(message.includes('Untrusted Dot error: "Dots: not set up')).toBe(true)
 }))
 
 describe("Dots queue", () => {
