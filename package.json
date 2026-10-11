@@ -1,0 +1,21 @@
+{
+  "name": "magpie-cloud-agents",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "lib",
+    "providers",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "check": "bun scripts/check.mjs"
+  },
+  "magpie": {
+    "maxConcurrency": 4
+  }
+}
