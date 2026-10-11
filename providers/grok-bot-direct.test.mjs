@@ -379,21 +379,31 @@ for (const row of [{ agentId: "bot-one", isRunning: false }, { agentId: "bot-one
   expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "The answer is 42." })
 })
 
-test("stale nested busy state fails visibly instead of completing or hanging", async () => {
-  const rows = [assistant(1, "Let me work that out.")]
+test("stale running rows use stability for growing, complete and paused transcripts", async () => {
+  let rows = []
   const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", isRunning: false, live: { isRunning: true, updatedAtMs: "1723456600000", staleAfterMs: "90000" } }] } : { dispatched: true })
   const run = await driver.create({}, { model: "bot-one", prompt: "question" })
-  await failure(driver.poll({}, run), "Grok Bot direct: the bot's live status is stale — its last update is older than the vendor's own staleness window, so the turn was not finished", 504, "kept")
+  rows = [assistant(1, "Let me work that out.")]
+  expect((await driver.poll({}, run)).state).toBe("running")
+  rows.push(assistant(2, "Working through the details."))
+  expect((await driver.poll({}, run)).state).toBe("running")
+  rows.push(assistant(3, "The answer is 42."))
+  expect((await driver.poll({}, run)).state).toBe("running")
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "The answer is 42." })
+  const next = await driver.followUp({}, run, ["another question"])
+  rows.push(assistant(4, "Let me work that out."))
+  expect((await driver.poll({}, next)).state).toBe("running")
+  expect(await driver.poll({}, next)).toEqual({ state: "succeeded", text: "Let me work that out." })
 })
 
-test("nested busy without staleness fields uses the vendor default window", async () => {
-  let clock = 1723456789000
-  const rows = [assistant(1, "Let me work that out.")]
+test("subagents without staleness fields never age out", async () => {
+  let clock = 1723456789000, rows = []
   const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", isRunning: false, live: { hasRunningSubagents: true } }] } : { dispatched: true }, {}, { now: () => clock })
   const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "preamble")]
   expect((await driver.poll({}, run)).state).toBe("running")
-  clock += 90000
-  await failure(driver.poll({}, run), "Grok Bot direct: the bot's live status is stale — its last update is older than the vendor's own staleness window, so the turn was not finished", 504, "kept")
+  clock += 3600000
+  expect((await driver.poll({}, run)).state).toBe("running")
 })
 
 test("snake_case nested busy fields are read", async () => {
@@ -457,16 +467,100 @@ test("idle with an empty transcript stays running", async () => {
   for (let poll = 0; poll < 3; poll++) expect((await driver.poll({}, run)).state).toBe("running")
 })
 
-test("status authentication errors cannot fall back to success", async () => {
-  const { driver } = harness(method => method === "ListGrokBotAgentStatuses" ? new Response(null, { status: 401 }) : method === "ListGrokBotTranscriptEntries" ? { entries: [] } : method === "GetGrokBotSendStatus" ? { status: 2 } : { dispatched: true })
+test("HTTP 401 on advisory status expires sign-in without re-deriving credentials", async () => {
+  const { driver, calls, rotations } = harness(method => method === "ListGrokBotAgentStatuses" ? new Response(null, { status: 401 }) : method === "ListGrokBotTranscriptEntries" ? { entries: [] } : method === "GetGrokBotSendStatus" ? { status: 2 } : { dispatched: true })
   const run = await driver.create({}, { model: "bot-one", prompt: "question" })
   await failure(driver.poll({}, run), serverRefusal, 401, "expired")
+  expect(rotations.filter(Boolean)).toHaveLength(0)
+  expect(calls.filter(call => call.url.endsWith("ListGrokBotAgentStatuses"))).toHaveLength(1)
 })
 
 test("a bare 401 status without the sign-in marker still propagates", async () => {
   const { driver } = harness(method => method === "ListGrokBotAgentStatuses" ? new Response(JSON.stringify({ status: 401, message: "unauthorized" }), { status: 500, headers: { "content-type": "application/json" } }) : method === "ListGrokBotTranscriptEntries" ? { entries: [] } : method === "GetGrokBotSendStatus" ? { status: 2 } : { dispatched: true })
   const run = await driver.create({}, { model: "bot-one", prompt: "question" })
   await failure(driver.poll({}, run), "unauthorized — the provider's protocol table may need an update", 401, "kept")
+})
+
+for (const [name, live] of nestedBusy.filter(([name]) => name !== "live.isRunning")) test(`aged ${name} stays busy`, async () => {
+  let rows = []
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", isRunning: false, live: { ...live, updatedAtMs: "1", staleAfterMs: "10" } }] } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "preamble")]
+  for (let poll = 0; poll < 3; poll++) expect((await driver.poll({}, run)).state).toBe("running")
+})
+
+for (const sessionField of ["sessionId", "session_id"]) test(`foreign ${sessionField} cannot override this run's idle row`, async () => {
+  let rows = []
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [
+    { agentId: "bot-one", isRunning: true, live: { [sessionField]: "other-session", isRunning: true, updatedAtMs: "1" } },
+    { agentId: "bot-one", isRunning: true, live: { [sessionField]: "other-session", awaiting: {} } },
+    { agentId: "bot-one", isRunning: false, live: { [sessionField]: "fixture-session", isRunning: false } },
+  ] } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "answer")]
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "answer" })
+})
+
+for (const flat of [false, true]) test(`stale running with flat ${flat} demotes while fresh idle still wins`, async () => {
+  let rows = [], statuses = [{ agentId: "bot-one", isRunning: flat, live: { sessionId: "fixture-session", isRunning: true, updatedAtMs: "1", staleAfterMs: "10" } }]
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "answer")]
+  expect((await driver.poll({}, run)).progress).toContain("demoted")
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "answer" })
+  run.view.stable = undefined
+  statuses.push({ agentId: "bot-one", isRunning: false })
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "answer" })
+})
+
+for (const window of [10, 90000]) test(`undated running demotes at window ${window}`, async () => {
+  let clock = 1723456789000, rows = []
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", isRunning: false, live: { isRunning: true, ...(window === 10 ? { staleAfterMs: "10" } : {}) } }] } : { dispatched: true }, {}, { now: () => clock })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "answer")]
+  expect((await driver.poll({}, run)).state).toBe("running")
+  clock += window - 1
+  expect((await driver.poll({}, run)).progress).toContain("still running")
+  clock++
+  expect((await driver.poll({}, run)).progress).toContain("demoted")
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "answer" })
+})
+
+for (const signal of [{ awaiting: {} }, { boxHandoffRequestId: "handoff" }, { isComposingMessage: true }, { hasRunningSubagents: true }]) test(`demotion preserves independent busy signal ${JSON.stringify(signal)}`, async () => {
+  let rows = []
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", isRunning: false, live: { isRunning: true, updatedAtMs: "1", ...signal } }] } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "preamble")]
+  for (let poll = 0; poll < 3; poll++) expect((await driver.poll({}, run)).state).toBe("running")
+})
+
+test("authorize discloses stopped transcript completion after demotion", () => {
+  const { driver } = harness()
+  expect(driver.authorize().instructions).toContain("stale running row is demoted")
+  expect(driver.authorize().instructions).toContain("partial answer may be delivered as final when its transcript stops growing")
+})
+
+test("flat absent nested idle must pass through stability", async () => {
+  let rows = []
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", live: { isRunning: false, hasRunningSubagents: false } }] } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "preamble")]
+  expect((await driver.poll({}, run)).state).toBe("running")
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "preamble" })
+})
+
+test("status authentication failure precedes transcript failure", async () => {
+  let polling = false
+  const { driver, calls } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") return polling ? new Response("transcript failed", { status: 502 }) : { entries: [] }
+    if (method === "GetGrokBotSendStatus") return { status: 2 }
+    if (method === "ListGrokBotAgentStatuses") return new Response(null, { status: 401 })
+    return { dispatched: true }
+  })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  polling = true
+  await failure(driver.poll({}, run), serverRefusal, 401, "expired")
+  expect(calls.filter(call => call.url.endsWith("ListGrokBotTranscriptEntries"))).toHaveLength(1)
 })
 
 test("retained headers cleared and credential-bearing errors redacted", async () => {

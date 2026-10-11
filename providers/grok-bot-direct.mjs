@@ -7,41 +7,35 @@ const HOST = "api2.cursor.sh"
 const SERVICE = "aiserver.v1.GrokBotService"
 // The app's transcript watch uses 90s when a live row omits stale_after_ms (bundle: `var hJ=9e4`).
 const DEFAULT_STALE_AFTER_MS = 90000
-const STALE_LIVE = "Grok Bot direct: the bot's live status is stale — its last update is older than the vendor's own staleness window, so the turn was not finished"
 const REFUSED = "Grok Bot direct: the app's sign-in was refused by the server — open Grok Bot desktop once to refresh it, then retry"
 const protocolError = message => chatError(502, `${message} — the provider's protocol table may need an update`, "kept")
 const record = value => value !== null && typeof value === "object" && !Array.isArray(value)
 const flag = (row, camel, snake) => { const value = row[camel] ?? row[snake]; return typeof value === "boolean" ? value : undefined }
 const text = (row, camel, snake) => { const value = row[camel] ?? row[snake]; return typeof value === "string" && value ? value : undefined }
 
-// A live row is busy the way the app's adapter reads it: running or a running subagent, or still
-// composing, awaiting the user, or holding a box handoff. `updated_at_ms` + `stale_after_ms` bound
-// how long such a row may keep the turn open; both come from the row, never from an invented timer.
 export function liveActivity(row, milliseconds, seen = undefined) {
   const live = record(row.live) ? row.live : undefined
   const flat = flag(row, "isRunning", "is_running")
   if (!live) return { busy: flat === true, idle: flat === false, stale: false }
   const running = flag(live, "isRunning", "is_running")
   const subagents = flag(live, "hasRunningSubagents", "has_running_subagents")
+  // Composing alone deliberately blocks completion; the app requires running && composing.
   const composing = flag(live, "isComposingMessage", "is_composing_message")
   const awaiting = record(live.awaiting)
   const handoff = text(live, "boxHandoffRequestId", "box_handoff_request_id") !== undefined
-  const busy = running === true || subagents === true || composing === true || awaiting || handoff
-  // Positively idle: nothing in the nested row asserts work, and the flat field is an explicit false.
-  // An unreadable nested flag is not busyness, so it must not block a flat idle reading forever.
-  const idle = !busy && flat === false
   const updatedAt = Number(live.updatedAtMs ?? live.updated_at_ms)
   const staleAfter = Number(live.staleAfterMs ?? live.stale_after_ms)
   const window = Number.isFinite(staleAfter) && staleAfter > 0 ? staleAfter : DEFAULT_STALE_AFTER_MS
-  // A row that names no update time cannot be dated, so the window runs from the first time its content is seen.
   let basis = Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : undefined
-  if (basis === undefined && seen) {
+  if (running === true && basis === undefined && seen) {
     const key = JSON.stringify(live)
     seen[key] ??= milliseconds
     basis = seen[key]
   }
-  const stale = busy && basis !== undefined && milliseconds - basis >= window
-  return { busy, idle, stale }
+  const stale = running === true && basis !== undefined && Math.max(0, milliseconds - basis) >= window
+  const busy = (!stale && (flat === true || running === true)) || subagents === true || composing === true || awaiting || handoff
+  const idle = !busy && flat === false
+  return { busy, idle: idle && !stale, stale }
 }
 
 export function cursorChecksum(machineId, milliseconds = Date.now()) {
@@ -150,7 +144,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     async verify({ signal, retryAuth = true } = {}) { return list(signal, retryAuth) },
     async liveModels(credential, signal) { return Object.fromEntries((await list(signal)).map(agent => [agent.id, { name: agent.name, tool_call: false }])) },
     authorize() {
-      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first. If bot status is unavailable, completion falls back to transcript stability: a paused bot's partial answer may be delivered as final. A flat idle reading is not trusted while the bot's nested live state still shows work in progress. The live status response itself has not been observed from the server, so that reading follows the app's own schema.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first. If bot status is unavailable or a stale running row is demoted, completion falls back to transcript stability: a paused bot's partial answer may be delivered as final when its transcript stops growing. A flat idle reading is not trusted while the bot's nested live state still shows work in progress. The live status response itself has not been observed from the server, so that reading follows the app's own schema.", callback: async () => {
         try {
           await store.get()
           return { type: "success", refresh: "dpapi-derive", access: "derived-in-memory", expires: 0, accountId: "grok-bot-direct" }
@@ -176,17 +170,20 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       let running, stale = false
       try {
         const result = await request("ListGrokBotAgentStatuses", { agent_ids: [agentId] }, signal, false)
-        const matches = Array.isArray(result.statuses) ? result.statuses.filter(row => record(row) && (row.agentId ?? row.agent_id) === agentId) : []
+        const matches = Array.isArray(result.statuses) ? result.statuses.filter(row => {
+          if (!record(row) || (row.agentId ?? row.agent_id) !== agentId) return false
+          const rowSession = row.live?.sessionId ?? row.live?.session_id
+          return rowSession == null || rowSession === "" || rowSession === session
+        }) : []
         run.view.seen ??= {}
         const states = matches.map(row => liveActivity(row, now(), run.view.seen))
-        if (states.some(state => state.busy && !state.stale)) running = true
-        else if (states.some(state => state.stale)) stale = true
-        else if (states.length && states.every(state => state.idle)) running = false
+        stale = states.some(state => state.stale)
+        if (states.some(state => state.busy)) running = true
+        else if (states.some(state => state.idle) && states.every(state => state.idle || state.stale)) running = false
       } catch (error) {
         if (signal?.aborted) throw signal.reason
         if (error?.status === 401 || error?.signIn === "expired") throw error
       }
-      if (stale && running !== true) throw chatError(504, STALE_LIVE, "kept")
       const entries = await tail(agentId, session, signal)
       const echoId = status.echoEntryId ?? status.echo_entry_id
       const ordered = entries.filter(record).slice().sort((left, right) => {
@@ -204,7 +201,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       }
       if (accepted && text && (running === false || run.view.stable === fingerprint)) return { state: "succeeded", text }
       run.view.stable = accepted && text ? fingerprint : undefined
-      return { state: "running", progress: running === undefined ? "Grok Bot direct: status unavailable; using transcript stability — a paused bot's partial answer may be delivered as final" : "Grok Bot direct: waiting for the bot" }
+      return { state: "running", progress: running === undefined ? `Grok Bot direct: ${stale ? "stale running status demoted" : "status unavailable"}; using transcript stability — a paused bot's partial answer may be delivered as final` : "Grok Bot direct: waiting for the bot" }
     },
     async cancel(credential, run) { await request("InterruptGrokBotAgentRun", { agent_id: run.ref.agentId, reason: "user-cancel", session_id: run.ref.sessionId }) },
     dispose() { disposed = true; store.dispose() },
