@@ -62,7 +62,7 @@ Entry functions pass the package's options through to each provider factory (`ma
 | `grokBot.launchTimeoutMs` | `10000` | How long app launch may take |
 | `grokBot.ghostMode` | `true` | `x-ghost-mode: true` header on direct-protocol requests |
 
-Every provider sets `maxConcurrency: 4`.
+Every provider runs at `maxConcurrency: 4`.
 
 ## Providers
 
@@ -72,7 +72,7 @@ The `codex` CLI labels this feature experimental, and so does this package. **Bi
 
 **Sign in.** `magpie plugin login codex-cloud` reuses the CLI's own login — nothing is typed in; you only paste the environment id from Codex web (Environments). The callback runs `codex login status` to prove the CLI is signed in; a logged-out CLI fails with an instruction to run `codex login`.
 
-**Per turn.** The driver spawns `codex cloud exec --env <env> --attempts <n> -- <prompt>` (CLI calls time out after 30 seconds; the diff fetch after 3, and a timed-out diff leaves the turn running to retry the same task), parses the task reference from the output, and falls back to the environment's newest task when parsing fails — in that case the reply carries the warning `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.` Polling runs `codex cloud status`; a successful state fetches `codex cloud diff` (truncated at 100 KiB). An identical resend reuses the same task; a resend after a terminal verdict starts a new one.
+**Per turn.** The driver spawns `codex cloud exec --env <env> --attempts <n> -- <prompt>` (CLI calls time out after 30 seconds; the diff fetch after 3, and a timed-out diff leaves the turn running to retry the same task), parses the task reference from the output, and falls back to the environment's newest task when parsing fails — in that case the reply carries the warning `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.` Polling runs `codex cloud status`; a successful state fetches `codex cloud diff` (truncated at 100 KiB). An identical resend reuses the same task; a resend after a failed or expired verdict starts a new one.
 
 **Status interpretation is heuristic and experimental.** It was tested only on constructed examples. Continuations with no marker or with a marker outside the recognized set — `work continues on the parser`, `the worker proceeds to packaging`, `the agent keeps indexing the tree`, `the migration is underway` — can be mistaken for completion and return an unfinished diff, so verify task completion independently before using a returned diff. Conversely, completed summaries can remain attached and time out without a diff: subject gerunds (`testing is complete`, `indexing is finished`, `testing passed`), predicate adjectives (`the file is missing`, `one test is failing`), sequencing, modal and intent summaries (`now the tests pass`, `the tests will pass on retry`, `nothing left to be verified`). Bare `Error` diagnostics also remain running.
 
@@ -96,7 +96,7 @@ The `codex` CLI labels this feature experimental, and so does this package. **Bi
 
 **Models.** `composer-2` and `claude-sonnet-4-5` statically; live models from `/v1/models` are added defensively when the shape is recognized.
 
-**Behaviour.** Agents are created with the name `magpie: ` plus the first 60 characters of the current request, and a deterministic agent id per session so follow-ups attach to the same agent. An `ERROR` run that still wrote a result is delivered with a `⚠ run ended ERROR` footer and any git branch/PR links the run reported. A 409 `agent_busy` returns an instruction to wait for or cancel the running agent.
+**Behaviour.** Agents are created with the name `magpie: ` plus the first 60 characters of the current request, and a deterministic per-request idempotency key (not a per-session id) so follow-ups attach to the same agent. An `ERROR` run that still wrote a result is delivered with a `⚠ run ended ERROR` footer and any git branch/PR links the run reported. A 409 `agent_busy` returns an instruction to wait for or cancel the running agent.
 
 ### devin-cloud — Devin Cloud
 
@@ -212,8 +212,8 @@ Everything below is unverified, stated plainly. None of it was tested, and nothi
 | The direct send path (`SendGrokBotUserMessage`, enums, transcript-entry shape, `session_id` semantics) | One read-only listing verified; every write and most read shapes unobserved | First real use |
 | CDP bot-list bridge return shapes and signed-in probe fields | Synthetic shapes from bundle reading | First live attach |
 | App-update drift (bridges/UI) | Inherent | Time; failures say the provider needs an update |
-| Real vendor compatibility for every provider | No real vendor call was made in this run | First real use of each provider |
-| The `.cmd`-shim case | A machine whose `codex` is an npm shim fails every request on the folded prompt's newline | A machine with a real `codex` binary |
+| Real vendor compatibility for every provider | No authenticated vendor call completed in this run | First real use of each provider |
+| The `.cmd`-shim case | Not reproducible on this host — its `codex` is a real binary, not an npm shim | A machine whose `codex` is an npm shim, failing every request on the folded prompt's newline |
 
 ## 中文说明
 
@@ -279,7 +279,7 @@ magpie plugin list
 | `grokBot.launchTimeoutMs` | `10000` | 应用启动的最长等待 |
 | `grokBot.ghostMode` | `true` | 直连协议请求携带 `x-ghost-mode: true` 头 |
 
-每个 provider 均设置 `maxConcurrency: 4`。
+所有 provider 均以 `maxConcurrency: 4` 运行。
 
 ### 各 provider
 
@@ -289,7 +289,7 @@ magpie plugin list
 
 **登录。** `magpie plugin login codex-cloud` 复用 CLI 自身的登录——无需输入任何内容；你只需粘贴 Codex 网页（Environments）中的 environment id。回调会运行 `codex login status` 证明 CLI 已登录；CLI 未登录时失败并提示运行 `codex login`。
 
-**每轮行为。** 驱动器启动 `codex cloud exec --env <env> --attempts <n> -- <prompt>`（CLI 调用 30 秒超时；diff 拉取 3 秒，超时的 diff 会让该轮保持运行以便重试同一任务），从输出解析任务引用；解析失败时回退为该环境的最新任务——此时回复会带上警告 `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.`（任务引用由环境最新任务推断；归属未验证，可能是其他会话的工作）。轮询运行 `codex cloud status`；成功状态会拉取 `codex cloud diff`（100 KiB 处截断）。完全相同的重发会复用同一任务；终局判定后的重发会启动新任务。
+**每轮行为。** 驱动器启动 `codex cloud exec --env <env> --attempts <n> -- <prompt>`（CLI 调用 30 秒超时；diff 拉取 3 秒，超时的 diff 会让该轮保持运行以便重试同一任务），从输出解析任务引用；解析失败时回退为该环境的最新任务——此时回复会带上警告 `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.`（任务引用由环境最新任务推断；归属未验证，可能是其他会话的工作）。轮询运行 `codex cloud status`；成功状态会拉取 `codex cloud diff`（100 KiB 处截断）。完全相同的重发会复用同一任务；失败或过期判定后的重发会启动新任务。
 
 **状态解读是启发式且实验性的。** 仅在构造样例上测试过。没有标记或标记不在识别集合内的进行时表述——`work continues on the parser`、`the worker proceeds to packaging`、`the agent keeps indexing the tree`、`the migration is underway`——可能被误判为已完成并返回未完成的 diff，因此使用返回的 diff 前请独立确认任务是否完成。反过来，表述已完成的总结也可能一直挂在运行态并超时且拿不到 diff：主语动名词（`testing is complete`、`indexing is finished`、`testing passed`）、表语形容词（`the file is missing`、`one test is failing`），以及顺序、情态与意图类总结（`now the tests pass`、`the tests will pass on retry`、`nothing left to be verified`）。裸 `Error` 诊断同样会保持在运行态。
 
@@ -313,7 +313,7 @@ magpie plugin list
 
 **模型。** 静态为 `composer-2` 与 `claude-sonnet-4-5`；`/v1/models` 返回形状可识别时会防御性地补充在线模型。
 
-**行为。** agent 以 `magpie: ` 加当前请求前 60 字符命名，并按会话生成确定性 agent id，使后续轮次附着到同一 agent。带结果的 `ERROR` 运行会送达结果并附 `⚠ run ended ERROR` 页脚及运行报告的 git 分支/PR 链接。409 `agent_busy` 返回等待或取消当前运行的指引。
+**行为。** agent 以 `magpie: ` 加当前请求前 60 字符命名，并按每次请求生成确定性的幂等键（而非按会话的 id），使后续轮次仍附着到同一 agent。带结果的 `ERROR` 运行会送达结果并附 `⚠ run ended ERROR` 页脚及运行报告的 git 分支/PR 链接。409 `agent_busy` 返回等待或取消当前运行的指引。
 
 #### devin-cloud —— Devin Cloud
 
@@ -429,8 +429,8 @@ MAGPIE=/path/to/magpie sh scripts/try.sh --metadata-only
 | 直连发送路径（`SendGrokBotUserMessage`、枚举、记录条目形状、`session_id` 语义） | 仅一次只读列表验证过；全部写入与多数读取形状未观测 | 第一次真实使用 |
 | CDP bot 列表桥返回形状与登录探测字段 | 来自包读取的合成形状 | 第一次真实 attach |
 | 应用更新导致的漂移（桥/UI） | 固有存在 | 时间；失败信息会说明 provider 需要更新 |
-| 每个 provider 的真实厂商兼容性 | 本次运行未做任何真实厂商调用 | 每个 provider 的第一次真实使用 |
-| `.cmd` shim 情形 | `codex` 实为 npm shim 的机器上，每次请求都因折叠提示词的换行而失败 | 一台装有真正 `codex` 二进制的机器 |
+| 每个 provider 的真实厂商兼容性 | 本次运行未完成任何已通过认证的厂商调用 | 每个 provider 的第一次真实使用 |
+| `.cmd` shim 情形 | 本机不可复现——其 `codex` 是真正的二进制，而非 npm shim | 一台 `codex` 实为 npm shim 的机器：每次请求都因折叠提示词的换行而失败 |
 
 ## License
 
