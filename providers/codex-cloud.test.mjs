@@ -254,6 +254,41 @@ for (const text of continuingRows) test(`continuation remains attached through t
   expect(diffs).toBe(0)
   expect(polls).toBe(2)
 })
+const structuralRows = [
+  "Done; checking the logs", "Completed; examining the failures", "Failed; investigating the cause",
+  "Done; rebuilding the index", "Completed; downloading the artifacts",
+  "Done; auditing the bundle", "Completed; encrypting archives", "Failed; diagnosing the fault",
+  "Done; synchronizing", "Done; now packaging artifacts", "Done, compiling modules",
+  "Done — uploading artifacts", "Completed. Scanning dependencies", "Done; the agent is indexing",
+  "Done; artifacts saved, then compressing outputs", "Done; cautiously deploying services",
+  "Done; frobniculating the fixture",
+]
+for (const text of structuralRows) test(`structural continuation: ${text}`, () => expect(_internal.stateOf(text)).toBe("running"))
+for (const text of structuralRows) test(`structural continuation keeps its task through the core: ${text}`, async () => {
+  let creates = 0, diffs = 0
+  const cli = async args => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") { creates++; return reply("task_abc123") }
+    if (args[1] === "status") return reply(text)
+    if (args[1] === "diff") { diffs++; return reply("unfinished diff") }
+    throw new Error("unexpected CLI invocation")
+  }
+  const loader = await makeCodexCloud({ maxRunMinutes: 0.001 }, { cli }).auth.loader(async () => auth)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await loader.fetch(endpoint, request())
+    expect(response.status).toBe(504)
+    expect(await response.text()).not.toContain("unfinished diff")
+  }
+  expect(creates).toBe(1)
+  expect(diffs).toBe(0)
+})
+test("status argv uses the created bare task reference even when a URL exists", async () => {
+  const script = scripted([reply("https://chatgpt.com/codex/tasks/task_abc123"), reply("running")])
+  const driver = _internal.makeDriver({ codexCloud: { env: "fake" } }, script.cli)
+  const run = await driver.create({}, { prompt: "repair parser" })
+  await driver.poll({}, run)
+  expect(script.calls[1].args).toEqual(["cloud", "status", "task_abc123"])
+})
 const clauseRows = [
   ["succeeded", "Completed: fixed the running indicator"],
   ["succeeded", "Done: updated the queued jobs panel"],

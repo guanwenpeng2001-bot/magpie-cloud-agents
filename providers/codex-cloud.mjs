@@ -59,7 +59,12 @@ const continuationWords = "running|starting|continuing|retrying|reconnecting|res
 const leadingContinuation = new RegExp("^\\s*(?:(?:still|now|again|then|also|already|currently|just|back|and|but|so)\\s+)*(?:" + continuationWords + ")\\b", "i")
 function continues(rest) {
   return rest.split(/[,;—]|\.\s/).some((clause, index) => {
-    if (index > 0 && leadingContinuation.test(clause)) return true
+    if (index > 0) {
+      const opening = /^\s*(?:(?:now|still|then|again|also|already|currently|just|and|but|so|[a-z]+ly)\s+)*([a-z]{2,}ing)\b/i.exec(clause)
+      if (opening && !/^(?:no|some|any|every)thing$/i.test(opening[1])) return true
+      if (/\b(?:am|is|are|was|were|been|be)\s+(?:(?:still|now|[a-z]+ly)\s+)*[a-z]{2,}ing\b/i.test(clause)) return true
+      if (leadingContinuation.test(clause)) return true
+    }
     for (const match of clause.matchAll(new RegExp("\\b(?:" + continuationWords + ")\\b", "gi"))) {
       const after = clause.slice(match.index + match[0].length)
       if (!after.trim() || /^\s*[.:]/.test(after)) return true
