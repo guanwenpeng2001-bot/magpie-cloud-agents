@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto"
 import { access } from "node:fs/promises"
 import { spawn, execFile } from "node:child_process"
 import { promisify } from "node:util"
@@ -19,9 +20,18 @@ const failure = key => chatError(key === "signedOut" ? 401 : key === "running" ?
 const execute = promisify(execFile)
 
 async function processes() {
-  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='Grok Bot.exe'\" | Select-Object ProcessId,CommandLine) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
+  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='Grok Bot.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,CreationDate) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
   const rows = JSON.parse(stdout || "[]")
-  return (Array.isArray(rows) ? rows : [rows]).map(row => ({ pid: row.ProcessId, port: Number(row.CommandLine?.match(/--remote-debugging-port[= ](\d+)/)?.[1]) || undefined }))
+  return (Array.isArray(rows) ? rows : [rows]).map(row => ({ pid: row.ProcessId, executable: row.ExecutablePath, created: row.CreationDate, managedTag: row.CommandLine?.match(/--magpie-grok-managed=([0-9]+:[0-9a-f-]+)/)?.[1], port: Number(row.CommandLine?.match(/--remote-debugging-port[= ](\d+)/)?.[1]) || undefined }))
+}
+function parentAlive(pid) {
+  try { process.kill(pid, 0); return true } catch (error) { return error.code !== "ESRCH" }
+}
+async function stopManaged(row) {
+  const script = `$expected = [Console]::In.ReadToEnd() | ConvertFrom-Json; $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"; if ($process -and $process.ExecutablePath -eq $expected.executable -and $process.CreationDate -eq $expected.created -and $process.CommandLine.Contains("--magpie-grok-managed=$($expected.managedTag)")) { Invoke-CimMethod -InputObject $process -MethodName Terminate | Out-Null }`
+  const child = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 5000 })
+  child.stdin.end(JSON.stringify(row))
+  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", code => code === 0 ? resolve() : reject(failure("debug"))) })
 }
 async function freePort() {
   const server = createServer()
@@ -117,7 +127,7 @@ const domTail = `(() => {
 })()`
 
 export function createGrokBotCdp(options = {}, dependencies = options.dependencies ?? {}) {
-  const deps = { env: process.env, spawn, processes, freePort, fetch: globalThis.fetch, timers: clock, connect: connectCdp, ...dependencies }
+  const deps = { env: process.env, spawn, processes, parentAlive, stopManaged, freePort, fetch: globalThis.fetch, timers: clock, connect: connectCdp, ...dependencies }
   const timers = deps.timers
   let connection, connecting, owned, idleTimer
   const active = new Map()
@@ -154,12 +164,22 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
   }
   async function start(signal) {
     const executable = await findGrokBot(deps)
-    const previous = await deps.processes()
+    let previous
+    try { previous = await deps.processes() } catch { throw failure("debug") }
     for (const port of [...new Set([...(options.reattachPorts ?? []), ...previous.map(row => row.port)])]) {
-      if (await version(port, signal)) return attach(port, signal)
+      if (await version(port, signal)) {
+        const client = await attach(port, signal)
+        const row = previous.find(row => row.port === port && row.created && row.executable?.toLowerCase() === executable.toLowerCase() && /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.managedTag ?? ""))
+        if (row && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) owned = { exitCode: null, kill: () => {
+          void deps.processes().then(rows => {
+            if (rows.some(current => current.pid === row.pid && current.created === row.created && current.executable === row.executable && current.managedTag === row.managedTag) && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) return deps.stopManaged(row)
+          }).catch(() => {})
+        } }
+        return client
+      }
     }
     const port = await deps.freePort()
-    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"], { stdio: "ignore", windowsHide: false })
+    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-grok-managed=${process.pid}:${randomUUID()}`], { stdio: "ignore", windowsHide: false })
     child.once?.("error", () => launchErrors.add(child))
     if (!previous.length) owned = child
     const started = timers.now()
@@ -175,11 +195,12 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
   async function ensure(signal) {
     touch()
     if (connection?.open) return connection
-    if (!connecting) connecting = start(signal).then(value => connection = value).finally(() => { connecting = undefined; idle() })
+    if (!connecting) connecting = start(signal).then(value => connection = value).catch(error => { signal?.throwIfAborted(); if (error.status) throw error; throw failure("debug") }).finally(() => { connecting = undefined; idle() })
     return connecting
   }
   async function signedIn(client, signal) {
-    if (!await client.evaluate(probe, signal)) throw failure("signedOut")
+    try { if (!await client.evaluate(probe, signal)) throw failure("signedOut") }
+    catch (error) { signal?.throwIfAborted(); if (error.bridge) throw failure("changed"); throw error }
   }
   async function bots(client, signal) {
     const value = await client.evaluate(`(async () => { const agent = window.desktop.agent; const rows = await Promise.allSettled([agent.getPinnedAgents(), agent.listGrokBotTeamAgents?.({})]); return rows.map(row => row.status === "fulfilled" ? row.value : null); })()`, signal)
@@ -188,7 +209,8 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
   async function tail(client, agentId, signal) {
     try { return entriesOf(await client.evaluate(`window.desktop.agent.readTranscriptStoreTail(${JSON.stringify({ agentId, limit: 50, reason: "server-tail" })})`, signal)) }
     catch (error) {
-      if (!error.bridge || !/invalid-args/.test(error.message)) throw error
+      if (!error.bridge) throw error
+      if (!/invalid-args/.test(error.message)) throw failure("changed")
       try { return entriesOf(await client.evaluate(domTail, signal)) }
       catch (fallback) { if (!client.open) throw failure("crashed"); throw failure("changed") }
     }
@@ -203,7 +225,8 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     try { await client.evaluate(`window.desktopMount.submitPrompt(${JSON.stringify({ prompt })})`, signal) }
     catch (error) {
       // A lost response may have submitted already; only contract failures can safely retry input.
-      if (!error.bridge || !/invalid-args|not a function|not mounted|undefined/.test(error.message)) throw error
+      if (!error.bridge) throw error
+      if (!/invalid-args|not a function|not mounted|undefined/.test(error.message)) throw failure("changed")
       return uiSend(client, bot, prompt, signal)
     }
     return ""
@@ -232,12 +255,16 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
         bot = { id: selected, name: selected }
       }
       if (active.has(bot.id)) throw chatError(409, "Grok Bot already has an active turn for this bot — wait for its answer before sending another")
-      run = { ref: bot.id, view: bot.name, bot, prompt: request.prompt, baseline: [], lastTail: null, recovered: false, signal }
+      const turnIndex = request.identity?.turnIndex ?? request.turnIndex ?? 0
+      const sessionKey = request.identity?.sessionKey ?? request.sessionKey ?? ""
+      const messageId = createHash("sha256").update(JSON.stringify([bot.id, sessionKey, turnIndex, request.prompt])).digest("hex").slice(0, 24)
+      run = { ref: bot.id, view: bot.name, bot, messageId, turnIndex, sessionKey, prompt: `${request.prompt}\n\n[Magpie turn: ${messageId}]`, baseline: [], lastTail: null, signal }
       run.onAbort = () => { release(run); idle() }
       active.set(bot.id, run)
-    } finally { idle() }
+    } catch (error) { if (error.bridge) throw failure("changed"); throw error }
+    finally { idle() }
     signal?.addEventListener("abort", run.onAbort, { once: true })
-    try { signal?.throwIfAborted(); run.baseline = await tail(client, run.bot.id, signal); run.progress = await send(client, run.bot, request.prompt, signal) }
+    try { signal?.throwIfAborted(); run.baseline = await tail(client, run.bot.id, signal); if (!run.baseline.some(entry => entry.role === "user" && entry.text.includes(`[Magpie turn: ${run.messageId}]`))) run.progress = await send(client, run.bot, run.prompt, signal) }
     catch (error) { release(run); throw error }
     finally { idle() }
     return run
@@ -253,20 +280,26 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
         entries = await tail(client, run.bot.id, signal)
       } catch (error) {
         if (error.status === 401 || error.bridge || error.message === CDP_ERRORS.changed || signal?.aborted) throw error
-        if (run.recovered) throw failure("crashed")
-        run.recovered = true
         connection?.close(); connection = undefined
         try { client = await ensure(signal); await signedIn(client, signal); entries = await tail(client, run.bot.id, signal) }
-        catch (recovery) { if (recovery.status === 401 || signal?.aborted) throw recovery; throw failure("crashed") }
+        catch (recovery) { if (recovery.status === 401 || recovery.message === CDP_ERRORS.changed || signal?.aborted) throw recovery; throw failure("crashed") }
       }
       const signature = JSON.stringify(entries)
       const stable = signature === run.lastTail
       run.lastTail = signature
-      const baselineIds = new Set(run.baseline.map(entry => entry.id).filter(Boolean))
-      const userIndex = entries.findLastIndex(entry => entry.role === "user" && entry.text === run.prompt && (!entry.id || !baselineIds.has(entry.id)))
-      const replies = userIndex < 0 ? [] : entries.slice(userIndex + 1).filter(entry => !entry.id || !baselineIds.has(entry.id))
+      const matches = entries.flatMap((entry, index) => entry.role === "user" && entry.text.includes(`[Magpie turn: ${run.messageId}]`) ? [index] : [])
+      const userIndex = matches.length === 1 ? matches[0] : -1
+      const nextUser = entries.findIndex((entry, index) => index > userIndex && entry.role === "user")
+      const replies = userIndex < 0 ? [] : entries.slice(userIndex + 1, nextUser < 0 ? undefined : nextUser)
       const last = replies.findLast(entry => ["assistant", "error", "refusal"].includes(entry.role))
-      if (last && stable) {
+      let running = false
+      try {
+        const value = await client.evaluate(`window.desktop.agent.listGrokBotAgentStatuses(${JSON.stringify({ agentIds: [run.bot.id] })})`, signal)
+        const rows = value?.statuses
+        const row = Array.isArray(rows) && rows.find(row => row?.agentId === run.bot.id)
+        running = row?.status === "running"
+      } catch { signal?.throwIfAborted() }
+      if (last && stable && !running) {
         release(run)
         return { state: ["error", "refusal"].includes(last.role) ? "failed" : "succeeded", text: last.text }
       }
@@ -277,7 +310,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
   return {
     id: "grok-bot", name: "Grok Bot",
     async authorize() {
-      return { url: "", method: "auto", instructions: "Keep Grok Bot signed in; Magpie will open and drive it when you chat. Sending a turn brings the app window to the front. No credential leaves the app.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Keep Grok Bot signed in; Magpie will open and drive it when you chat. Sending a turn brings the app window to the front. No credential leaves the app. A unique Magpie turn identifier is appended to each submitted prompt for reply correlation. If the app status bridge is unavailable or unreadable, a paused answer may be delivered as final after two unchanged transcript reads.", callback: async () => {
         try { await findGrokBot(deps); return { type: "success", refresh: "grok-bot-cdp", access: "app-local", expires: 0, accountId: "grok-bot-cdp", mechanism: "cdp" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
@@ -289,7 +322,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     },
     create, poll,
     cancel(credential, run) { if (active.get(run.bot.id) === run) release(run); idle() },
-    followUp(credential, run, texts, signal) { return create(credential, { model: run.bot.id, prompt: texts.join("\n") }, signal) },
-    dispose() { touch(); connection?.close(); connection = undefined; if (owned) { owned.kill(); owned = undefined } },
+    followUp(credential, run, texts, signal) { return create(credential, { model: run.bot.id, prompt: texts.join("\n"), turnIndex: run.turnIndex + 1, sessionKey: run.sessionKey }, signal) },
+    dispose() { touch(); connection?.close(); connection = undefined; if (owned) { if (owned.exitCode == null && !launchErrors.has(owned)) owned.kill(); owned = undefined } },
   }
 }

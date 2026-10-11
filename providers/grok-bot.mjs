@@ -19,7 +19,7 @@ export function makeGrokBotDriver(input, options = {}, dependencies = {}) {
       try {
         const module = await (dependencies.importDirect ? dependencies.importDirect() : import("./grok-bot-direct.mjs"))
         const driver = module.makeGrokBotDirect(input, options)
-        if (typeof driver?.create !== "function" || typeof driver?.authorize !== "function") throw directFailure()
+        if (!["create", "authorize", "verify", "dispose"].every(key => typeof driver?.[key] === "function")) throw directFailure()
         direct = driver
       } catch { throw directFailure() }
     }
@@ -52,6 +52,7 @@ export function makeGrokBotDriver(input, options = {}, dependencies = {}) {
       },
     },
     "chat.headers": async (request, output) => {
+      if (request?.model?.providerID !== ID && request?.provider?.info?.id !== ID) return
       const session = sessionOf(request)
       if (session) { output.headers ??= {}; output.headers[SESSION_HEADER] = session }
     },

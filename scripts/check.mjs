@@ -86,7 +86,21 @@ for (const [fnName, fn] of Object.entries(mod)) {
       if (!["oauth", "api"].includes(m.type)) problems.push(`${fnName}: method type ${m.type}`)
       if (m.type === "oauth" && typeof m.authorize !== "function") problems.push(`${fnName}: ${m.label} has no authorize`)
     }
-    if (process.argv.includes("--stubs")) {
+    if (process.argv.includes("--stubs") && auth.provider === "grok-bot") {
+      const { makeGrokBotDriver } = await import("../providers/grok-bot.mjs")
+      let operations = 0
+      const forbidden = () => { operations++; throw new Error("implemented gate attempted app access") }
+      const isolated = makeGrokBotDriver({}, {}, { cdp: { env: {}, exists: async () => false, processes: forbidden, spawn: forbidden, fetch: forbidden, freePort: forbidden }, importDirect: async () => { throw new Error("fixture missing direct module") } })
+      const flow = await isolated.auth.methods[0].authorize()
+      const result = await flow.callback()
+      if (result.type !== "failed" || result.error !== "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry") throw new Error("implemented missing-install contract failed")
+      if (Object.keys(await isolated.auth.loader(async () => null)).length) throw new Error("signed-out loader is active")
+      const loader = await isolated.auth.loader(async () => ({ type: "oauth", access: "app-local", mechanism: "cdp" }))
+      const response = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "app-bot", messages: [{ role: "user", content: "gate" }] }) })
+      if (response.status !== 502 || response.headers.get("X-Magpie-Sign-In") !== "kept" || (await response.json()).error.message !== result.error) throw new Error("implemented transport error contract failed")
+      if ((await (await isolated.auth.methods[1].authorize()).callback()).type !== "failed" || operations !== 0) throw new Error("implemented transport isolation failed")
+      console.log("implemented: grok-bot; scaffold: 5; app operations: 0")
+    } else if (process.argv.includes("--stubs")) {
       for (const method of auth.methods) {
         if (method.type !== "oauth") continue
         const flow = await method.authorize({ env: "sandbox" })

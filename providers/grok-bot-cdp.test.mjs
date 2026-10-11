@@ -44,20 +44,26 @@ function fixture(settings = {}) {
         const expression = frame.params?.expression ?? ""
         let value
         let error
-        if (expression.includes("cursorAccount")) value = state.signedIn
+        if (expression.includes("cursorAccount")) { value = state.signedIn; error = state.probeError }
+        else if (expression.includes("listGrokBotAgentStatuses")) value = state.statuses
         else if (expression.includes("Promise.allSettled")) value = [["bot-id"], { agents: [{ agentId: "bot-id", name: "My bot" }, { id: "second", name: "Other bot" }] }]
         else if (expression.includes("readTranscriptStoreTail")) {
-          if (state.transcriptFallback) error = "edge/invalid-args"
+          if (state.tailError) error = state.tailError
+          else if (state.transcriptFallback) error = "edge/invalid-args"
           else value = { entries: state.tail }
         } else if (expression.includes("const region")) value = { entries: state.tail }
         else if (expression.includes("desktopMount.mount(")) { if (state.bridgeMissing) error = "mount is not a function" }
         else if (expression.includes("desktopMount.submitPrompt(")) {
           const prompt = JSON.parse(expression.slice(expression.indexOf("(") + 1, -1)).prompt
-          state.tail.push({ id: `user-${state.tail.length}`, role: "user", text: prompt })
-          if (state.autoAnswer) state.tail.push({ id: `assistant-${state.tail.length}`, role: "assistant", text: "answer" })
+          if (state.onSubmit) state.onSubmit(state, prompt)
+          else {
+            state.tail.push({ id: `user-${state.tail.length}`, role: "user", text: prompt })
+            if (state.autoAnswer) state.tail.push({ id: `assistant-${state.tail.length}`, role: "assistant", text: "answer" })
+          }
         } else if (expression.includes("const composer")) value = state.composer
         else if (expression.includes("const mounted")) value = "bot-id"
         socket.send(JSON.stringify(error ? { id: frame.id, result: { exceptionDetails: { exception: { description: error } } } } : { id: frame.id, result: frame.method === "Runtime.evaluate" ? { result: { value } } : {} }))
+        if (state.quitAfterSubmit && expression.includes("desktopMount.submitPrompt(")) { state.unreachable = true; queueMicrotask(() => socket.close()) }
       },
     },
   })
@@ -94,7 +100,8 @@ test("launch binds debug argv to loopback and mounts before submit with server-t
   const fake = fixture()
   try {
     await send(fake)
-    expect(fake.spawns[0].argv).toEqual([`--remote-debugging-port=${new URL(fake.endpoint).port}`, "--remote-debugging-address=127.0.0.1"])
+    expect(fake.spawns[0].argv.slice(0, 2)).toEqual([`--remote-debugging-port=${new URL(fake.endpoint).port}`, "--remote-debugging-address=127.0.0.1"])
+    expect(fake.spawns[0].argv[2]).toMatch(/^--magpie-grok-managed=\d+:[0-9a-f-]{36}$/)
     const expressions = fake.frames.map(frame => frame.params.expression).filter(Boolean)
     expect(expressions.findIndex(text => text.includes("desktopMount.mount("))).toBeLessThan(expressions.findIndex(text => text.includes("desktopMount.submitPrompt(")))
     expect(expressions.some(text => text.includes('"reason":"server-tail"'))).toBe(true)
@@ -129,7 +136,8 @@ test("UI fallback switches bot, inserts prompt and sends Enter with exact progre
   try {
     const run = await send(fake)
     expect(run.progress).toBe("Grok Bot updated and its automation bridge changed — falling back to UI input; if this repeats, the provider needs an update")
-    expect(fake.frames.find(frame => frame.method === "Input.insertText").params.text).toBe("hello")
+    expect(fake.frames.find(frame => frame.method === "Input.insertText").params.text).toBe(run.prompt)
+    expect(run.prompt).toMatch(/^hello\n\n\[Magpie turn: [0-9a-f]{24}\]$/)
     expect(fake.frames.filter(frame => frame.method === "Input.dispatchKeyEvent").map(frame => frame.params.type)).toEqual(["keyDown", "keyUp"])
     expect(fake.frames.some(frame => frame.params.expression?.includes("desktopMount.switchTo("))).toBe(true)
   } finally { fake.close() }
@@ -171,7 +179,7 @@ test("crash recovers once without resending prompt, then reports exact 502 kept"
     fake.disconnect(); await Bun.sleep(5)
     expect((await fake.driver.poll(marker, run)).state).toBe("running")
     expect(fake.frames.filter(frame => frame.params.expression?.includes("desktopMount.submitPrompt(")).length).toBe(1)
-    fake.disconnect(); await Bun.sleep(5)
+    fake.disconnect(); fake.state.unreachable = true; await Bun.sleep(5)
     await expectFailure(() => fake.driver.poll(marker, run), "crashed")
   } finally { fake.close() }
 })
@@ -209,7 +217,8 @@ test("multi-turn loader sends only splitSuffix texts to the bot transcript", asy
     expect((await request(history)).status).toBe(200)
     expect((await request([...history, { role: "assistant", content: "answer" }, { role: "user", content: "second" }])).status).toBe(200)
     const prompts = fake.frames.filter(frame => frame.params.expression?.includes("desktopMount.submitPrompt(")).map(frame => JSON.parse(frame.params.expression.slice(frame.params.expression.indexOf("(") + 1, -1)).prompt)
-    expect(prompts).toEqual(["Current request:\nfirst", "second"])
+    expect(prompts.map(prompt => prompt.replace(/\n\n\[Magpie turn: [0-9a-f]{24}\]$/, ""))).toEqual(["Current request:\nfirst", "second"])
+    expect(prompts.every(prompt => /\[Magpie turn: [0-9a-f]{24}\]$/.test(prompt))).toBe(true)
     fake.expireIdle()
   } finally { fake.close() }
 })
@@ -222,6 +231,81 @@ test("cancel releases idle ownership without interrupting the bot", async () => 
 test("concurrent sends to one bot cannot both submit", async () => {
   const fake = fixture()
   try { const results = await Promise.allSettled([send(fake), send(fake)]); expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1); expect(fake.frames.filter(frame => frame.params.expression?.includes("desktopMount.submitPrompt("))).toHaveLength(1) } finally { fake.close() }
+})
+
+test("review F1 headers remain scoped to Grok Bot", async () => {
+  const plugin = makeGrokBotDriver({})
+  for (const request of [{ model: { providerID: "grok-bot" } }, { provider: { info: { id: "grok-bot" } } }]) {
+    const output = { headers: {} }; await plugin["chat.headers"]({ ...request, sessionID: "session" }, output); expect(output.headers[SESSION_HEADER]).toBe("session")
+  }
+  const output = { headers: {} }; await plugin["chat.headers"]({ model: { providerID: "foreign" }, sessionID: "session" }, output); expect(output.headers).toEqual({})
+})
+for (const [probe, dom] of [["A", true], ["U", false]]) test(`review ${probe} repeated idless prompt cannot return previous answer`, async () => {
+  const fake = fixture({ transcriptFallback: dom, tail: [{ role: "user", text: "hello" }, { role: "assistant", text: "OLD ANSWER" }], onSubmit() {} })
+  try { const run = await send(fake); await fake.driver.poll(marker, run); expect((await fake.driver.poll(marker, run)).state).toBe("running") } finally { fake.close() }
+})
+for (const [probe, dom] of [["D", true], ["V", false]]) test(`review ${probe} interjection cannot answer our turn`, async () => {
+  const fake = fixture({ transcriptFallback: dom, onSubmit(state, prompt) { state.tail.push({ id: "ours", role: "user", text: prompt }, { id: "other", role: "user", text: "time?" }, { id: "answer", role: "assistant", text: "3pm" }) } })
+  try { const run = await send(fake); await fake.driver.poll(marker, run); expect((await fake.driver.poll(marker, run)).state).toBe("running") } finally { fake.close() }
+})
+test("review F4 readable running status prevents paused answer completion", async () => {
+  const fake = fixture({ autoAnswer: true, statuses: { statuses: [{ agentId: "bot-id", status: "running" }] } })
+  try { const run = await send(fake); await fake.driver.poll(marker, run); expect((await fake.driver.poll(marker, run)).state).toBe("running"); fake.state.statuses.statuses[0].status = "idle"; expect((await fake.driver.poll(marker, run)).state).toBe("succeeded") } finally { fake.close() }
+})
+test("review AH recovery remains available after two disconnected polls", async () => {
+  const fake = fixture()
+  try { const run = await send(fake); for (let attempt = 0; attempt < 3; attempt++) { fake.disconnect(); await Bun.sleep(5); expect((await fake.driver.poll(marker, run)).state).toBe("running") } } finally { fake.close() }
+})
+for (const field of ["probeError", "tailError"]) test(`review F7 maps ${field} to exact changed row`, async () => {
+  const fake = fixture({ [field]: "object is not a function" }); try { await expectFailure(() => send(fake), "changed") } finally { fake.close() }
+})
+test("review F6 dispose never kills exited child", async () => {
+  const fake = fixture({ exited: true }); await send(fake); fake.close(); expect(fake.kills).toBe(0)
+})
+test("review F9 missing verify and dispose rejects direct seam", async () => {
+  const plugin = makeGrokBotDriver({}, {}, { importDirect: async () => ({ makeGrokBotDirect: () => ({ create() {}, authorize() { return { callback: async () => ({ type: "success" }) } } }) }) })
+  expect((await (await plugin.auth.methods[1].authorize()).callback()).type).toBe("failed")
+})
+
+test("review F7 process enumeration errors map to debug row", async () => {
+  const fake = fixture(); const driver = createGrokBotCdp({}, { ...fake.dependencies, processes: async () => { throw new Error("powershell unavailable") } })
+  try { await expectFailure(() => driver.create(marker, { model: "bot-id", prompt: "hello" }), "debug") } finally { driver.dispose(); fake.close() }
+})
+test("review F8 tagged orphan is adopted and identity revalidated before stop", async () => {
+  const fake = fixture(); let stopped = 0
+  const row = { pid: 42, port: Number(new URL(fake.endpoint).port), executable: "C:\\Programs\\Grok Bot\\Grok Bot.exe", created: "start", managedTag: "999999:12345678-1234-4234-8234-123456789abc" }
+  const driver = createGrokBotCdp({ keepAliveMinutes: 0.01 }, { ...fake.dependencies, processes: async () => [row], parentAlive: () => false, stopManaged: async () => { stopped++ } })
+  try { await driver.liveModels(marker); fake.expireIdle(); await Bun.sleep(5); expect(stopped).toBe(1) } finally { driver.dispose(); fake.close() }
+})
+
+test("review AJ identical loader retries reconnect twice without resubmission", async () => {
+  const fake = fixture({ quitAfterSubmit: true })
+  const quick = { now: Date.now, random: () => 0.5, setTimeout: (callback, delay) => setTimeout(callback, delay >= 1600 && delay <= 10000 ? 0 : delay), clearTimeout }
+  const plugin = makeGrokBotDriver({}, { progress: false }, { cdp: fake.dependencies, timers: quick })
+  try {
+    const loader = await plugin.auth.loader(async () => marker)
+    const ask = () => loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "bot-id", messages: [{ role: "user", content: "same" }] }) })
+    expect((await ask()).status).toBe(502)
+    fake.state.quitAfterSubmit = false
+    fake.disconnect(); await Bun.sleep(5); fake.state.unreachable = true
+    expect((await ask()).status).toBe(502)
+    const attempts = fake.spawns.length
+    expect((await ask()).status).toBe(502)
+    expect(fake.spawns.length).toBeGreaterThan(attempts)
+    fake.state.unreachable = false
+    fake.state.tail.push({ role: "assistant", text: "recovered answer" })
+    const response = await ask(); expect(response.status).toBe(200)
+    expect((await response.json()).choices[0].message.content).toBe("recovered answer")
+    expect(fake.frames.filter(frame => frame.params.expression?.includes("desktopMount.submitPrompt("))).toHaveLength(1)
+    fake.expireIdle()
+  } finally { fake.close() }
+})
+
+test("review F2 implemented gate distinguishes missing installation from scaffold", async () => {
+  const gate = Bun.spawn([process.execPath, "scripts/check.mjs", "--stubs"], { stdout: "pipe", stderr: "pipe", env: { ...process.env, ProgramFiles: "Z:\\missing", LOCALAPPDATA: "Z:\\missing", PATH: "Z:\\missing" } })
+  const output = await new Response(gate.stdout).text(); const errors = await new Response(gate.stderr).text()
+  expect({ code: await gate.exited, errors }).toEqual({ code: 0, errors: "" })
+  expect(output).toContain("implemented: grok-bot; scaffold: 5")
 })
 
 test("CDP client rejects remote websocket endpoints", async () => { await expect(connectCdp("ws://example.invalid:9333/devtools/page/1")).rejects.toThrow(messages.debug) })
