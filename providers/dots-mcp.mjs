@@ -5,6 +5,13 @@ import { BlockList, isIP } from "node:net"
 import { equalSecret, mintToken } from "./dots-queue.mjs"
 
 const BODY_LIMIT = 262144
+// Bun.serve destroys the socket mid-upload once a body exceeds
+// maxRequestBodySize, so a native cap equal to BODY_LIMIT races the
+// application's own 413 below and intermittently resets the connection before
+// the handler can answer. Keep the native cap strictly above the app
+// threshold; the app-level check remains the contract and answers 413 for
+// anything over BODY_LIMIT.
+const NATIVE_BODY_LIMIT = BODY_LIMIT * 2
 const VERSIONS = ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
 const object = value => value !== null && typeof value === "object" && !Array.isArray(value)
 const schema = (properties, required = []) => ({ type: "object", properties, required, additionalProperties: false })
@@ -165,7 +172,7 @@ export function startMcp({ token, queue, port = 0, hostname = "127.0.0.1", trans
     catch (error) { return { jsonrpc: "2.0", id: rpc.id, error: { code: error.code ?? -32602, message: error.code === -32015 ? "Callback verification failed" : error.code === -32601 ? "Method not found" : "Invalid parameters" } } }
   }
   const respond = (status, body, headers = {}) => new Response(body === null ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff", ...headers } })
-  const server = Bun.serve({ hostname: "127.0.0.1", port, maxRequestBodySize: BODY_LIMIT, idleTimeout: 30, async fetch(request, listener) {
+  const server = Bun.serve({ hostname: "127.0.0.1", port, maxRequestBodySize: NATIVE_BODY_LIMIT, idleTimeout: 30, async fetch(request, listener) {
     const path = new URL(request.url).pathname
     if (path !== "/mcp" && !/^\/mcp\/[^/]+$/.test(path)) return respond(404, { error: { code: "not_found" } })
     const address = listener.requestIP(request)?.address ?? "127.0.0.1"
