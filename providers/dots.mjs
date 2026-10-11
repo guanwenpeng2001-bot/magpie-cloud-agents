@@ -6,6 +6,10 @@ import { startMcp } from "./dots-mcp.mjs"
 import { DotsTunnel, dotsFailure, DOTS_FAILURES } from "./dots-tunnel.mjs"
 
 const ID = "dots", NAME = "ChatGPT Dot", BASE = "https://dots.cloud-agents.invalid/v1"
+// Dots setup has no OpenAI authorization page: the Dot calls this PC, so the only useful
+// browser target is OpenAI's own guide to adding a custom MCP connector; the paste
+// happens in ChatGPT, not on any page we return.
+const DOTS_SETUP_GUIDE_URL = "https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt"
 const MODELS = { dot: { name: "ChatGPT Dot (replies in minutes)", tool_call: false } }
 const valid = auth => auth?.type === "oauth" && typeof auth.dot_token === "string" && Buffer.from(auth.dot_token, "base64url").length === 24
 export const STANDING_INSTRUCTIONS = `Watch task.available on queue "dot" and renew before refreshBefore.
@@ -111,8 +115,8 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
     resource.setupTimer = setTimeout(() => { void dispose(token) }, (dependencies.handshakeTimeoutMs ?? 600000) + 1000)
     resource.setupTimer.unref?.()
     return {
-      url: "", method: "auto",
-      instructions: `Dots requires the most setup in this provider set: a bundled tunnel and a one-time connector paste. The Dot calls this PC from OpenAI's network, so a public address is required. No OpenAI credential is involved.\nChatGPT → Plugins → Add → Create custom MCP server.\nEndpoint: ${resource.tunnel.publicUrl}/mcp\nBearer token (shown once): ${token}\nIf headers cannot be set, append the token to /mcp/ and treat the entire URL as a secret.\nConnect the plugin, then ask the Dot to subscribe. Setup waits for its initialize handshake.\n${STANDING_INSTRUCTIONS}\nReplies are text-only, in one block after seconds to minutes. Keep Magpie running. Re-run login after a quick-tunnel URL changes. Logout tears down the bridge.`,
+      url: DOTS_SETUP_GUIDE_URL, method: "auto",
+      instructions: `Dots has no OpenAI sign-in page: the Dot calls this PC, so the browser button opens OpenAI's guide instead of a consent screen. In ChatGPT, follow Settings → Apps → Create with developer mode — the guide shows the exact screens.\nEndpoint: ${resource.tunnel.publicUrl}/mcp\nBearer token (shown once): ${token}\nIf headers cannot be set, append the token to /mcp/ and treat the entire URL as a secret.\nDots requires the most setup in this provider set: a bundled tunnel and a one-time connector paste. The Dot calls this PC from OpenAI's network, so a public address is required. No OpenAI credential is involved.\nConnect the plugin, then ask the Dot to subscribe. Setup waits for its initialize handshake.\n${STANDING_INSTRUCTIONS}\nReplies are text-only, in one block after seconds to minutes. Keep Magpie running. Re-run login after a quick-tunnel URL changes. Logout tears down the bridge.`,
       async callback() {
         try {
           await doctor(resource, auth, true)

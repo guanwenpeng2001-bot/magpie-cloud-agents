@@ -244,9 +244,26 @@ test("provider sign-in observes handshake and doctor reports ready", () => withP
   expect(auth.access).toBe("dots-local")
   expect(auth.refresh).toBe("dots-tunnel")
   expect(auth.expires).toBe(0)
-  expect(flow.instructions.includes("ChatGPT → Plugins → Add → Create custom MCP server")).toBe(true)
+  expect(flow.url).toBe("https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt")
+  expect(flow.instructions.includes("Dots has no OpenAI sign-in page")).toBe(true)
+  expect(flow.instructions.includes("opens OpenAI's guide")).toBe(true)
+  expect(flow.instructions.includes("Settings → Apps → Create with developer mode")).toBe(true)
+  expect(flow.instructions.includes("Endpoint: https://synthetic-dots.trycloudflare.com/mcp")).toBe(true)
+  expect(flow.instructions.includes("Bearer token (shown once): ")).toBe(true)
+  expect(flow.instructions.includes("help.openai.com")).toBe(false)
   expect(await plugin.auth.checkin(async () => auth)).toEqual({ outcome: "done", message: "ready" })
 }))
+
+test("sign-in failure branch returns no url and keeps method auto", async () => {
+  const { makeDotsDriver } = await import("./dots.mjs")
+  const plugin = makeDotsDriver({}, {}, { startMcp: () => ({ url: "http://127.0.0.1:9/mcp", close: async () => {} }), createTunnel: () => { throw new Error("synthetic tunnel failure") } })
+  try {
+    const flow = await plugin.auth.methods[0].authorize()
+    expect(flow.url).toBe("")
+    expect(flow.method).toBe("auto")
+    expect(flow.instructions).toBe("synthetic tunnel failure")
+  } finally { await plugin._internal.close() }
+})
 
 test("no Dot handshake makes sign-in fail with the exact no-Dot message", () => withProvider(async ({ result }) => {
   expect(result.type).toBe("failed")
