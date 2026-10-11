@@ -5,9 +5,44 @@ import { makeTokenStore } from "./grok-bot-token.mjs"
 
 const HOST = "api2.cursor.sh"
 const SERVICE = "aiserver.v1.GrokBotService"
+// The app's transcript watch uses 90s when a live row omits stale_after_ms (bundle: `var hJ=9e4`).
+const DEFAULT_STALE_AFTER_MS = 90000
+const STALE_LIVE = "Grok Bot direct: the bot's live status is stale — its last update is older than the vendor's own staleness window, so the turn was not finished"
 const REFUSED = "Grok Bot direct: the app's sign-in was refused by the server — open Grok Bot desktop once to refresh it, then retry"
 const protocolError = message => chatError(502, `${message} — the provider's protocol table may need an update`, "kept")
 const record = value => value !== null && typeof value === "object" && !Array.isArray(value)
+const flag = (row, camel, snake) => { const value = row[camel] ?? row[snake]; return typeof value === "boolean" ? value : undefined }
+const text = (row, camel, snake) => { const value = row[camel] ?? row[snake]; return typeof value === "string" && value ? value : undefined }
+
+// A live row is busy the way the app's adapter reads it: running or a running subagent, or still
+// composing, awaiting the user, or holding a box handoff. `updated_at_ms` + `stale_after_ms` bound
+// how long such a row may keep the turn open; both come from the row, never from an invented timer.
+export function liveActivity(row, milliseconds, seen = undefined) {
+  const live = record(row.live) ? row.live : undefined
+  const flat = flag(row, "isRunning", "is_running")
+  if (!live) return { busy: flat === true, idle: flat === false, stale: false }
+  const running = flag(live, "isRunning", "is_running")
+  const subagents = flag(live, "hasRunningSubagents", "has_running_subagents")
+  const composing = flag(live, "isComposingMessage", "is_composing_message")
+  const awaiting = record(live.awaiting)
+  const handoff = text(live, "boxHandoffRequestId", "box_handoff_request_id") !== undefined
+  const busy = running === true || subagents === true || composing === true || awaiting || handoff
+  // Positively idle: nothing in the nested row asserts work, and the flat field is an explicit false.
+  // An unreadable nested flag is not busyness, so it must not block a flat idle reading forever.
+  const idle = !busy && flat === false
+  const updatedAt = Number(live.updatedAtMs ?? live.updated_at_ms)
+  const staleAfter = Number(live.staleAfterMs ?? live.stale_after_ms)
+  const window = Number.isFinite(staleAfter) && staleAfter > 0 ? staleAfter : DEFAULT_STALE_AFTER_MS
+  // A row that names no update time cannot be dated, so the window runs from the first time its content is seen.
+  let basis = Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : undefined
+  if (basis === undefined && seen) {
+    const key = JSON.stringify(live)
+    seen[key] ??= milliseconds
+    basis = seen[key]
+  }
+  const stale = busy && basis !== undefined && milliseconds - basis >= window
+  return { busy, idle, stale }
+}
 
 export function cursorChecksum(machineId, milliseconds = Date.now()) {
   const timestamp = Math.floor(milliseconds / 1e6)
@@ -72,13 +107,17 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
           const raw = await response.text()
           let parsed
           try { parsed = JSON.parse(raw) } catch { if (response.ok) throw protocolError("Invalid Connect JSON response") }
-          if (!response.ok) throw protocolError(safeMessage(typeof parsed?.message === "string" ? parsed.message : raw || `HTTP ${response.status}`, credential.token))
+          if (!response.ok) {
+            const detail = safeMessage(typeof parsed?.message === "string" ? parsed.message : raw || `HTTP ${response.status}`, credential.token)
+            const declared = Number(parsed?.status)
+            throw chatError(Number.isInteger(declared) && declared >= 400 && declared <= 599 ? declared : 502, `${detail} — the provider's protocol table may need an update`, "kept")
+          }
           if (!record(parsed)) throw protocolError("Invalid Connect response shape")
           return parsed
         }, signal, dependencies.timeoutMs ?? 15000)
       } catch (error) {
         if (signal?.aborted) throw signal.reason
-        if (error?.status === 401) {
+        if (error?.status === 401 && error?.signIn === "expired") {
           if (attempt === 0 && retryAuth) continue
           throw chatError(401, REFUSED, "expired")
         }
@@ -111,7 +150,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     async verify({ signal, retryAuth = true } = {}) { return list(signal, retryAuth) },
     async liveModels(credential, signal) { return Object.fromEntries((await list(signal)).map(agent => [agent.id, { name: agent.name, tool_call: false }])) },
     authorize() {
-      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first. If bot status is unavailable, completion falls back to transcript stability: a paused bot's partial answer may be delivered as final.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first. If bot status is unavailable, completion falls back to transcript stability: a paused bot's partial answer may be delivered as final. A flat idle reading is not trusted while the bot's nested live state still shows work in progress. The live status response itself has not been observed from the server, so that reading follows the app's own schema.", callback: async () => {
         try {
           await store.get()
           return { type: "success", refresh: "dpapi-derive", access: "derived-in-memory", expires: 0, accountId: "grok-bot-direct" }
@@ -134,17 +173,20 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       const { agentId, messageId, sessionId: session } = run.ref
       const status = await request("GetGrokBotSendStatus", { agent_id: agentId, message_id: messageId, session_id: session }, signal)
       if ([3, "REJECTED"].includes(status.status)) throw protocolError(status.rejectionCode ?? status.rejection_code ?? "Message rejected")
-      let running
+      let running, stale = false
       try {
-        const result = await request("ListGrokBotAgentStatuses", { agent_ids: [agentId] }, signal)
+        const result = await request("ListGrokBotAgentStatuses", { agent_ids: [agentId] }, signal, false)
         const matches = Array.isArray(result.statuses) ? result.statuses.filter(row => record(row) && (row.agentId ?? row.agent_id) === agentId) : []
-        const states = matches.map(row => row.isRunning ?? row.is_running)
-        if (states.includes(true)) running = true
-        else if (states.length && states.every(state => state === false)) running = false
+        run.view.seen ??= {}
+        const states = matches.map(row => liveActivity(row, now(), run.view.seen))
+        if (states.some(state => state.busy && !state.stale)) running = true
+        else if (states.some(state => state.stale)) stale = true
+        else if (states.length && states.every(state => state.idle)) running = false
       } catch (error) {
         if (signal?.aborted) throw signal.reason
         if (error?.status === 401 || error?.signIn === "expired") throw error
       }
+      if (stale && running !== true) throw chatError(504, STALE_LIVE, "kept")
       const entries = await tail(agentId, session, signal)
       const echoId = status.echoEntryId ?? status.echo_entry_id
       const ordered = entries.filter(record).slice().sort((left, right) => {
