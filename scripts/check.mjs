@@ -48,6 +48,23 @@ const EXPECTED = {
 
 const root = fileURLToPath(new URL("..", import.meta.url))
 const problems = []
+// Sandbox accounting under --stubs uses two counters, not one. sandboxOperations
+// counts a covered operation attempted from a provider's transport;
+// authorizeOperations counts one attempted inside an OAuth authorization probe.
+// Every transport attempt is fatal below regardless of how the provider was
+// classified. An authorization-probe attempt is fatal only for a provider
+// positively classified as a scaffold; for any other provider it is counted and
+// reported in the summary line instead. The reason for the exemption: the real
+// codex-cloud callback legitimately invokes its CLI verification, so the
+// sentinels must block that attempt rather than count it against the transport
+// path — without the exemption a green composed tree fails. The exemption is
+// about attempts and never about outcomes: the sentinels stay installed inside
+// the probe, so the attempted call never runs, and the callback's claimed
+// outcome is still asserted by the OAuth clauses below. What the exemption
+// cannot catch: it turns a non-scaffold provider's authorization attempt into a
+// reported count rather than an assertion, so an implementation probing from its
+// authorize region passes the gate with the attempt visible only in the summary
+// line.
 let sandboxOperations = 0
 let authorizeOperations = 0
 let probingAuthorization = false
@@ -139,6 +156,9 @@ for (const [fnName, fn] of Object.entries(mod)) {
       for (const method of auth.methods) {
         if (method.type !== "oauth") continue
         let outcome
+        // The flag scopes the sentinel branch to this authorization probe only;
+        // the finally below clears it so a later provider's transport attempt is
+        // counted as fatal, never exempt.
         probingAuthorization = scaffold !== true
         try {
           const flow = await method.authorize({ env: "sandbox" })
@@ -189,6 +209,10 @@ const missingIds = Object.values(EXPECTED)
   .filter((id) => !ids.includes(id))
 if (missingIds.length) problems.push(`provider ids missing: ${missingIds.join(", ")}`)
 
+// The summary label "transport attempts" is narrower than the counter it prints:
+// a scaffold's authorize-region attempt also lands in sandboxOperations (the
+// flag above is false for a scaffold). Only sandboxOperations is fatal;
+// authorizeOperations is reported, never asserted.
 if (process.argv.includes("--stubs")) console.log(`sandbox summary: transport attempts: ${sandboxOperations}; authorization attempts blocked: ${authorizeOperations}`)
 if (sandboxOperations) problems.push(`sandbox isolation failed: ${sandboxOperations} external operations`)
 if (problems.length) {
