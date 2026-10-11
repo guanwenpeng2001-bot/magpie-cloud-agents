@@ -254,6 +254,31 @@ for (const text of continuingRows) test(`continuation remains attached through t
   expect(diffs).toBe(0)
   expect(polls).toBe(2)
 })
+const grammaticalRows = [
+  "Done; the agent will deploy shortly", "Done; it might frobnicate artifacts",
+  "Done; now the agent compiles modules", "Done; then it uploads the artifacts",
+  "Done; meanwhile packaging continues", "Done; subsequently the worker uploads artifacts",
+  "Done; to be verified", "Done; about to push the fix", "Done; to frobnicate artifacts",
+]
+for (const text of grammaticalRows) test(`grammatical continuation: ${text}`, async () => {
+  expect(_internal.stateOf(text)).toBe("running")
+  let creates = 0, diffs = 0
+  const cli = async args => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") { creates++; return reply("task_abc123") }
+    if (args[1] === "status") return reply(text)
+    if (args[1] === "diff") { diffs++; return reply("unfinished diff") }
+    throw new Error("unexpected CLI invocation")
+  }
+  const loader = await makeCodexCloud({ maxRunMinutes: 0.001 }, { cli }).auth.loader(async () => auth)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await loader.fetch(endpoint, request())
+    expect(response.status).toBe(504)
+    expect(await response.text()).not.toContain("unfinished diff")
+  }
+  expect(creates).toBe(1)
+  expect(diffs).toBe(0)
+})
 const structuralRows = [
   "Done; checking the logs", "Completed; examining the failures", "Failed; investigating the cause",
   "Done; rebuilding the index", "Completed; downloading the artifacts",

@@ -7,6 +7,7 @@ const ID = "codex-cloud"
 const NAME = "Codex Cloud (codex CLI)"
 const BASE = "https://codex-cloud.cloud-agents.invalid/v1"
 const MODELS = { "cloud-task": { name: "Codex Cloud task", tool_call: false, reasoning: false } }
+const STATUS_NOTES = "Status interpretation is experimental and tested only on constructed examples; real CLI wording is unverified. Product limit: third-person present continuations without a recognized grammatical marker, such as 'work continues on the parser', 'the worker proceeds to packaging', 'the agent keeps indexing the tree', and 'the migration is underway', can be mistaken for completion and return an unfinished diff. Verify task completion independently before using a returned diff. Conversely, completed summaries can remain attached and time out without a diff: subject gerunds ('testing is complete', 'indexing is finished', 'checking revealed no issues', 'monitoring is in place', 'testing passed', 'monitoring shows no errors'); predicate adjectives ('the file is missing', 'one test is failing', 'the results are promising', 'the report is outstanding', 'the remaining work is existing scope'); sequencing summaries ('now the tests pass', 'now everything is green', 'then the suite went green', 'meanwhile the cache was cleared', 'subsequently reviewed and merged'); modal summaries ('the tests will pass on retry', 'the API can be extended later'); and intent summaries ('nothing left to be verified', 'the fix is ready to be merged'). Bare Error diagnostics also remain running. An identical resend reuses the task; delivery can resume if the status later becomes unambiguous, but unchanged wording can keep timing out indefinitely."
 const LOGGED_OUT = "the codex CLI isn't signed in — run `codex login` (or `codex login --device-auth` on a headless box), then sign in again"
 const MISSING = "the codex CLI wasn't found on PATH — install the `codex` CLI from OpenAI first"
 const marker = auth => auth?.type === "oauth" && auth.access === "codex-cli" && auth.refresh === "codex-cli"
@@ -63,6 +64,9 @@ function continues(rest) {
       const opening = /^\s*(?:(?:now|still|then|again|also|already|currently|just|and|but|so|[a-z]+ly)\s+)*([a-z]{2,}ing)\b/i.exec(clause)
       if (opening && !/^(?:no|some|any|every)thing$/i.test(opening[1])) return true
       if (/\b(?:am|is|are|was|were|been|be)\s+(?:(?:still|now|[a-z]+ly)\s+)*[a-z]{2,}ing\b/i.test(clause)) return true
+      if (/\b(?:will|would|shall|should|can|could|may|might|must)\s+(?:not\s+)?[a-z]+\b/i.test(clause)) return true
+      if (/^\s*(?:(?:and|but)\s+)?(?:now|then|meanwhile|subsequently|next|afterwards|after\s+that)\b/i.test(clause)) return true
+      if (/^\s*(?:about\s+|going\s+)?to\s+[a-z]+\b|\bto\s+be\s+[a-z]+\b/i.test(clause)) return true
       if (leadingContinuation.test(clause)) return true
     }
     for (const match of clause.matchAll(new RegExp("\\b(?:" + continuationWords + ")\\b", "gi"))) {
@@ -176,7 +180,7 @@ export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now,
         prompts: [{ type: "text", key: "env", message: "Codex Cloud environment id (Codex web → Environments; used as `codex cloud exec --env`)", validate: value => typeof value === "string" && value.trim() ? undefined : "an environment id is required" }],
         authorize(inputs) {
           return {
-            url: "", instructions: "Reuses the codex CLI's own login. Nothing is typed in; only the environment id is stored.", method: "auto",
+            url: "", instructions: "Reuses the codex CLI's own login. Nothing is typed in; only the environment id is stored.\n\nProvider notes: " + STATUS_NOTES, method: "auto",
             async callback() {
               const env = inputs?.env?.trim()
               if (!env) return { type: "failed", error: "an environment id is required" }
