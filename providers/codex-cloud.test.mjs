@@ -254,7 +254,17 @@ for (const text of continuingRows) test(`continuation remains attached through t
   expect(diffs).toBe(0)
   expect(polls).toBe(2)
 })
+test("authorize instructions disclose unfinished-diff risk and named status limits", () => {
+  const instructions = makeCodexCloud({}, scripted([])).auth.methods[0].authorize({ env: "fake" }).instructions
+  for (const text of [
+    "work continues on the parser", "the worker proceeds to packaging",
+    "the agent keeps indexing the tree", "the migration is underway",
+    "return an unfinished diff", "Verify task completion independently before using a returned diff",
+    "tested only on constructed examples", "real CLI wording is unverified",
+  ]) expect(instructions).toContain(text)
+})
 const grammaticalRows = [
+  "Done; and then it uploads", "Done; after that the worker kerffufles the queue",
   "Done; the agent will deploy shortly", "Done; it might frobnicate artifacts",
   "Done; now the agent compiles modules", "Done; then it uploads the artifacts",
   "Done; meanwhile packaging continues", "Done; subsequently the worker uploads artifacts",
