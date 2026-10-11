@@ -13,10 +13,21 @@ An installable Magpie package that exposes six vendor cloud-agent services as Op
 
 ## Install
 
-Point `plugin add` at this repository root:
+Install from the published GitHub repository:
+
+```sh
+magpie plugin add github:guanwenpeng2001-bot/magpie-cloud-agents
+```
+
+Or point `plugin add` at a local checkout of this repository:
 
 ```sh
 magpie plugin add <absolute-path-to-this-repository>
+```
+
+After either install:
+
+```sh
 magpie plugin --json
 magpie plugin list
 ```
@@ -230,10 +241,21 @@ Everything below is unverified, stated plainly. None of it was tested, and nothi
 
 ### 安装
 
-`plugin add` 指向本仓库根目录：
+从已发布的 GitHub 仓库安装：
+
+```sh
+magpie plugin add github:guanwenpeng2001-bot/magpie-cloud-agents
+```
+
+或将 `plugin add` 指向本仓库的本地检出目录：
 
 ```sh
 magpie plugin add <本仓库绝对路径>
+```
+
+任选一种方式安装后：
+
+```sh
 magpie plugin --json
 magpie plugin list
 ```
