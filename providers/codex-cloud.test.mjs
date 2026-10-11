@@ -114,6 +114,17 @@ for (const text of ["not logged in", "logged out", "not logged in but formerly l
   const plugin = makeCodexCloud({}, scripted([reply(text)]))
   expect(await plugin.auth.methods[0].authorize({ env: "fake" }).callback()).toMatchObject({ type: "failed", error: expect.stringContaining("codex login") })
 })
+// The real CLI writes its confirmation to stderr with exit code 0 and leaves stdout empty
+// (measured on codex 0.x, 2026-10-12: stdout "", stderr "Logged in using ChatGPT\n", status 0).
+// A check that reads only stdout therefore rejects a genuinely signed-in CLI.
+test("sign-in accepts a confirmation the CLI wrote to stderr", async () => {
+  const plugin = makeCodexCloud({}, scripted([reply("", 0, "Logged in using ChatGPT\n")]))
+  expect(await plugin.auth.methods[0].authorize({ env: "fake" }).callback()).toEqual({ type: "success", refresh: "codex-cli", access: "codex-cli", expires: 0, accountId: "env:fake", env: "fake" })
+})
+test("sign-in rejects logged-out wording the CLI wrote to stderr", async () => {
+  const plugin = makeCodexCloud({}, scripted([reply("", 1, "Not logged in\n")]))
+  expect(await plugin.auth.methods[0].authorize({ env: "fake" }).callback()).toMatchObject({ type: "failed", error: expect.stringContaining("codex login") })
+})
 test("oauth sign-in stores only markers and a distinct environment account id", async () => {
   const script = scripted([reply("Logged in using ChatGPT")])
   const method = makeCodexCloud({}, script).auth.methods[0]

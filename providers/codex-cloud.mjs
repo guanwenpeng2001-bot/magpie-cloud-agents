@@ -147,7 +147,9 @@ export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now,
   const driver = makeDriver(options, cli)
   const verify = async (signal, children = new Set()) => {
     const result = await cli(["login", "status"], { signal, children, timeoutMs: 10000 })
-    if (result.code !== 0 || !/logged in/i.test(result.stdout) || loggedOut(outputOf(result))) throw chatError(401, LOGGED_OUT, "expired")
+    // The CLI writes its confirmation to stderr (measured: stdout "", stderr "Logged in using ChatGPT", exit 0),
+    // so the marker has to be read from both streams, exactly as the logged-out check already does.
+    if (result.code !== 0 || !/logged in/i.test(outputOf(result)) || loggedOut(outputOf(result))) throw chatError(401, LOGGED_OUT, "expired")
   }
   return {
     auth: {
