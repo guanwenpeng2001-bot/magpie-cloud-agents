@@ -80,6 +80,7 @@ function fixture(settings = {}) {
   const driver = createGrokBotCdp({ keepAliveMinutes: 0.01, launchTimeoutMs: 400 }, dependencies)
   return { state, frames, spawns, dependencies, driver, endpoint: `ws://127.0.0.1:${server.port}/devtools/page/fake`,
     get kills() { return kills },
+    get connections() { return clients.length },
     expireIdle() { for (const [timer, job] of [...timers]) if (job.delay === 600) { timers.delete(timer); job.callback() } },
     disconnect() { for (const client of clients) client.close(); clients = [] },
     close() { driver.dispose(); server.stop(true) },
@@ -193,7 +194,7 @@ test("factory preserves floor and enumerates named bot models", async () => {
 test("factory direct import is lazy and broken/missing driver gives setup error without breaking CDP", async () => {
   for (const load of [async () => { throw new Error("missing module") }, async () => ({}), async () => ({ makeGrokBotDirect: () => ({}) })]) {
     let imports = 0
-    const plugin = makeGrokBotDriver({}, { grokBot: { dependencies: { exists: async () => true } } }, { importDirect: async () => { imports++; return load() } })
+    const plugin = makeGrokBotDriver({}, { grokBot: { dependencies: { processes: async () => [], exists: async () => true } } }, { importDirect: async () => { imports++; return load() } })
     expect(imports).toBe(0)
     expect(plugin.auth.methods[0].label).toContain("default")
     expect((await (await plugin.auth.methods[0].authorize()).callback()).type).toBe("success")
@@ -310,8 +311,65 @@ test("review F2 implemented gate distinguishes missing installation from scaffol
 
 test("CDP client rejects remote websocket endpoints", async () => { await expect(connectCdp("ws://example.invalid:9333/devtools/page/1")).rejects.toThrow(messages.debug) })
 
+test("CDP sign-in rejects a running app without an attachable debug endpoint", async () => {
+  const fake = fixture({ previous: true, unreachable: true })
+  try { expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "failed", error: messages.running }) }
+  finally { fake.close() }
+})
+
+for (const scenario of ["closed", "running", "attachable", "orphan", "configured"]) test(`CDP sign-in ${scenario} never launches or terminates the app`, async () => {
+  const fake = fixture({ unreachable: scenario === "running" })
+  let stopped = 0, attached = 0, detached = 0, enumerated = 0
+  const port = Number(new URL(fake.endpoint).port)
+  const row = { pid: 42, executable: "C:\\Programs\\Grok Bot\\Grok Bot.exe", created: "start", managedTag: "999999:12345678-1234-4234-8234-123456789abc", port: scenario === "running" ? undefined : port }
+  const driver = createGrokBotCdp({ reattachPorts: scenario === "configured" ? [port] : [] }, {
+    ...fake.dependencies,
+    processes: async () => { enumerated++; return ["closed", "configured"].includes(scenario) ? [] : [row] },
+    parentAlive: () => scenario !== "orphan",
+    stopManaged: async () => { stopped++ },
+    connect: async () => { attached++; return { close() { detached++ } } },
+  })
+  try {
+    const result = await (await driver.authorize()).callback()
+    expect(result.type).toBe(scenario === "running" ? "failed" : "success")
+    if (scenario === "running") expect(result.error).toBe(messages.running)
+    expect(enumerated).toBe(1)
+    expect(attached).toBe(["closed", "running"].includes(scenario) ? 0 : 1)
+    expect(detached).toBe(attached)
+    fake.expireIdle()
+  } finally { driver.dispose(); fake.close() }
+  await Bun.sleep(5)
+  expect(fake.spawns).toHaveLength(0)
+  expect(fake.kills).toBe(0)
+  expect(stopped).toBe(0)
+})
+
+test("CDP sign-in attaches through the real client without launching", async () => {
+  const fake = fixture({ previous: true, reattach: true })
+  try {
+    expect((await (await fake.driver.authorize()).callback()).type).toBe("success")
+    expect(fake.connections).toBe(1)
+    expect(fake.spawns).toHaveLength(0)
+  } finally { fake.close() }
+  expect(fake.kills).toBe(0)
+})
+
+test("CDP sign-in rejects a verified endpoint whose renderer cannot attach", async () => {
+  const fake = fixture({ previous: true, reattach: true })
+  const driver = createGrokBotCdp({}, { ...fake.dependencies, connect: async () => { throw new Error(messages.debug) } })
+  try { expect(await (await driver.authorize()).callback()).toEqual({ type: "failed", error: messages.debug }); expect(fake.spawns).toHaveLength(0) }
+  finally { driver.dispose(); fake.close() }
+})
+
+test("CDP sign-in reports process enumeration failure", async () => {
+  const fake = fixture()
+  const driver = createGrokBotCdp({}, { ...fake.dependencies, processes: async () => { throw new Error("unavailable") } })
+  try { expect(await (await driver.authorize()).callback()).toEqual({ type: "failed", error: messages.debug }) }
+  finally { driver.dispose(); fake.close() }
+})
+
 test("CDP sign-in verifies installation and saves only a local marker without launching", async () => {
-  const plugin = makeGrokBotDriver({}, { grokBot: { dependencies: { exists: async () => true, spawn: () => { throw new Error("must not launch") } } } })
+  const plugin = makeGrokBotDriver({}, { grokBot: { dependencies: { processes: async () => [], exists: async () => true, spawn: () => { throw new Error("must not launch") } } } })
   const flow = await plugin.auth.methods[0].authorize()
   expect(await flow.callback()).toEqual({ type: "success", refresh: "grok-bot-cdp", access: "app-local", expires: 0, accountId: "grok-bot-cdp", mechanism: "cdp" })
 })

@@ -162,21 +162,35 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     if (endpoint.hostname !== "127.0.0.1" || Number(endpoint.port) !== port) throw failure("debug")
     return deps.connect(endpoint.href, { timers, WebSocket: deps.WebSocket }, signal)
   }
+  async function runningProcesses() {
+    try { return await deps.processes() } catch { throw failure("debug") }
+  }
+  async function reattach(previous, signal) {
+    for (const port of [...new Set([...(options.reattachPorts ?? []), ...previous.map(row => row.port)])]) {
+      if (await version(port, signal)) return { port, client: await attach(port, signal) }
+    }
+  }
+  async function checkDrivable() {
+    await findGrokBot(deps)
+    if (connection?.open) return
+    const previous = await runningProcesses()
+    const attached = await reattach(previous)
+    if (attached) attached.client.close()
+    else if (previous.length) throw failure("running")
+  }
   async function start(signal) {
     const executable = await findGrokBot(deps)
-    let previous
-    try { previous = await deps.processes() } catch { throw failure("debug") }
-    for (const port of [...new Set([...(options.reattachPorts ?? []), ...previous.map(row => row.port)])]) {
-      if (await version(port, signal)) {
-        const client = await attach(port, signal)
-        const row = previous.find(row => row.port === port && row.created && row.executable?.toLowerCase() === executable.toLowerCase() && /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.managedTag ?? ""))
-        if (row && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) owned = { exitCode: null, kill: () => {
-          void deps.processes().then(rows => {
-            if (rows.some(current => current.pid === row.pid && current.created === row.created && current.executable === row.executable && current.managedTag === row.managedTag) && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) return deps.stopManaged(row)
-          }).catch(() => {})
-        } }
-        return client
-      }
+    const previous = await runningProcesses()
+    const attached = await reattach(previous, signal)
+    if (attached) {
+      const { port, client } = attached
+      const row = previous.find(row => row.port === port && row.created && row.executable?.toLowerCase() === executable.toLowerCase() && /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.managedTag ?? ""))
+      if (row && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) owned = { exitCode: null, kill: () => {
+        void deps.processes().then(rows => {
+          if (rows.some(current => current.pid === row.pid && current.created === row.created && current.executable === row.executable && current.managedTag === row.managedTag) && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) return deps.stopManaged(row)
+        }).catch(() => {})
+      } }
+      return client
     }
     const port = await deps.freePort()
     const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-grok-managed=${process.pid}:${randomUUID()}`], { stdio: "ignore", windowsHide: false })
@@ -311,7 +325,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     id: "grok-bot", name: "Grok Bot",
     async authorize() {
       return { url: "", method: "auto", instructions: "Keep Grok Bot signed in; Magpie will open and drive it when you chat. Sending a turn brings the app window to the front. No credential leaves the app. A unique Magpie turn identifier is appended to each submitted prompt for reply correlation. If the app status bridge is unavailable or unreadable, a paused answer may be delivered as final after two unchanged transcript reads.", callback: async () => {
-        try { await findGrokBot(deps); return { type: "success", refresh: "grok-bot-cdp", access: "app-local", expires: 0, accountId: "grok-bot-cdp", mechanism: "cdp" } }
+        try { await checkDrivable(); return { type: "success", refresh: "grok-bot-cdp", access: "app-local", expires: 0, accountId: "grok-bot-cdp", mechanism: "cdp" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
     },
