@@ -523,7 +523,7 @@ for (const shape of ["long", "labels", "truncation", "controls", "ansi", "scheme
     controls: secret.slice(0, 16) + "\u0000\u0007" + secret.slice(16),
     ansi: secret.slice(0, 16) + "\u001b[31m" + secret.slice(16),
     "scheme-less": "/mcp/" + secret, punctuation: "(" + secret + ")", alone: secret,
-    floor: secret.slice(0, 20), chunks: [secret.slice(0, 16), secret.slice(16)], bounded: "connection failed\n".repeat(1000),
+    floor: secret.slice(0, 20), chunks: [secret.slice(0, 16), secret.slice(16)], bounded: "connection failed\n".repeat(1000) + secret,
   }
   const message = await diagnosticMessage(inputs[shape])
   expect(message.includes(secret)).toBe(false)
@@ -533,6 +533,29 @@ for (const shape of ["long", "labels", "truncation", "controls", "ansi", "scheme
     expect(message.includes(secret.slice(0, 20))).toBe(false)
     expect((await diagnosticMessage(secret.slice(0, 19))).includes(secret.slice(0, 19))).toBe(true)
   }
+})
+
+for (const text of [
+  "INF Registered tunnel connection connIndex=0 location=LAX",
+  "2026-10-11T10:41:52Z INF Registered tunnel connection connIndex=0 connection=8f2c location=lax01 protocol=quic",
+  "connIndex=0 location=lax01",
+  "Registered tunnel connection connIndex=0 connection=1f2e3d4c location=lax01 protocol=quic",
+  "2026-10-11T10:41:52Z ERR Proxy upstream=127.0.0.1 port=8080 status=502 retry=3",
+  "INFO Shell command=cloudflared exitCode=1 elapsed=120ms",
+  "INF Tunnel protocol=quic location=lax01 connIndex=2",
+]) test(`metadata preservation: ${text}`, async () => {
+  expect((await diagnosticMessage(text)).endsWith(text)).toBe(true)
+})
+
+test("wrapped token with label on second half is redacted", async () => {
+  const secret = mintToken(), halves = [secret.slice(0, 16), secret.slice(16)]
+  const message = await diagnosticMessage(halves[0] + "\nBearer " + halves[1])
+  expect(halves.some(part => message.includes(part))).toBe(false)
+})
+
+test("metadata values still redact standalone long tokens", async () => {
+  const secret = mintToken()
+  expect((await diagnosticMessage("connection=" + secret)).includes(secret)).toBe(false)
 })
 
 test("benign diagnostic guard preserves ordinary text", async () => {
@@ -554,6 +577,17 @@ test("Dot error is quoted as untrusted and has no terminal controls", () => with
   expect(response.status).toBe(502)
   expect(/[\x00-\x1f\x7f-\x9f]/.test(message)).toBe(false)
   expect(message.includes('Untrusted Dot error: "Dots: not set up')).toBe(true)
+}))
+
+test("Dot Unicode format controls are stripped while multilingual text survives", () => withProvider(async ({ plugin, auth }) => {
+  const driver = plugin._internal.driver, run = await driver.create(auth, { prompt: "unicode" })
+  const queue = plugin._internal.resources.get(auth.dot_token).queue
+  const lease = queue.claim(run.ref)
+  const text = "连接失败 café 日本語 العربية"
+  queue.release(run.ref, lease.lease_token, false, text + String.fromCodePoint(0x202e, 0x2066, 0x2028, 0x2029))
+  const outcome = await driver.poll(auth, run)
+  expect(/[\p{Cf}\p{Zl}\p{Zp}]/u.test(outcome.progress)).toBe(false)
+  expect(outcome.progress).toBe("Untrusted Dot error: " + JSON.stringify(text))
 }))
 
 describe("Dots queue", () => {

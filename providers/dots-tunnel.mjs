@@ -68,6 +68,10 @@ export async function healthCheck(publicUrl, { fetch: fetcher = globalThis.fetch
   } catch (error) { if (error.status) throw error; throw dotsFailure("unreachable") }
 }
 
+function wrappedFragment(value) {
+  return !/=.+/.test(value) && (/^(?:bearer|token|secret|password|authorization|cookie|key)$/i.test(value) || /[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(value) || value.length >= 12)
+}
+
 function diagnosticTail(output) {
   return output
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
@@ -75,14 +79,15 @@ function diagnosticTail(output) {
     .replace(/[A-Za-z0-9_+\/=.%\-]+(?:\s+[A-Za-z0-9_+\/=.%\-]+)*/g, span => {
       const parts = span.split(/(\s+)/)
       for (let start = 0; start < parts.length; start += 2) {
-        if (!/[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(parts[start]) && parts[start].length < 12) continue
+        if (!wrappedFragment(parts[start])) continue
         let end = start, length = parts[start].length
-        while (end + 2 < parts.length && (/[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(parts[end + 2]) || parts[end + 2].length >= 12)) { end += 2; length += parts[end].length }
+        while (end + 2 < parts.length && wrappedFragment(parts[end + 2])) { end += 2; length += parts[end].length }
         if (length >= 20 && /[A-Z0-9]/.test(parts.slice(start, end + 1).join(""))) { parts.splice(start, end - start + 1, "[redacted]") }
         else start = end
       }
       return parts.join("")
     })
+    .replace(/[A-Za-z0-9_+\/.%\-]{20,}/g, value => /[A-Z0-9]/.test(value) ? "[redacted]" : value)
     .replace(/https?:\/\/\S+/gi, "[url]")
     .replace(/\b(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))\b[^\r\n]*/gi, "[credential]")
     .replace(/[\p{C}\p{Z}]+/gu, " ").trim().slice(-200)
