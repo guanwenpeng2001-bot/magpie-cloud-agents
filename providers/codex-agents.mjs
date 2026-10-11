@@ -19,8 +19,10 @@ const FAILURE = new Set(["failed", "failure", "error", "cancelled", "canceled", 
 const EXPIRED = new Set(["expired"])
 const ACTION = new Set(["action_required", "requires_action"])
 function answerText(item) {
-  if (item?.type !== "message" || item.role !== "assistant" || !Array.isArray(item.content)) return ""
-  return item.content.filter(part => part?.type === "output_text" && typeof part.text === "string").map(part => part.text.trim()).filter(Boolean).join("\n")
+  if (item?.type !== "message" || item.role !== "assistant") return ""
+  if (typeof item.content === "string") return item.content.trim()
+  if (!Array.isArray(item.content)) return ""
+  return item.content.filter(part => (part?.type === undefined || part.type === "output_text" || part.type === "text") && typeof part?.text === "string").map(part => part.text.trim()).filter(Boolean).join("\n")
 }
 function lastText(payload) {
   return rowsOf(payload).map(answerText).findLast(Boolean) ?? ""
@@ -68,7 +70,7 @@ function makeDriver(options) {
     }
     throw chatError(502, "Agents API item pagination exceeded 20 pages")
   }
-  async function outcome(cred, run, status, signal, detail) {
+  async function outcome(cred, run, status, signal, detail, turnId) {
     const normalized = String(status ?? "").trim()
     if (ACTION.has(normalized)) {
       const action = detail?.required_action?.type ?? detail?.data?.required_action?.type ?? detail?.required_actions?.[0]?.type ?? detail?.data?.required_actions?.[0]?.type ?? "unknown required_action"
@@ -77,7 +79,6 @@ function makeDriver(options) {
     if (EXPIRED.has(normalized)) return { state: "expired" }
     if (FAILURE.has(normalized)) return { state: "failed", progress: `${detail?.type ?? normalized}${detail?.error ? ": " + JSON.stringify(detail.error) : ""}` }
     if (!SUCCESS.has(normalized)) return { state: "running" }
-    const turnId = detail?.turn_id ?? detail?.data?.turn_id ?? (detail?.type ? undefined : detail?.id)
     if (typeof turnId !== "string" || !turnId) return { state: "failed", progress: "completed without a turn id — session " + run.ref }
     const text = lastText(await readItems(cred, run, turnId, signal))
     if (!text) return { state: "failed", progress: "turn " + normalized + " without a message-shaped reply — session " + run.ref }
@@ -131,7 +132,7 @@ function makeDriver(options) {
               try { payload = data ? JSON.parse(data) : {} } catch { continue }
               const type = payload.type ?? event
               const status = { "agent.session.turn.completed": "completed", "agent.session.turn.failed": "failed", "agent.session.failed": "failed", "agent.session.turn.cancelled": "cancelled", "agent.session.action_required": "action_required" }[type]
-              if (status) return await outcome(cred, run, status, signal, payload)
+              if (status) return await outcome(cred, run, status, signal, payload, payload.turn_id ?? payload.data?.turn_id)
               if (type) emit(type)
             }
             if (done) break
@@ -145,8 +146,17 @@ function makeDriver(options) {
     async poll(cred, run, signal) {
       const payload = await (await request(cred, pathOf(run) + "/turns?order=desc&limit=1", { signal })).json()
       const rows = Array.isArray(payload) ? payload : payload?.data ?? payload?.turns ?? payload
-      const latest = Array.isArray(rows) ? rows[0] : rows
-      return outcome(cred, run, turnStatus(latest), signal, latest)
+      let latest = Array.isArray(rows) ? rows[0] : rows
+      if (Array.isArray(rows) && rows.length > 1) {
+        const timed = rows.map(turn => ({ turn, time: turn?.created_at ?? turn?.created }))
+        if (timed.some(entry => typeof entry.time !== "number" || !Number.isFinite(entry.time)))
+          return { state: "failed", progress: "ambiguous turn chronology — session " + run.ref }
+        timed.sort((left, right) => right.time - left.time)
+        if (timed[0].time === timed[1].time)
+          return { state: "failed", progress: "ambiguous turn chronology — session " + run.ref }
+        latest = timed[0].turn
+      }
+      return outcome(cred, run, turnStatus(latest), signal, latest, latest?.turn_id ?? latest?.data?.turn_id ?? latest?.id)
     },
     async cancel(cred, run) {
       await request(cred, pathOf(run) + "/events", { signal: AbortSignal.timeout(5000), key: hash([run.submissionKey, "cancel"]), body: { events: [{ type: "agent.session.input.cancel" }] } })
@@ -173,7 +183,8 @@ export function makeCodexAgents(options = {}) {
       id: ID,
       async models(provider, { auth } = {}) {
         const cred = credentialOf(auth)
-        return (cred && await driver.liveModels(cred)) || provider.models || MODELS
+        const live = cred && await driver.liveModels(cred)
+        return live ? { ...provider.models, ...MODELS, ...live } : provider.models || MODELS
       },
     },
     async "chat.headers"(input, output) {

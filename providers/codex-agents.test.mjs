@@ -6,7 +6,7 @@ import { startFakeCloud } from "../scripts/fake-cloud.mjs"
 const eventResponse = (type, extra = {}) => new Response(`event: ${type}\r\ndata: ${JSON.stringify({ type, turn_id: "turn_synthetic", ...extra })}\r\n\r\n`, { headers: { "Content-Type": "text/event-stream" } })
 const servers = []
 afterEach(() => { for (const server of servers.splice(0)) server.stop() })
-const auth = { type: "api", key: "SYNTHETIC-ONLY" }
+const auth = { type: "api", key: crypto.randomUUID() }
 const messages = [{ role: "user", content: "Hello cloud" }]
 async function setup(scenario, options = {}, getAuth = () => auth) {
   const server = startFakeCloud({ scenario: async context => {
@@ -79,7 +79,7 @@ test.each([
 test("idle disconnect reconnects three times then reads the latest terminal turn", async () => {
   const { server, request } = await setup(({ url }) => {
     if (url.pathname.endsWith("/events")) return eventResponse("agent.session.idle")
-    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ id: "turn_synthetic", status: "completed", state: { execution_status: "running" } }, { status: "failed" }] })
+    if (url.pathname.endsWith("/turns")) return Response.json({ data: [{ id: "turn_synthetic", status: "completed", created_at: 2, state: { execution_status: "running" } }, { status: "failed", created_at: 1 }] })
     if (url.pathname.endsWith("/items")) return Response.json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "latest turn answer" }] }] })
   })
   expect((await request()).status).toBe(200)
@@ -133,7 +133,7 @@ test("loader gating, live credential re-read, malformed JSON and path errors", a
   let current = auth
   const { plugin, loader, request } = await setup(undefined, {}, () => current)
   expect(await plugin.auth.loader(() => null)).toEqual({})
-  current = { type: "oauth", access: "SYNTHETIC" }
+  current = { type: "oauth", access: crypto.randomUUID() }
   const missing = await request()
   expect(missing.status).toBe(401)
   expect(missing.headers.get("X-Magpie-Sign-In")).toBe("expired")
@@ -192,18 +192,18 @@ test("create and follow-up keys exist before send and survive failed submission 
   reject = false
   const run = await driver.create(auth, submission)
   expect(keys[0]).toMatch(/^[0-9a-f]{64}$/)
-  expect(keys[1]).toBe(keys[0])
+  expect(keys[1] === keys[0]).toBe(true)
   const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex")
-  expect(keys[0]).toBe(digest([digest(auth.key), "session", 0, "content-hash"]))
+  expect(keys[0] === digest([digest(auth.key), "session", 0, "content-hash"])).toBe(true)
   reject = true
   await expect(driver.followUp(auth, run, ["Next"])).rejects.toMatchObject({ status: 503 })
   reject = false
   const next = await driver.followUp(auth, run, ["Next"])
-  expect(keys[2]).toBe(keys[3])
+  expect(keys[2] === keys[3]).toBe(true)
   expect(keys[2]).not.toBe(keys[0])
   await driver.followUp(auth, next, ["Next"])
   expect(keys[4]).not.toBe(keys[3])
-  await driver.create({ type: "api", key: "SECOND-SYNTHETIC" }, submission)
+  await driver.create({ type: "api", key: crypto.randomUUID() }, submission)
   expect(keys[5]).not.toBe(keys[0])
 })
 test("abort invokes cancel event and closes the chat stream", async () => {
@@ -344,7 +344,7 @@ test("review F2 poll scopes items to the latest turn's own id", async () => {
   expect(result.text).toBe("turn nine answer")
   expect(paths).toEqual(["/openai/v1/agents/sessions/session_1/turns/turn_9/items?order=asc&limit=100"])
 })
-test("review F2 follow-up drops the previous turn's id so the next read is not scoped to it", async () => {
+test("review F2 follow-up omits the prior run's turnId field", async () => {
   const { server } = await setup(({ url, body }) => url.pathname.endsWith("/events") && body?.events?.[0]?.type === "agent.session.input.message" ? Response.json({}) : undefined)
   const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
   const next = await driver.followUp(auth, { ref: "session_1", turnId: "turn_1", submissionKey: "k" }, ["again"])
@@ -374,9 +374,12 @@ test("review M15 event line alone terminates without polling", async () => {
   expect(server.requests.filter(row => row.path.endsWith("/turns"))).toHaveLength(0)
 })
 test("missing turn identity fails without reading session history", async () => {
-  const result = await reviewedPoll({ status: "completed" })
+  const { server } = await setup(({ url }) => url.pathname.endsWith("/turns") ? Response.json({ data: [{ status: "completed" }] }) : Response.json({ data: [answerItem("previous answer")] }))
+  const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
+  const result = await driver.poll(auth, { ref: "session_1" })
   expect(result.state).toBe("failed")
   expect(result.progress).toContain("turn id")
+  expect(server.requests.filter(row => row.path.endsWith("/items"))).toHaveLength(0)
 })
 test("incomplete item pagination fails instead of returning an old page", async () => {
   const { server } = await setup(({ url }) => {
@@ -397,14 +400,68 @@ test("poll ignores an earlier unknown status message before the failed status", 
 test("poll selects the newest turn even when older turns fill a page", async () => {
   const { server } = await setup(({ url }) => {
     if (url.pathname.endsWith("/turns")) {
-      const latest = { id: "turn_current", status: "running" }
-      const old = { id: "turn_old", status: "completed" }
-      return Response.json({ data: url.searchParams.get("order") === "desc" ? [latest, old] : [old], has_more: true, last_id: "turn_old" })
+      const latest = { id: "turn_current", status: "running", created_at: 2 }
+      const old = { id: "turn_old", status: "completed", created_at: 1 }
+      return Response.json({ data: [old, latest] })
     }
     if (url.pathname.endsWith("/items")) return Response.json({ data: [answerItem("stale answer")] })
   })
   const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
   expect((await driver.poll(auth, { ref: "session_1" })).state).toBe("running")
+})
+test.each(["created_at", "created"])("R1 timestamp %s selects the current answer in either list order", async field => {
+  for (const reverse of [false, true]) {
+    const turns = [{ id: "old", status: "completed", [field]: 10 }, { id: "current", status: "completed", [field]: 20 }]
+    const { server } = await setup(({ url }) => url.pathname.endsWith("/turns") ? Response.json({ data: reverse ? [...turns].reverse() : turns }) : Response.json({ data: [answerItem(url.pathname.includes("/current/") ? "current answer" : "stale answer")] }))
+    const driver = _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } })
+    expect(await driver.poll(auth, { ref: "session_1" })).toEqual({ state: "succeeded", text: "current answer" })
+  }
+})
+test.each([[{}, {}], [{ created_at: 1 }, {}], [{ created_at: 1 }, { created_at: 1 }], [{ created_at: "invalid" }, { created_at: 2 }]].map(dates => [dates]))("R1 ambiguous chronology fails visibly without item reads %#", async dates => {
+  const { server, request } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return new Response("")
+    if (url.pathname.endsWith("/turns")) return Response.json({ data: dates.map((date, index) => ({ id: "turn_" + index, status: "completed", ...date })) })
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [answerItem("stale answer")] })
+  })
+  const response = await request()
+  expect(response.status).toBe(502)
+  expect((await response.json()).error.message).toContain("session_1")
+  expect(server.requests.filter(row => row.path.endsWith("/items"))).toHaveLength(0)
+})
+test.each(["turn", "agent.turn"])("R2 typed poll object %s retains its turn identity", async type => {
+  expect(await reviewedPoll({ id: "current", status: "completed", type })).toEqual({ state: "succeeded", text: "previous answer" })
+})
+test.each([false, true])("R2 stream event id alone is not a turn identity %#", async eventLineOnly => {
+  const { server, request } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return new Response('event: agent.session.turn.completed\ndata: ' + JSON.stringify({ id: "event_only", ...(eventLineOnly ? {} : { type: "agent.session.turn.completed" }) }) + '\n\n')
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [answerItem("wrong identity")] })
+  })
+  const response = await request()
+  expect(response.status).toBe(502)
+  expect((await response.json()).error.message).toContain("turn id")
+  expect(server.requests.filter(row => row.path.endsWith("/items"))).toHaveLength(0)
+})
+test.each([[{ type: "output_text", text: "answer" }], [{ type: "text", text: "answer" }], [{ text: "answer" }], "answer"].map(content => [content]))("R3 accepts bounded assistant content %#", async content => {
+  const { request } = await setup(({ url }) => url.pathname.endsWith("/items") ? Response.json({ data: [{ type: "message", role: "assistant", content }] }) : undefined)
+  const response = await request()
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toBe("answer")
+})
+test.each(["reasoning", "assistant_message"])("R3 rejects unsupported item type %s", async type => {
+  const { request } = await setup(({ url }) => url.pathname.endsWith("/items") ? Response.json({ data: [{ type, role: "assistant", content: "not an answer" }] }) : undefined)
+  const response = await request()
+  expect(response.status).toBe(502)
+  expect((await response.json()).error.message).toContain("session_1")
+})
+test.each(["unrelated", "gpt-6-sol"])("R5 configured model survives populated live list %s", async id => {
+  const { plugin } = await setup(() => Response.json({ data: [{ id }] }))
+  const custom = { name: "Custom agent", tool_call: false }
+  const config = { provider: { "codex-agents": { models: { "user-custom-agent": custom } } } }
+  await plugin.config(config)
+  const models = await plugin.provider.models(config.provider["codex-agents"], { auth })
+  expect(models["user-custom-agent"]).toEqual(custom)
+  expect(models["gpt-6-astra"]).toBeDefined()
+  if (id === "gpt-6-sol") expect(models[id]).toBeDefined()
 })
 test("environment opt-in and folded system instructions are retained", async () => {
   const environment = { type: "openai_hosted" }
