@@ -55,6 +55,19 @@ function taskOf(text) {
   if (!match) return null
   return match[0].startsWith("https://") ? { ref: new URL(match[0]).pathname.split("/").pop(), url: match[0] } : { ref: match[0] }
 }
+const continuationWords = "running|starting|continuing|retrying|reconnecting|resuming|attempting|trying|waiting|verifying|working|queuing|in progress|pending|queued"
+const leadingContinuation = new RegExp("^\\s*(?:(?:still|now|again|then|also|already|currently|just|back|and|but|so)\\s+)*(?:" + continuationWords + ")\\b", "i")
+function continues(rest) {
+  return rest.split(/[,;—]|\.\s/).some((clause, index) => {
+    if (index > 0 && leadingContinuation.test(clause)) return true
+    for (const match of clause.matchAll(new RegExp("\\b(?:" + continuationWords + ")\\b", "gi"))) {
+      const after = clause.slice(match.index + match[0].length)
+      if (!after.trim() || /^\s*[.:]/.test(after)) return true
+      if (/^\s+(?:the|a|an|my|its|his|her|their|our|your|this|that|these|those|to|for|with|and|or|now|still|again|it|them|us|me|back|up|down|on|in|at|from|out|by|into|over|through|toward|towards|about)\b/i.test(after)) return true
+    }
+    return false
+  })
+}
 function stateOf(text, prompt = "") {
   const states = []
   const echoed = new Set(prompt.split(/\r?\n/).map(line => line.trim()).filter(Boolean))
@@ -63,13 +76,13 @@ function stateOf(text, prompt = "") {
     line = line.trim()
     const positioned = /\[([^\]]+)\]\s*$/.exec(line)?.[1] ?? /^(?:status|state)\s*:\s*(.+)$/i.exec(line)?.[1] ?? /^task[_-][\w-]+\s+.+\s{2,}([a-z]+|in progress)$/i.exec(line)?.[1]
     const candidate = positioned ?? line.replace(/^task\s+/i, "")
-    const match = /^(complet\w*|succeed\w*|done|finish\w*|fail\w*|error\w*|cancel\w*|expir\w*|running|working|queued|pending|in progress)\b(?=$|[.:,\s—])/i.exec(candidate)
+    const match = /^(complet\w*|succeed\w*|done|finish\w*|fail\w*|error\w*|cancel\w*|expir\w*|running|working|queued|pending|in progress)\b(?=$|[.:,;\s—])/i.exec(candidate)
     if (!match) { if (positioned) states.push("running"); continue }
     const word = match[1]
     const rest = candidate.slice(match[0].length)
-    if (!/^expir/i.test(word) && /\b(?:running|starting|continuing|retrying|in progress|pending|queued)\b/i.test(rest)) { states.push("running"); continue }
+    if (!/^expir/i.test(word) && continues(rest)) { states.push("running"); continue }
     if (!positioned && /^error/i.test(word) && rest) { states.push("running"); continue }
-    if (!positioned && !/^expir/i.test(word) && rest && !/^(?:\s*[.:,—]|\s+(?:successfully\b|with\s+\d|by user\b))/.test(rest)) continue
+    if (!positioned && !/^expir/i.test(word) && rest && !/^(?:\s*[.:,;—]|\s+(?:successfully\b|with\s+\d|by user\b))/.test(rest)) continue
     states.push(/^expir/i.test(word) ? "expired" : /^(fail|error|cancel)/i.test(word) ? "failed" : /^(complet|succeed|done|finish)/i.test(word) ? "succeeded" : "running")
   }
   return states.length && states.every(state => state === states[0]) ? states[0] : "running"

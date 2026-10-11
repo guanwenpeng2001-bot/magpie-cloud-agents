@@ -254,6 +254,85 @@ for (const text of continuingRows) test(`continuation remains attached through t
   expect(diffs).toBe(0)
   expect(polls).toBe(2)
 })
+const clauseRows = [
+  ["succeeded", "Completed: fixed the running indicator"],
+  ["succeeded", "Done: updated the queued jobs panel"],
+  ["succeeded", "Finished: removed the pending flag"],
+  ["succeeded", "Succeeded: rewrote the in progress badge"],
+  ["succeeded", "Completed: added a starting-state enum"],
+  ["succeeded", "Completed: fixed the continuing education module"],
+  ["succeeded", "Completed: the running total is 5"],
+  ["succeeded", "Done: pending review cleared"],
+  ["succeeded", "Done; the queued jobs panel was rewritten"],
+  ["succeeded", "Completed, and the running total is 5"],
+  ["failed", "Cancelled: the pending request was dropped"],
+  ["failed", "Failed: the queued job was dropped"],
+  ["running", "Failed: resuming from the last checkpoint"],
+  ["running", "Failed, queuing a retry"],
+  ["running", "Done, working through the failures"],
+  ["running", "Status: completed. Now verifying the fix"],
+  ["running", "Completed. Now verifying the fix"],
+  ["running", "Done. Verifying the result"],
+  ["running", "Done, running tests"],
+  ["running", "Completed, retrying uploads"],
+  ["running", "Done, pending checks"],
+  ["running", "Completed, running integration tests now"],
+  ["succeeded", "Completed: repaired the waiting room selector"],
+  ["succeeded", "Finished: renamed the reconnecting-state constant"],
+  ["succeeded", "Done; the verifying badge was removed"],
+  ["succeeded", "Succeeded, and the working directory label is correct"],
+  ["succeeded", "Done: pending approval cleared"],
+  ["failed", "Failed: the resuming worker crashed"],
+  ["failed", "Cancelled; the queued export was discarded"],
+  ["running", "Done, reconnecting sockets"],
+  ["running", "Completed. Now attempting recovery"],
+  ["running", "Failed, trying another region"],
+  ["running", "Status: completed the setup; waiting for allocation"],
+  ["running", "Done, checks prepared; now verifying artifacts"],
+  ["running", "Finished — working through remaining checks"],
+  ["running", "Status: failed: resuming the upload"],
+  ["running", "Completed; queuing exports"],
+  ["running", "Error: transport unavailable"],
+  ["expired", "Expired while waiting for allocation"],
+  ["failed", "State: error"],
+  ["succeeded", "Done; artifacts saved"],
+  ["running", "not finished; artifacts missing"],
+]
+for (const [state, text] of clauseRows) test(`clause meaning: ${text}`, () => expect(_internal.stateOf(text)).toBe(state))
+for (const text of ["Completed: fixed the running indicator", "Completed successfully"]) test(`stable completion delivers its diff on each attached request: ${text}`, async () => {
+  let creates = 0, polls = 0, diffs = 0
+  const cli = async args => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") { creates++; return reply("task_abc123") }
+    if (args[1] === "status") { polls++; return reply(text) }
+    if (args[1] === "diff") { diffs++; return reply("complete diff") }
+    throw new Error("unexpected CLI invocation")
+  }
+  const loader = await makeCodexCloud({ maxRunMinutes: 0.001 }, { cli }).auth.loader(async () => auth)
+  for (let i = 0; i < 2; i++) {
+    const response = await loader.fetch(endpoint, request())
+    expect(response.status).toBe(200)
+    expect((await response.json()).choices[0].message.content).toContain("complete diff")
+  }
+  expect(creates).toBe(1)
+  expect(polls).toBe(2)
+  expect(diffs).toBe(2)
+})
+for (const text of ["Done, reconnecting sockets", "Completed. Now verifying the fix", "Failed, queuing a retry"]) test(`clause continuation preserves the attachment: ${text}`, async () => {
+  let creates = 0, diffs = 0, polls = 0
+  const cli = async args => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") { creates++; return reply("task_abc123") }
+    if (args[1] === "diff") { diffs++; return reply("partial diff") }
+    polls++; return reply(text)
+  }
+  const loader = await makeCodexCloud({ maxRunMinutes: 0.001 }, { cli }).auth.loader(async () => auth)
+  expect((await loader.fetch(endpoint, request())).status).toBe(504)
+  expect((await loader.fetch(endpoint, request())).status).toBe(504)
+  expect(creates).toBe(1)
+  expect(diffs).toBe(0)
+  expect(polls).toBe(2)
+})
 test("expired prose preserves its terminal verdict", () => expect(_internal.stateOf("Expired before finishing")).toBe("expired"))
 test("real diff timer retries the same completed task", async () => {
   let creates = 0, diffs = 0
