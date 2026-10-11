@@ -8,6 +8,8 @@
 // and its throw poisons the load — internals hang off `_internal`).
 // It signs in to nothing and sends no request.
 
+import childProcess from "node:child_process"
+import { syncBuiltinESMExports } from "node:module"
 import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
@@ -46,6 +48,15 @@ const EXPECTED = {
 
 const root = fileURLToPath(new URL("..", import.meta.url))
 const problems = []
+let sandboxOperations = 0
+if (process.argv.includes("--stubs")) {
+  const forbidden = () => { sandboxOperations++; throw new Error("sandbox gate attempted external access") }
+  for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) childProcess[key] = forbidden
+  syncBuiltinESMExports()
+  globalThis.fetch = forbidden
+  globalThis.WebSocket = class { constructor() { forbidden() } }
+  if (globalThis.Bun) { Bun.spawn = forbidden; Bun.spawnSync = forbidden }
+}
 
 const mod = await import(pathToFileURL(join(root, "index.mjs")).href)
 
@@ -99,20 +110,33 @@ for (const [fnName, fn] of Object.entries(mod)) {
       const response = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "app-bot", messages: [{ role: "user", content: "gate" }] }) })
       if (response.status !== 502 || response.headers.get("X-Magpie-Sign-In") !== "kept" || (await response.json()).error.message !== result.error) throw new Error("implemented transport error contract failed")
       if ((await (await isolated.auth.methods[1].authorize()).callback()).type !== "failed" || operations !== 0) throw new Error("implemented transport isolation failed")
-      console.log("implemented: grok-bot; scaffold: 5; app operations: 0")
+      console.log("implemented: grok-bot; scaffold: 5 candidates checked by sandbox behavior; app operations: 0")
     } else if (process.argv.includes("--stubs")) {
-      for (const method of auth.methods) {
-        if (method.type !== "oauth") continue
-        const flow = await method.authorize({ env: "sandbox" })
-        if (flow.method !== "auto" || typeof flow.callback !== "function") throw new Error("malformed OAuth flow")
-        if ((await flow.callback()).type !== "failed") throw new Error("stub claims successful authorization")
-      }
       const credential = auth.methods[0].type === "api" ? { type: "api", key: "sandbox-only" } : { type: "oauth", env: "sandbox" }
       const loader = await auth.loader(async () => credential)
-      for (const stream of [false, true]) {
-        const response = await loader.fetch(new Request(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ messages: [], stream }) }))
-        const answer = await response.json()
-        if (response.status !== 501 || !answer.error.message.includes(auth.provider) || !answer.error.message.includes("transport not implemented yet")) throw new Error("invalid stub response")
+      let scaffold
+      if (typeof loader.fetch !== "function") {
+        if (Object.keys(loader).length || Object.keys(await auth.loader(async () => null)).length) throw new Error("invalid signed-out loader")
+        console.log(`sandbox: ${auth.provider}; incomplete credential refused`)
+      } else {
+        for (const stream of [false, true]) {
+          const response = await loader.fetch(new Request(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ messages: null, stream }) }))
+          const answer = await response.json()
+          const isScaffold = response.status === 501 && answer.error?.message?.includes(auth.provider) && answer.error.message.includes("transport not implemented yet")
+          const invalidRequest = response.status === 400 && response.headers.get("X-Magpie-Sign-In") === "kept" && answer.error?.code === 400 && answer.error?.type === "cloud_agent_error" && answer.error?.message === "a request that isn't JSON or has no valid messages array"
+          if (!isScaffold && !invalidRequest) throw new Error("invalid sandbox response")
+          if (scaffold !== undefined && scaffold !== isScaffold) throw new Error("inconsistent sandbox contract")
+          scaffold = isScaffold
+        }
+        console.log(`sandbox: ${auth.provider}; ${scaffold ? "scaffold" : "invalid request refused"}`)
+      }
+      if (scaffold) {
+        for (const method of auth.methods) {
+          if (method.type !== "oauth") continue
+          const flow = await method.authorize({ env: "sandbox" })
+          if (flow.method !== "auto" || typeof flow.callback !== "function") throw new Error("malformed OAuth flow")
+          if ((await flow.callback()).type !== "failed") throw new Error("stub claims successful authorization")
+        }
       }
     }
     if (!hooks.config) {
@@ -147,6 +171,7 @@ const missingIds = Object.values(EXPECTED)
   .filter((id) => !ids.includes(id))
 if (missingIds.length) problems.push(`provider ids missing: ${missingIds.join(", ")}`)
 
+if (sandboxOperations) problems.push(`sandbox isolation failed: ${sandboxOperations} external operations`)
 if (problems.length) {
   console.error(`✗ magpie-cloud-agents\n  ${problems.join("\n  ")}`)
   process.exit(1)
