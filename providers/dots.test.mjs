@@ -222,7 +222,7 @@ async function withProvider(run, { options = {}, handshake = true, ...overrides 
   const tunnel = { state: "ready", publicUrl: "https://synthetic-dots.trycloudflare.com", rotated: false, async start() { return this.publicUrl }, async check() { if (this.rotated) throw tunnelModule.dotsFailure("rotated"); if (this.state !== "ready") throw tunnelModule.dotsFailure("down"); return true }, async stop() { this.state = "stopped" } }
   const plugin = makeDotsDriver({}, options, {
     now: () => time, handshakeTimeoutMs: 20,
-    createTunnel: () => tunnel,
+    createTunnel: config => { tunnel.knownSecrets = config.knownSecrets; return tunnel },
     startMcp: settings => { token = settings.token; server = mcpModule.startMcp({ ...settings, transport: async (_url, body) => ({ status: callbackStatus, body: JSON.stringify({ challenge: JSON.parse(body).challenge }) }) }); return server },
     ...overrides,
   })
@@ -427,7 +427,7 @@ test("live same-session concurrent asks attach without a second enqueue", () => 
 
 test("tunnel down includes only bounded redacted child output", () => withTunnel(async ({ tunnel }) => {
   const secret = mintToken()
-  tunnel.command = [process.execPath, "-e", 'require("node:fs").writeSync(2, "connection failed\\n".repeat(1000) + process.argv[1] + "\\nhttps://private-edge.trycloudflare.com/mcp/" + process.argv[1] + "\\nBearer " + process.argv[1] + "\\u001b[31m\\nconnection failed"); process.exit(1)', secret]
+  tunnel.command = [process.execPath, "-e", 'require("node:fs").writeSync(2, "connection failed\\n".repeat(1000) + process.argv[1] + "\\nhttps://private-edge.trycloudflare.com/mcp/" + process.argv[1] + "\\nBearer " + process.argv[1] + "\\u001b[31m\\nconnection failed"); process.exit(1)', "--", secret]
   tunnel.fetcher = async () => ({ status: 502 })
   let failure
   try { await tunnel.start() } catch (error) { failure = error }
@@ -496,11 +496,11 @@ for (const scenario of ["split", "truncated", "controls", "ansi", "cookie", "bou
   if (scenario === "unreachable") expect(failure.message).toBe(tunnelModule.DOTS_FAILURES.unreachable)
 }))
 
-async function diagnosticMessage(output) {
+async function diagnosticMessage(output, knownSecrets = []) {
   const child = new EventEmitter()
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
   child.exitCode = null; child.kill = () => { child.exitCode = 1; child.emit("exit", 1) }
-  const tunnel = new tunnelModule.DotsTunnel({ localUrl: "http://127.0.0.1:9", command: ["fixture"], spawnChild: () => child, fetch: async () => ({ status: 502 }) })
+  const tunnel = new tunnelModule.DotsTunnel({ localUrl: "http://127.0.0.1:9", command: ["fixture"], knownSecrets, spawnChild: () => child, fetch: async () => ({ status: 502 }) })
   try {
     const pending = tunnel.start()
     for (const chunk of Array.isArray(output) ? output : [output]) child.stderr.emit("data", Buffer.from(chunk))
@@ -569,7 +569,7 @@ for (const shape of ["token-second", "secret-second", "connection-first", "conne
     "padded-base64": Buffer.from(secret.slice(0, 16)).toString("base64").match(/.{1,12}/g).join("\n"),
     "short-credential": secret.slice(0, 24) + "\naccess_token=" + secret.slice(24),
     "bare-label": halves[0] + "\nBearer " + halves[1],
-    "credential-bridge": halves[0] + "\nkey=" + secret.slice(16, 20).toLowerCase() + "\n" + secret.slice(20),
+    "credential-bridge": halves[0] + "\nkey=" + secret.slice(16, 20).toLowerCase().replace(/[^a-z]/g, "a") + "\n" + secret.slice(20),
   }
   if (shape === "internal-equals") fragments = [inputs[shape].slice(0, 8), halves[0].slice(9), halves[1]]
   if (shape === "padded-base64") fragments = inputs[shape].split("\n")
@@ -583,6 +583,34 @@ for (const width of [18, 19, 20, 21]) test(`isolated diagnostic floor ${width}`,
   let secret
   do { secret = mintToken().slice(0, width) } while (!/[A-Z0-9]/.test(secret))
   expect((await diagnosticMessage(secret)).includes(secret)).toBe(width < 20)
+})
+
+for (const text of [
+  "host=abc123def456 connIndex=0", "origin=example12345 connIndex=0",
+  "path=/api/v1/health connIndex=0", "trace_id=4f2a9c8b1d3e location=lax01",
+  "request_id=abcdef123456 status=502", "remote=192.168.100.20 port=8080",
+  "timestamp=2026-10-11T10:41:52Z connIndex=0", "user_agent=Mozilla/5.0 connIndex=0",
+  "INF Starting tunnel tunnelID=8f2c4a1b-9d3e-4f5a-b6c7-d8e9f0a1b2c3",
+  "INF Connection 0f2e3d4c-5b6a-7980-9a1b-2c3d4e5f6a7b registered connIndex=0",
+  "INF Proxy hostname=edge.example.test remote=192.168.100.20 path=/api/v1/health",
+]) test(`structured metadata preserved: ${text}`, async () => {
+  expect((await diagnosticMessage(text)).endsWith(text)).toBe(true)
+})
+
+for (const width of [8, 10, 11]) test(`known credential metadata fragments width ${width}`, async () => {
+  const secret = mintToken().toLowerCase(), parts = [secret.slice(0, width), secret.slice(width)]
+  const message = await diagnosticMessage("INF connection=" + parts[0] + " protocol=" + parts[1] + " location=lax01", [secret])
+  expect(parts.some(part => message.includes(part))).toBe(false)
+  expect(message.includes("location=lax01")).toBe(true)
+})
+
+test("known credential is threaded from provider auth into tunnel", () => withProvider(async ({ auth, tunnel }) => {
+  expect(tunnel.knownSecrets?.includes(auth.dot_token)).toBe(true)
+}))
+
+test("known credential overrides structured metadata preservation", async () => {
+  const secret = mintToken().toLowerCase(), part = secret.slice(0, 8)
+  expect((await diagnosticMessage("trace_id=" + part, [secret])).includes(part)).toBe(false)
 })
 
 test("metadata values still redact standalone long tokens", async () => {

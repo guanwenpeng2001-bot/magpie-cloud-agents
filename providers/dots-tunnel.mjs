@@ -69,17 +69,39 @@ export async function healthCheck(publicUrl, { fetch: fetcher = globalThis.fetch
 }
 
 function wrappedFragment(value) {
-  const field = /^([A-Za-z][A-Za-z_-]*)=([^=]{1,11})$/.exec(value)
+  const field = /^([A-Za-z][A-Za-z_-]*)=([^=]+)$/.exec(value)
   const credential = /^(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))$/i
   if (field && credential.test(field[1])) return true
-  if (field && /^(?:connIndex|connection|location|protocol|upstream|port|status|retry|command|exitCode|elapsed)$/i.test(field[1])) return false
+  if (field && /^(?:[a-z0-9_.\/-]+|[A-Z]+|[A-Za-z]+\/[0-9.]+)$/.test(field[2])) return false
   return credential.test(value) || /[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(value) || value.length >= 12
 }
 
-function diagnosticTail(output) {
+function diagnosticTail(output, knownSecrets = []) {
+  const preserved = []
+  const prefixes = new Set(knownSecrets.flatMap(secret => Array.from({ length: Math.max(0, secret.length - 3) }, (_, index) => secret.slice(index, index + 4))))
   return output
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/[\p{C}]/gu, character => /[\n\r\t]/.test(character) ? character : "")
+    .replace(/[A-Za-z0-9_-]+/g, value => {
+      let result = ""
+      for (let index = 0; index < value.length;) {
+        if (!prefixes.has(value.slice(index, index + 4))) { result += value[index++]; continue }
+        let length = 0
+        for (const secret of knownSecrets) {
+          for (let size = Math.min(secret.length, value.length - index); size >= 4; size--) {
+            if (secret.includes(value.slice(index, index + size))) { length = Math.max(length, size); break }
+          }
+        }
+        if (length) { result += "[redacted]"; index += length } else result += value[index++]
+      }
+      return result
+    })
+    .replace(/([A-Za-z0-9_+\/.%-]+=[A-Za-z0-9_+\/.%=-]+)[ \t]*[\r\n]+([A-Za-z0-9_+\/.%=-]{12,})(?=\s|$)/g, (span, field, fragment) => /[A-Z0-9]/.test(fragment) && !fragment.includes("=") && !/^(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))=/i.test(field) ? "[redacted]" : span)
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[A-Za-z][A-Za-z_-]*=(?:\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ|[a-z0-9_.\/-]+|[A-Z]+|[A-Za-z]+\/[0-9.]+)(?=\s|$)/g, value => {
+      if (/^(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))=/i.test(value)) return value
+      preserved.push(value)
+      return "〈" + String.fromCharCode(0xe000 + preserved.length - 1) + "〉"
+    })
     .replace(/[A-Za-z0-9_+\/=.%\-]+(?:\s+[A-Za-z0-9_+\/=.%\-]+)*/g, span => {
       const parts = span.split(/(\s+)/)
       for (let start = 0; start < parts.length; start += 2) {
@@ -94,15 +116,16 @@ function diagnosticTail(output) {
     .replace(/[A-Za-z0-9_+\/.%\-]{20,}/g, value => /[A-Z0-9]/.test(value) ? "[redacted]" : value)
     .replace(/https?:\/\/\S+/gi, "[url]")
     .replace(/\b(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))\b[^\r\n]*/gi, "[credential]")
+    .replace(/〈([\u{e000}-\u{ffff}])〉/gu, (_, marker) => preserved[marker.charCodeAt(0) - 0xe000])
     .replace(/[\p{C}\p{Z}]+/gu, " ").trim().slice(-200)
 }
 
 export class DotsTunnel {
-  constructor({ localUrl, directory = dotsStateDir(), command, publicUrl, binary = ensureTunnelBinary, spawnChild = spawn, fetch: fetcher = globalThis.fetch, startupMs = 30000, backoffMs = 1000, timers = { setTimeout, clearTimeout }, onState = () => {} } = {}) {
+  constructor({ localUrl, knownSecrets = [], directory = dotsStateDir(), command, publicUrl, binary = ensureTunnelBinary, spawnChild = spawn, fetch: fetcher = globalThis.fetch, startupMs = 30000, backoffMs = 1000, timers = { setTimeout, clearTimeout }, onState = () => {} } = {}) {
     if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(localUrl)) throw new Error("Tunnel target must be loopback")
     if (command && (!Array.isArray(command) || !command.length || command.some(part => typeof part !== "string" || !part))) throw new Error("tunnelCommand must be an argv array")
     if (publicUrl && (new URL(publicUrl).protocol !== "https:" || new URL(publicUrl).origin !== publicUrl)) throw new Error("Invalid public URL")
-    Object.assign(this, { localUrl, directory, command, fixedUrl: publicUrl, binary, spawnChild, fetcher, startupMs, backoffMs, timers, onState })
+    Object.assign(this, { localUrl, knownSecrets, directory, command, fixedUrl: publicUrl, binary, spawnChild, fetcher, startupMs, backoffMs, timers, onState })
     this.state = "stopped"; this.publicUrl = null; this.previousUrl = null; this.generation = 0; this.failures = 0; this.stopped = false; this.waiters = new Set()
   }
   setState(state) { this.state = state; this.onState(state) }
@@ -122,7 +145,7 @@ export class DotsTunnel {
     return new Promise((resolve, reject) => {
       let child, settled = false, output = "", checking = false, truncated = false
       const downFailure = () => {
-        const tail = diagnosticTail(truncated ? output.replace(/^[^\r\n]*/, "") : output)
+        const tail = diagnosticTail(truncated ? output.replace(/^[^\r\n]*/, "") : output, this.knownSecrets)
         return chatError(502, DOTS_FAILURES.down + (tail ? " — " + tail : ""), "kept")
       }
       this.downFailure = downFailure

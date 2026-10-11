@@ -52,7 +52,7 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
     if (!resource) {
       const queue = new DotsQueue({ now, ttlMs: ttlMinutes * 60000 })
       const server = createServer({ token: auth.dot_token, queue, now })
-      const tunnel = createTunnel({ localUrl: server.url.replace(/\/mcp$/, ""), command: settings.tunnelCommand, publicUrl: settings.publicUrl })
+      const tunnel = createTunnel({ knownSecrets: [auth.dot_token], localUrl: server.url.replace(/\/mcp$/, ""), command: settings.tunnelCommand, publicUrl: settings.publicUrl })
       resource = { queue, server, tunnel, initialized: false, onExit: () => { tunnel.child?.kill() } }
       process.once("exit", resource.onExit)
       resources.set(auth.dot_token, resource)
