@@ -239,6 +239,48 @@ describe("gate clause pins (scripts/check.mjs --stubs)", () => {
     expect(output).not.toContain("sandbox isolation failed")
   })
 
+  test("authorization probe exemption does not leak into a later API provider's transport", async () => {
+    const dir = await buildFixtureTree({
+      "providers/codex-cloud.mjs": codexCloudStubSource({ transport: "shared400", authorize: "attemptsOperation" }),
+      "providers/cursor-cloud.mjs": `export function makeCursorCloud() {
+  return {
+    auth: {
+      provider: "cursor-cloud",
+      methods: [{ type: "api", label: "fixture API key" }],
+      async loader() {
+        return {
+          baseURL: "https://cursor-cloud.cloud-agents.invalid/v1",
+          async fetch() {
+            try { await globalThis.fetch("https://sentinel-blocked.invalid") } catch {}
+            return new Response(JSON.stringify({ error: {
+              message: "a request that isn't JSON or has no valid messages array",
+              type: "cloud_agent_error", code: 400,
+            } }), { status: 400, headers: { "X-Magpie-Sign-In": "kept" } })
+          },
+        }
+      },
+    },
+    async config(config) {
+      config.provider["cursor-cloud"] = {
+        name: "Cursor Cloud Agents", npm: "@ai-sdk/openai-compatible",
+        models: {
+          "composer-2": { name: "Composer 2", tool_call: false },
+          "claude-sonnet-4-5": { name: "Claude Sonnet 4.5", tool_call: false },
+        },
+      }
+    },
+  }
+}
+`,
+    })
+    const { status, output } = runGate(dir)
+    expect(status).not.toBe(0)
+    expect(output).toContain("authorization: codex-cloud; failed")
+    expect(output).toContain("sandbox: cursor-cloud; invalid request refused")
+    expect(output).toContain("sandbox summary: transport attempts: 2; authorization attempts blocked: 1")
+    expect(output).toContain("sandbox isolation failed: 2 external operations")
+  })
+
   test("scaffold-classified authorize-region attempt stays fatal", async () => {
     const dir = await buildFixtureTree({
       "providers/codex-cloud.mjs": codexCloudStubSource({ transport: "scaffold501", authorize: "attemptsOperation" }),
