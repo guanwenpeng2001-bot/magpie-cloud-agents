@@ -125,7 +125,8 @@ export class DotsTunnel {
     if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(localUrl)) throw new Error("Tunnel target must be loopback")
     if (command && (!Array.isArray(command) || !command.length || command.some(part => typeof part !== "string" || !part))) throw new Error("tunnelCommand must be an argv array")
     if (publicUrl && (new URL(publicUrl).protocol !== "https:" || new URL(publicUrl).origin !== publicUrl)) throw new Error("Invalid public URL")
-    Object.assign(this, { localUrl, knownSecrets, directory, command, fixedUrl: publicUrl, binary, spawnChild, fetcher, startupMs, backoffMs, timers, onState })
+    Object.defineProperty(this, "knownSecrets", { value: knownSecrets })
+    Object.assign(this, { localUrl, directory, command, fixedUrl: publicUrl, binary, spawnChild, fetcher, startupMs, backoffMs, timers, onState })
     this.state = "stopped"; this.publicUrl = null; this.previousUrl = null; this.generation = 0; this.failures = 0; this.stopped = false; this.waiters = new Set()
   }
   setState(state) { this.state = state; this.onState(state) }

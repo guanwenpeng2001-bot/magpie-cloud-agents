@@ -604,6 +604,24 @@ for (const width of [8, 10, 11]) test(`known credential metadata fragments width
   expect(message.includes("location=lax01")).toBe(true)
 })
 
+for (const value of ["usWest2a", "USWEST2A", "gzip+br", "gzip%20br"]) test(`documented metadata loss class ${value}`, async () => {
+  const input = "INF connection=" + value + " location=lax01"
+  expect((await diagnosticMessage(input)).endsWith(input)).toBe(false)
+})
+
+test("metadata fragment boundary preserves colon-bearing multi-field line", async () => {
+  const input = "INF Xx123456789 host=123:443 Xx123456789"
+  expect((await diagnosticMessage(input)).endsWith(input)).toBe(true)
+})
+
+test("known credentials are excluded from enumerable tunnel state", async () => {
+  const secret = mintToken()
+  const tunnel = new tunnelModule.DotsTunnel({ localUrl: "http://127.0.0.1:9", knownSecrets: [secret] })
+  expect(Object.keys(tunnel).includes("knownSecrets")).toBe(false)
+  expect(JSON.stringify(tunnel).includes(secret)).toBe(false)
+  expect(Object.hasOwn({ ...tunnel }, "knownSecrets")).toBe(false)
+})
+
 test("known credential is threaded from provider auth into tunnel", () => withProvider(async ({ auth, tunnel }) => {
   expect(tunnel.knownSecrets?.includes(auth.dot_token)).toBe(true)
 }))
