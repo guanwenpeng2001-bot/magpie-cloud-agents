@@ -68,6 +68,16 @@ export async function healthCheck(publicUrl, { fetch: fetcher = globalThis.fetch
   } catch (error) { if (error.status) throw error; throw dotsFailure("unreachable") }
 }
 
+function diagnosticTail(output) {
+  return output
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\p{C}]/gu, character => /[\n\r\t]/.test(character) ? character : "")
+    .replace(/https?:\/\/\S+/gi, "[url]")
+    .replace(/\b(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))\b[^\r\n]*/gi, "[credential]")
+    .replace(/[A-Za-z0-9_+\/=.%-]{20,}/g, "[redacted]")
+    .replace(/[\p{C}\p{Z}]+/gu, " ").trim().slice(-200)
+}
+
 export class DotsTunnel {
   constructor({ localUrl, directory = dotsStateDir(), command, publicUrl, binary = ensureTunnelBinary, spawnChild = spawn, fetch: fetcher = globalThis.fetch, startupMs = 30000, backoffMs = 1000, timers = { setTimeout, clearTimeout }, onState = () => {} } = {}) {
     if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(localUrl)) throw new Error("Tunnel target must be loopback")
@@ -91,11 +101,19 @@ export class DotsTunnel {
     if (!command) command = [await this.binary({ directory: this.directory }), "tunnel", "--url", this.localUrl, "--no-autoupdate"]
     if (this.stopped || generation !== this.generation) throw dotsFailure("down")
     return new Promise((resolve, reject) => {
-      let child, settled = false, output = "", checking = false
+      let child, settled = false, output = "", checking = false, truncated = false
+      const downFailure = () => {
+        const tail = diagnosticTail(truncated ? output.replace(/^[^\r\n]*/, "") : output)
+        return chatError(502, DOTS_FAILURES.down + (tail ? " — " + tail : ""), "kept")
+      }
+      this.downFailure = downFailure
       const finish = error => {
         if (settled) return
         settled = true; this.timers.clearTimeout(timeout)
-        if (error) { this.lastError = error; reject(error) } else resolve(this.publicUrl)
+        if (error) {
+          if (error.message === DOTS_FAILURES.down) error = downFailure()
+          this.lastError = error; reject(error)
+        } else { this.lastError = null; resolve(this.publicUrl) }
       }
       const timeout = this.timers.setTimeout(() => { finish(dotsFailure("down")); child?.kill() }, this.startupMs)
       this.abortStart = () => finish(dotsFailure("down"))
@@ -119,16 +137,19 @@ export class DotsTunnel {
       catch { this.setState("down"); finish(dotsFailure("down")); return }
       this.child = child
       const consume = chunk => {
-        output = (output + chunk.toString()).slice(-8192)
+        const combined = output + chunk.toString()
+        truncated = truncated || combined.length > 8192
+        output = combined.slice(-8192)
         const url = this.fixedUrl || parseTunnelUrl(output)
         if (url) void ready(url)
       }
       child.stdout?.on("data", consume)
       child.stderr?.on("data", consume)
-      child.once("error", () => { this.setState("down"); finish(dotsFailure("down")) })
+      child.once("error", () => { this.lastError = downFailure(); this.setState("down"); finish(this.lastError) })
       child.once("exit", () => {
         if (generation !== this.generation) return
-        this.child = null; this.publicUrl = null; this.setState("down"); finish(dotsFailure("down"))
+        if (this.state === "ready" || !settled) this.lastError = downFailure()
+        this.child = null; this.publicUrl = null; this.setState("down"); finish(this.lastError)
         if (!this.stopped) {
           const delay = Math.min(this.backoffMs * 2 ** this.failures++, 30000)
           this.restartTimer = this.timers.setTimeout(() => { this.restartTimer = null; void this.start().catch(() => {}) }, delay)
@@ -141,7 +162,8 @@ export class DotsTunnel {
   async check() {
     if (this.state !== "ready" || !this.child || !this.publicUrl) throw this.lastError ?? dotsFailure("down")
     if (this.rotated) throw dotsFailure("rotated")
-    return healthCheck(this.publicUrl, { fetch: this.fetcher })
+    try { return await healthCheck(this.publicUrl, { fetch: this.fetcher }) }
+    catch (error) { throw error.message === DOTS_FAILURES.down ? this.downFailure() : error }
   }
   async stop() {
     this.stopped = true; this.generation++

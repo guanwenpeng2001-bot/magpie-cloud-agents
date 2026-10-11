@@ -87,16 +87,16 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
     },
     async poll(auth, run) {
       const resource = resources.get(auth.dot_token)
-      if (!resource) throw dotsFailure("restarted")
+      if (!resource) return { state: "failed", progress: "Dots: the bridge restarted; asking again sends it as a new task" }
       const task = resource.queue.get(run.ref)
-      if (!task) throw dotsFailure("restarted")
+      if (!task) return { state: "failed", progress: "Dots: the task record is gone; asking again sends it as a new task" }
       if (task.status === "completed") return { state: "succeeded", text: task.result.content }
       if (task.status === "failed" || task.status === "cancelled") return { state: "failed", progress: task.error || "task cancelled" }
       if (task.status === "expired") {
-        const message = task.attempts ? `Dots: the Dot took the task but didn't finish (task_id ${task.id}); asking again rejoins/retries safely` : `Dots: no Dot claimed the task within ${ttlMinutes} min (task_id ${task.id}). Confirm the connector is added and the account has Dots; asking again rejoins it`
-        throw chatError(504, message, "kept")
+        const message = task.attempts ? "Dots: the Dot took the task but didn't finish; asking again sends it as a new task" : `Dots: no Dot claimed the task within ${ttlMinutes} min. Confirm the connector is added and the account has Dots; asking again sends it as a new task`
+        return { state: "failed", progress: message }
       }
-      if (resource.tunnel.state !== "ready") throw dotsFailure("down")
+      if (resource.tunnel.state !== "ready") { await resource.tunnel.check(); throw dotsFailure("down") }
       if (resource.tunnel.rotated) throw dotsFailure("rotated")
       return { state: "running", progress: `waiting for the Dot (${Math.floor((now() - task.createdAt) / 1000)} s) — ${task.status === "running" ? "claimed" : "queued"}; task_id ${task.id}` }
     },

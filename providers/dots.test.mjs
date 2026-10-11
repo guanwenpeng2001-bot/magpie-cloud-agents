@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test"
 import http from "node:http"
+import { EventEmitter } from "node:events"
 import { createHash } from "node:crypto"
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -314,22 +315,22 @@ for (const [kind, status, message] of [
   ["restarted", 502, "Dots: the bridge restarted; ask again"],
 ]) test(`failure message ${kind}: exact status and kept sign-in`, () => expectChatError(async () => { throw tunnelModule.dotsFailure(kind) }, status, message))
 
-test("queued past TTL: exact 504 and kept sign-in", () => withProvider(async ({ plugin, auth, now }) => {
+test("queued past TTL: terminal failed verdict", () => withProvider(async ({ plugin, auth, now }) => {
   const driver = plugin._internal.driver, run = await driver.create(auth, { prompt: "never claimed" })
   now(60001)
-  await expectChatError(() => driver.poll(auth, run), 504, `Dots: no Dot claimed the task within 1 min (task_id ${run.ref}). Confirm the connector is added and the account has Dots; asking again rejoins it`)
+  expect(await driver.poll(auth, run)).toEqual({ state: "failed", progress: "Dots: no Dot claimed the task within 1 min. Confirm the connector is added and the account has Dots; asking again sends it as a new task" })
 }, { options: { dots: { taskTtlMinutes: 1 } } }))
 
-test("claimed never completed: exact 504 and kept sign-in", () => withProvider(async ({ plugin, auth, call, now }) => {
+test("claimed never completed: terminal failed verdict", () => withProvider(async ({ plugin, auth, call, now }) => {
   const driver = plugin._internal.driver, run = await driver.create(auth, { prompt: "never finished" })
   await call("tools/call", { name: "claim_task", arguments: { task_id: run.ref } })
   now(60001)
-  await expectChatError(() => driver.poll(auth, run), 504, `Dots: the Dot took the task but didn't finish (task_id ${run.ref}); asking again rejoins/retries safely`)
+  expect(await driver.poll(auth, run)).toEqual({ state: "failed", progress: "Dots: the Dot took the task but didn't finish; asking again sends it as a new task" })
 }, { options: { dots: { taskTtlMinutes: 1 } } }))
 
-test("subscription lapse and rotated URL block creates; lost task reports bridge restart", () => withProvider(async ({ plugin, auth, now, tunnel }) => {
+test("subscription lapse and rotated URL block creates; lost task returns terminal failure", () => withProvider(async ({ plugin, auth, now, tunnel }) => {
   const driver = plugin._internal.driver
-  await expectChatError(() => driver.poll(auth, { ref: "missing" }), 502, "Dots: the bridge restarted; ask again")
+  expect(await driver.poll(auth, { ref: "missing" })).toEqual({ state: "failed", progress: "Dots: the task record is gone; asking again sends it as a new task" })
   now(86400001)
   await expectChatError(() => driver.create(auth, { prompt: "lapsed" }), 503, "Dots: The Dot's queue subscription lapsed. Ask the Dot to re-subscribe (or re-run setup).")
   tunnel.rotated = true
@@ -376,6 +377,119 @@ test("MCP handshake and task mutation notifications never execute", () => withMc
   const response = await fetch(server.url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", method: "initialize" }) })
   expect(response.status).toBe(202)
   expect(server.initialized).toBe(false)
+}))
+
+for (const loss of ["ttl", "claimed", "record", "resource"]) test(`same-session retry creates executable work after ${loss} loss`, () => withProvider(async ({ plugin, auth, now }) => {
+  const loader = await plugin.auth.loader(async () => auth)
+  const resource = plugin._internal.resources.get(auth.dot_token), ids = []
+  resource.queue.onAvailable(task => {
+    ids.push(task.id)
+    if (ids.length === 1) {
+      if (loss === "claimed") resource.queue.claim(task.id)
+      if (["ttl", "claimed", "record"].includes(loss)) now(1800001)
+      if (loss === "record") { resource.queue.get(task.id); now(2400001) }
+      if (loss === "resource") plugin._internal.resources.delete(auth.dot_token)
+    } else {
+      const lease = resource.queue.claim(task.id)
+      resource.queue.complete(task.id, lease.lease_token, { content: "fresh executable reply" })
+    }
+  })
+  const send = () => loader.fetch("https://dots.cloud-agents.invalid/v1/chat/completions", { headers: { "x-magpie-cloud-agents-session": "recovery-session" }, body: JSON.stringify({ messages: [{ role: "user", content: "same prompt" }] }) })
+  const first = await send()
+  plugin._internal.resources.set(auth.dot_token, resource)
+  expect(first.status).toBe(502)
+  expect(first.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  const message = (await first.json()).error.message
+  expect(message.split(ids[0]).length - 1).toBe(1)
+  expect(message).toContain("asking again sends it as a new task")
+  if (loss === "ttl") expect(message).toBe(`Dots run failed: Dots: no Dot claimed the task within 30 min. Confirm the connector is added and the account has Dots; asking again sends it as a new task — ${ids[0]}`)
+  if (loss === "claimed") expect(message).toBe(`Dots run failed: Dots: the Dot took the task but didn't finish; asking again sends it as a new task — ${ids[0]}`)
+  const second = await send()
+  expect(second.status).toBe(200)
+  expect((await second.json()).choices[0].message.content).toBe("fresh executable reply")
+  expect(ids.length).toBe(2)
+  expect(ids[0] === ids[1]).toBe(false)
+}))
+
+test("live same-session concurrent asks attach without a second enqueue", () => withProvider(async ({ plugin, auth }) => {
+  const loader = await plugin.auth.loader(async () => auth)
+  const resource = plugin._internal.resources.get(auth.dot_token)
+  const send = () => loader.fetch("https://dots.cloud-agents.invalid/v1/chat/completions", { headers: { "x-magpie-cloud-agents-session": "live-session" }, body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "live prompt" }] }) })
+  const first = await send(), task = resource.queue.list().tasks[0]
+  const second = await send()
+  expect(resource.queue.tasks.size).toBe(1)
+  expect(resource.queue.list().tasks[0].id).toBe(task.id)
+  const lease = resource.queue.claim(task.id)
+  resource.queue.complete(task.id, lease.lease_token, { content: "shared reply" })
+  const replies = await Promise.all([first.text(), second.text()])
+  expect(replies.every(reply => reply.includes("shared reply"))).toBe(true)
+}))
+
+test("tunnel down includes only bounded redacted child output", () => withTunnel(async ({ tunnel }) => {
+  tunnel.command = [process.execPath, "-e", 'const crypto = require("node:crypto"); console.error("connection failed\\nhttps://private-edge.trycloudflare.com/mcp/" + crypto.randomBytes(24).toString("base64url") + " Bearer " + crypto.randomBytes(32).toString("hex") + "\\u001b[31m timeout"); process.exit(1)']
+  tunnel.fetcher = async () => ({ status: 502 })
+  let failure
+  try { await tunnel.start() } catch (error) { failure = error }
+  expect(Boolean(failure)).toBe(true)
+  expect(failure.message).toContain("connection failed")
+  expect(failure.message.includes("trycloudflare.com")).toBe(false)
+  expect(/[A-Za-z0-9_-]{24,}/.test(failure.message)).toBe(false)
+  expect(/[\x00-\x1f\x7f-\x9f]/.test(failure.message)).toBe(false)
+  expect(failure.message.length <= tunnelModule.DOTS_FAILURES.down.length + 203).toBe(true)
+}))
+
+test("ready tunnel exit retains diagnostics and driver poll surfaces them", () => withTunnel(async ({ tunnel }) => {
+  await tunnel.start()
+  const exited = new Promise(resolve => { tunnel.onState = state => { if (state === "down") resolve() } })
+  tunnel.child.stderr.emit("data", Buffer.from("connection refused\n"))
+  tunnel.fetcher = async () => ({ status: 502 })
+  await expect(tunnel.check()).rejects.toThrow("connection refused")
+  tunnel.child.kill()
+  await exited
+  await expect(tunnel.check()).rejects.toThrow("connection refused")
+  await withProvider(async ({ plugin, auth, tunnel: fake }) => {
+    const run = await plugin._internal.driver.create(auth, { prompt: "outage" })
+    fake.state = "down"
+    fake.check = () => tunnel.check()
+    await expect(plugin._internal.driver.poll(auth, run)).rejects.toThrow("connection refused")
+  })
+}, { backoffMs: 30000 }))
+
+for (const scenario of ["split", "truncated", "controls", "ansi", "cookie", "bounded", "unreachable"]) test(`tunnel diagnostic redaction handles ${scenario} output`, () => withTunnel(async ({ tunnel }) => {
+  const child = new EventEmitter()
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
+  child.exitCode = null; child.kill = () => { child.exitCode = 1; child.emit("exit", 1) }
+  tunnel.spawnChild = () => child
+  const secret = mintToken(), publicUrl = "https://synthetic-private.trycloudflare.com/mcp/" + secret
+  const pending = tunnel.start()
+  if (scenario === "split") {
+    child.stderr.emit("data", Buffer.from("connection failed\n" + publicUrl.slice(0, 17)))
+    child.stderr.emit("data", Buffer.from(publicUrl.slice(17) + "\nBearer " + secret + "\ntimeout"))
+  } else if (scenario === "truncated") {
+    child.stderr.emit("data", Buffer.from("https://" + "x".repeat(8200) + "/" + secret + "\nconnection failed"))
+  } else if (scenario === "controls") {
+    child.stderr.emit("data", Buffer.from("connection failed\nBearer " + secret.slice(0, 10) + "\u0000" + secret.slice(10) + "\ntimeout"))
+  } else if (scenario === "ansi") {
+    child.stderr.emit("data", Buffer.from("connection failed " + secret.slice(0, 10) + "\u001b[31m" + secret.slice(10)))
+  } else if (scenario === "cookie") {
+    child.stderr.emit("data", Buffer.from("connection failed\nCookie: session=" + secret.slice(0, 10) + "; access_token=" + secret.slice(10) + "\ntimeout"))
+  } else if (scenario === "bounded") {
+    child.stderr.emit("data", Buffer.from("connection failed\n".repeat(1000)))
+  } else {
+    tunnel.fetcher = async () => ({ status: 200 })
+    child.stderr.emit("data", Buffer.from("connection failed\n" + publicUrl))
+  }
+  if (scenario !== "unreachable") child.kill()
+  let failure
+  try { await pending } catch (error) { failure = error }
+  expect(Boolean(failure)).toBe(true)
+  expect(failure.message.includes(secret)).toBe(false)
+  expect(failure.message.includes(secret.slice(0, 10))).toBe(false)
+  expect(failure.message.includes(secret.slice(10))).toBe(false)
+  expect(failure.message.includes("trycloudflare")).toBe(false)
+  expect(/[\p{C}\p{Zl}\p{Zp}]/u.test(failure.message)).toBe(false)
+  expect(failure.message.length <= tunnelModule.DOTS_FAILURES.down.length + 203).toBe(true)
+  if (scenario === "unreachable") expect(failure.message).toBe(tunnelModule.DOTS_FAILURES.unreachable)
 }))
 
 describe("Dots queue", () => {
