@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { chatError } from "../lib/errors.mjs"
 import { withTimeout } from "../lib/http.mjs"
-import { foldPrompt } from "../lib/transcript.mjs"
 import { makeTokenStore } from "./grok-bot-token.mjs"
 
 const HOST = "api2.cursor.sh"
@@ -102,9 +101,9 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     const baseline = await tail(agentId, session, signal)
     const messageId = identity?.key ? createHash("sha256").update(identity.key).digest("hex").replace(/^(.{8})(.{4})(.{4})(.{4})(.{12}).*$/, "$1-$2-$3-$4-$5") : uuid()
     const response = await request("SendGrokBotUserMessage", { agent_id: agentId, message_id: messageId, text: prompt, sent_at_ms: String(now()), is_fork: false, session_id: session }, signal)
-    if (response.refusal || response.delivery === 4 || response.delivery === "GROK_BOT_USER_MESSAGE_DELIVERY_REFUSED") throw protocolError(response.refusal?.message ?? "Message refused")
-    if (response.dispatched !== true && ![1, 2, 3, "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_BOX", "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"].includes(response.delivery)) throw protocolError("Message dispatch was not acknowledged")
-    return { ref: { agentId, messageId, sessionId: session }, view: { baseline: new Set(baseline.map(row => row.entryId ?? row.entry_id ?? String(row.seq))), stable: undefined } }
+    if (response.refusal || response.delivery === 4 || response.delivery === "REFUSED") throw protocolError(response.refusal?.message ?? "Message refused")
+    if (response.dispatched !== true && ![1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE"].includes(response.delivery)) throw protocolError("Message dispatch was not acknowledged")
+    return { url: agentId, ref: { agentId, messageId, sessionId: session }, view: { baseline: new Set(baseline.map(row => row.entryId ?? row.entry_id ?? String(row.seq))), stable: undefined } }
   }
   const driver = {
     id: "grok-bot", name: "Grok Bot direct", staticModels: { "app-bot": { name: "App bot", tool_call: false } },
@@ -112,7 +111,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     async verify({ signal, retryAuth = true } = {}) { return list(signal, retryAuth) },
     async liveModels(credential, signal) { return Object.fromEntries((await list(signal)).map(agent => [agent.id, { name: agent.name, tool_call: false }])) },
     authorize() {
-      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Reads the installed Grok Bot app's sealed sign-in in memory and sends it only to api2.cursor.sh, with redirects refused. Keys and tokens are never saved or logged; buffers are cleared after use or on teardown. Sign in to the app once on this machine first. If bot status is unavailable, completion falls back to transcript stability: a paused bot's partial answer may be delivered as final.", callback: async () => {
         try {
           await store.get()
           return { type: "success", refresh: "dpapi-derive", access: "derived-in-memory", expires: 0, accountId: "grok-bot-direct" }
@@ -129,12 +128,23 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       return send(agentId, sessionId, prompt, identity, signal)
     },
     async followUp(credential, run, suffix, signal) {
-      return send(run.ref.agentId, run.ref.sessionId, foldPrompt(suffix, options), undefined, signal)
+      return send(run.ref.agentId, run.ref.sessionId, suffix.join("\n\n"), undefined, signal)
     },
     async poll(credential, run, signal) {
       const { agentId, messageId, sessionId: session } = run.ref
       const status = await request("GetGrokBotSendStatus", { agent_id: agentId, message_id: messageId, session_id: session }, signal)
-      if ([3, "GROK_BOT_SEND_STATUS_REJECTED"].includes(status.status)) throw protocolError(status.rejectionCode ?? status.rejection_code ?? "Message rejected")
+      if ([3, "REJECTED"].includes(status.status)) throw protocolError(status.rejectionCode ?? status.rejection_code ?? "Message rejected")
+      let running
+      try {
+        const result = await request("ListGrokBotAgentStatuses", { agent_ids: [agentId] }, signal)
+        const matches = Array.isArray(result.statuses) ? result.statuses.filter(row => record(row) && (row.agentId ?? row.agent_id) === agentId) : []
+        const states = matches.map(row => row.isRunning ?? row.is_running)
+        if (states.includes(true)) running = true
+        else if (states.length && states.every(state => state === false)) running = false
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason
+        if (error?.status === 401 || error?.signIn === "expired") throw error
+      }
       const entries = await tail(agentId, session, signal)
       const echoId = status.echoEntryId ?? status.echo_entry_id
       const ordered = entries.filter(record).slice().sort((left, right) => {
@@ -144,11 +154,15 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       const candidates = ordered.filter((row, index) => !run.view.baseline.has(row.entryId ?? row.entry_id ?? String(row.seq)) && (echoIndex < 0 || index > echoIndex))
       const replies = candidates.map(transcriptEntry).filter(row => row?.role === "assistant" && row.text.trim())
       const fingerprint = JSON.stringify(ordered)
-      const accepted = [2, "GROK_BOT_SEND_STATUS_ACCEPTED"].includes(status.status)
+      const accepted = [2, "ACCEPTED"].includes(status.status)
       const text = replies.at(-1)?.text
-      if (accepted && text && run.view.stable === fingerprint) return { state: "succeeded", text }
+      if (running === true) {
+        run.view.stable = undefined
+        return { state: "running", progress: "Grok Bot direct: the bot is still running" }
+      }
+      if (accepted && text && (running === false || run.view.stable === fingerprint)) return { state: "succeeded", text }
       run.view.stable = accepted && text ? fingerprint : undefined
-      return { state: "running", progress: "Grok Bot direct: waiting for the bot" }
+      return { state: "running", progress: running === undefined ? "Grok Bot direct: status unavailable; using transcript stability — a paused bot's partial answer may be delivered as final" : "Grok Bot direct: waiting for the bot" }
     },
     async cancel(credential, run) { await request("InterruptGrokBotAgentRun", { agent_id: run.ref.agentId, reason: "user-cancel", session_id: run.ref.sessionId }) },
     dispose() { disposed = true; store.dispose() },

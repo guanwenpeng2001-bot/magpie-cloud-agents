@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { emulate } from "../lib/emulate.mjs"
 import { unwrapToken, unprotect, makeTokenStore } from "./grok-bot-token.mjs"
 import { makeGrokBotDirect, cursorChecksum, transcriptEntry } from "./grok-bot-direct.mjs"
 
@@ -39,7 +40,7 @@ async function fixture() {
 async function failure(promise, message, status, signIn) {
   let caught
   try { await promise } catch (error) { caught = error }
-  expect(caught?.message === message).toBe(true)
+  expect(caught?.message).toBe(message)
   expect(caught?.status).toBe(status)
   expect(caught?.signIn).toBe(signIn)
 }
@@ -224,7 +225,7 @@ test("send fields, two stable polls, multi-turn same bot and cancel", async () =
   let rows = [assistant(1, "old reply")]
   const { driver, calls } = harness(method => {
     if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
-    if (method === "GetGrokBotSendStatus") return { status: "GROK_BOT_SEND_STATUS_ACCEPTED", echoEntryId: "row-2" }
+    if (method === "GetGrokBotSendStatus") return { status: "ACCEPTED", echoEntryId: "row-2" }
     if (method === "SendGrokBotUserMessage") return { dispatched: true }
     return {}
   })
@@ -239,7 +240,8 @@ test("send fields, two stable polls, multi-turn same bot and cancel", async () =
   rows[0] = assistant(3, "changed reply")
   expect((await driver.poll({}, run)).state).toBe("running")
   expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "changed reply" })
-  const next = await driver.followUp({}, run, [{ role: "user", content: "next question" }])
+  const next = await driver.followUp({}, run, ["next question"])
+  expect(calls.filter(call => call.url.endsWith("SendGrokBotUserMessage")).at(-1).body.text).toBe("next question")
   expect(next.ref.agentId).toBe(run.ref.agentId); expect(next.ref.sessionId).toBe(run.ref.sessionId)
   expect((await driver.poll({}, next)).state).toBe("running")
   await driver.cancel({}, next)
@@ -256,6 +258,110 @@ test("pending cannot finish; rejected status maps to exact protocol error", asyn
   expect((await driver.poll({}, run)).state).toBe("running"); expect((await driver.poll({}, run)).state).toBe("running")
   status = 3
   await failure(driver.poll({}, run), "not allowed — the provider's protocol table may need an update", 502, "kept")
+})
+
+test("running status prevents stable preamble completion until idle and final answer", async () => {
+  let rows = [], running = true
+  const { driver, calls } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
+    if (method === "GetGrokBotSendStatus") return { status: 2 }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", isRunning: running }] }
+    return { dispatched: true }
+  })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "Let me work that out.")]
+  expect((await driver.poll({}, run)).state).toBe("running")
+  expect((await driver.poll({}, run)).state).toBe("running")
+  rows.push(assistant(2, "The answer is 42."))
+  expect((await driver.poll({}, run)).state).toBe("running")
+  running = false
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "The answer is 42." })
+  expect(calls.find(call => call.url.endsWith("ListGrokBotAgentStatuses")).body).toEqual({ agent_ids: ["bot-one"] })
+  expect(run.url).toBe("bot-one")
+})
+
+test("non-byte injected keys yield exact 401 instead of TypeError", async () => {
+  const data = await fixture()
+  for (const key of [{}, new ArrayBuffer(32), "invalid"]) await failure(unwrapToken(data.localState, data.secrets, { unprotect: async () => key }), refused, 401, "kept")
+})
+
+for (const delivery of [1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE"]) test(`corroborated delivery ${delivery} is accepted`, async () => {
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: [] } : { delivery })
+  expect((await driver.create({}, { model: "bot-one", prompt: "question" })).ref.agentId).toBe("bot-one")
+})
+
+test("bare accepted and rejected status and refused delivery", async () => {
+  let rows = [], status = "ACCEPTED", delivery = "ACCEPTED_BOX"
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status, rejectionCode: "denied" } : method === "ListGrokBotAgentStatuses" ? {} : { delivery })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "answer")]
+  await driver.poll({}, run)
+  expect((await driver.poll({}, run)).state).toBe("succeeded")
+  status = "REJECTED"
+  await failure(driver.poll({}, run), "denied — the provider's protocol table may need an update", 502, "kept")
+  delivery = "REFUSED"
+  await failure(driver.create({}, { model: "bot-one", prompt: "question" }), "Message refused — the provider's protocol table may need an update", 502, "kept")
+})
+
+test("real core preserves folded first turn and sends only new user texts", async () => {
+  let rows = [], turn = 0
+  const { driver, calls } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
+    if (method === "GetGrokBotSendStatus") return { status: "ACCEPTED" }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agent_id: "bot-one", is_running: false }] }
+    if (method === "SendGrokBotUserMessage") { rows.push(assistant(++turn, `answer ${turn}`)); return { dispatched: true } }
+    return {}
+  })
+  const timers = { now: Date.now, random: () => 0.5, setTimeout: (callback, delay) => setTimeout(callback, delay < 15000 ? 0 : delay), clearTimeout }
+  const completion = emulate(driver, async () => ({ type: "oauth", access: "derived-in-memory" }), { progress: false }, { timers })
+  const post = messages => completion("https://fixture.invalid/v1/chat/completions", { headers: { "x-magpie-cloud-agents-session": "fixture-conversation" }, body: JSON.stringify({ model: "bot-one", messages, stream: false }) })
+  const first = [{ role: "user", content: "FIRST QUESTION" }]
+  expect((await post(first)).status).toBe(200)
+  expect((await post([...first, { role: "assistant", content: "answer 1" }, { role: "user", content: "next question" }, { role: "user", content: "another detail" }])).status).toBe(200)
+  const sends = calls.filter(call => call.url.endsWith("SendGrokBotUserMessage"))
+  expect(sends.map(call => call.body.text)).toEqual(["Current request:\nFIRST QUESTION", "next question\n\nanother detail"])
+  expect(sends[1].body.agent_id).toBe(sends[0].body.agent_id)
+  driver.dispose()
+})
+
+for (const unavailable of [{}, { statuses: [{ agentId: "other", isRunning: false }] }, { statuses: [{ agentId: "bot-one", isRunning: "false" }] }, { statuses: [{ agentId: "bot-one" }] }, "network", "invalid-json"]) test(`status fallback is explicit: ${JSON.stringify(unavailable)}`, async () => {
+  let rows = []
+  const { driver } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
+    if (method === "GetGrokBotSendStatus") return { status: 2 }
+    if (method === "ListGrokBotAgentStatuses") {
+      if (unavailable === "network") throw new Error("offline")
+      return unavailable === "invalid-json" ? new Response("{") : unavailable
+    }
+    return { dispatched: true }
+  })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  rows = [assistant(1, "stable reply")]
+  expect((await driver.poll({}, run)).progress).toContain("a paused bot's partial answer may be delivered as final")
+  expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "stable reply" })
+})
+
+test("status authentication errors cannot fall back to success", async () => {
+  const { driver } = harness(method => method === "ListGrokBotAgentStatuses" ? new Response(null, { status: 401 }) : method === "ListGrokBotTranscriptEntries" ? { entries: [] } : method === "GetGrokBotSendStatus" ? { status: 2 } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  await failure(driver.poll({}, run), serverRefusal, 401, "expired")
+})
+
+test("retained headers cleared and credential-bearing errors redacted", async () => {
+  for (const network of [false, true]) {
+    let retained
+    const token = new TextEncoder().encode("synthetic-custody-value")
+    const driver = makeGrokBotDirect({}, {}, { store: { get: async () => ({ token, machineId: "fixture" }), dispose: () => token.fill(0) }, fetch: async (url, init) => {
+      retained = init
+      const value = new TextDecoder().decode(token)
+      if (network) throw new Error(`failure ${value}`)
+      return Response.json({ message: `failure ${value}` }, { status: 500 })
+    } })
+    await failure(driver.verify(), network ? "can't reach api2.cursor.sh: failure [redacted]" : "failure [redacted] — the provider's protocol table may need an update", 502, "kept")
+    expect(Object.hasOwn(retained.headers, "authorization")).toBe(false)
+    expect(retained.redirect).toBe("error")
+    driver.dispose()
+  }
 })
 
 test("authorize returns marker only; dispose clears token", async () => {

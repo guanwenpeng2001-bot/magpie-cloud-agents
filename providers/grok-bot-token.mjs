@@ -66,7 +66,7 @@ export async function unwrapToken(localState, secrets, dependencies = {}) {
   } catch (error) {
     token?.fill(0)
     throw error?.message === MISSING_SIGN_IN ? missing() : refused()
-  } finally { key?.fill(0) }
+  } finally { if (key instanceof Uint8Array) key.fill(0) }
 }
 
 export function makeTokenStore(dependencies = {}) {
