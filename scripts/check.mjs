@@ -49,8 +49,10 @@ const EXPECTED = {
 const root = fileURLToPath(new URL("..", import.meta.url))
 const problems = []
 let sandboxOperations = 0
+let authorizeOperations = 0
+let probingAuthorization = false
 if (process.argv.includes("--stubs")) {
-  const forbidden = () => { sandboxOperations++; throw new Error("sandbox gate attempted external access") }
+  const forbidden = () => { if (probingAuthorization) authorizeOperations++; else sandboxOperations++; throw new Error("sandbox gate attempted external access") }
   for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) childProcess[key] = forbidden
   syncBuiltinESMExports()
   globalThis.fetch = forbidden
@@ -102,6 +104,10 @@ for (const [fnName, fn] of Object.entries(mod)) {
       let operations = 0
       const forbidden = () => { operations++; throw new Error("implemented gate attempted app access") }
       const isolated = makeGrokBotDriver({}, {}, { cdp: { env: {}, exists: async () => false, processes: forbidden, spawn: forbidden, fetch: forbidden, freePort: forbidden }, importDirect: async () => { throw new Error("fixture missing direct module") } })
+      for (const method of isolated.auth.methods) {
+        const shape = await method.authorize({ env: "sandbox" })
+        if (shape.method !== "auto" || typeof shape.callback !== "function") throw new Error("malformed OAuth flow")
+      }
       const flow = await isolated.auth.methods[0].authorize()
       const result = await flow.callback()
       if (result.type !== "failed" || result.error !== "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry") throw new Error("implemented missing-install contract failed")
@@ -130,13 +136,25 @@ for (const [fnName, fn] of Object.entries(mod)) {
         }
         console.log(`sandbox: ${auth.provider}; ${scaffold ? "scaffold" : "invalid request refused"}`)
       }
-      if (scaffold) {
-        for (const method of auth.methods) {
-          if (method.type !== "oauth") continue
+      for (const method of auth.methods) {
+        if (method.type !== "oauth") continue
+        let outcome
+        probingAuthorization = scaffold !== true
+        try {
           const flow = await method.authorize({ env: "sandbox" })
           if (flow.method !== "auto" || typeof flow.callback !== "function") throw new Error("malformed OAuth flow")
-          if ((await flow.callback()).type !== "failed") throw new Error("stub claims successful authorization")
+          outcome = await flow.callback()
+        } finally { probingAuthorization = false }
+        if (scaffold && outcome?.type !== "failed") throw new Error("stub claims successful authorization")
+        if (!["failed", "success"].includes(outcome?.type)) throw new Error("invalid OAuth outcome")
+        if (outcome.type === "success") {
+          const authenticated = await auth.loader(async () => ({ ...outcome, type: "oauth" }))
+          if (typeof authenticated.fetch !== "function") throw new Error("authorization success has no transport")
+          const response = await authenticated.fetch(new Request(authenticated.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: "gate" }], stream: false }) }))
+          const answer = await response.json()
+          if (response.status === 501 || response.status === 400 || response.status === 401 || answer.error?.message?.includes("transport not implemented yet")) throw new Error("authorization success is unsupported by transport")
         }
+        console.log(`authorization: ${auth.provider}; ${outcome.type}`)
       }
     }
     if (!hooks.config) {
@@ -171,6 +189,7 @@ const missingIds = Object.values(EXPECTED)
   .filter((id) => !ids.includes(id))
 if (missingIds.length) problems.push(`provider ids missing: ${missingIds.join(", ")}`)
 
+if (process.argv.includes("--stubs")) console.log(`sandbox summary: transport attempts: ${sandboxOperations}; authorization attempts blocked: ${authorizeOperations}`)
 if (sandboxOperations) problems.push(`sandbox isolation failed: ${sandboxOperations} external operations`)
 if (problems.length) {
   console.error(`✗ magpie-cloud-agents\n  ${problems.join("\n  ")}`)
