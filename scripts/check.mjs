@@ -86,7 +86,10 @@ for (const [fnName, fn] of Object.entries(mod)) {
       if (!["oauth", "api"].includes(m.type)) problems.push(`${fnName}: method type ${m.type}`)
       if (m.type === "oauth" && typeof m.authorize !== "function") problems.push(`${fnName}: ${m.label} has no authorize`)
     }
-    if (process.argv.includes("--stubs")) {
+    if (process.argv.includes("--stubs") && auth.provider === "codex-cloud") {
+      const loader = await auth.loader(async () => ({ type: "oauth", env: "sandbox" }))
+      if (Object.keys(loader).length) throw new Error("unrecognised OAuth row must remain signed out")
+    } else if (process.argv.includes("--stubs")) {
       for (const method of auth.methods) {
         if (method.type !== "oauth") continue
         const flow = await method.authorize({ env: "sandbox" })

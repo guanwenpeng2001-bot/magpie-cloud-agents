@@ -102,7 +102,7 @@ test("successful status returns its short summary above a UTF-8 truncated diff",
   expect(script.calls[1].args).toEqual(["cloud", "diff", "task_abc123"])
 })
 test("long status summaries are omitted from the diff answer", async () => {
-  const script = scripted([reply("Completed " + "x".repeat(2048)), reply("diff --git a/a b/a")])
+  const script = scripted([reply("Completed: " + "x".repeat(2048)), reply("diff --git a/a b/a")])
   expect((await _internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).text).toBe("diff --git a/a b/a")
 })
 test("missing task exit is terminal failure and never requests a diff", async () => {
@@ -200,7 +200,96 @@ for (const word of ["failed", "expired"]) test(`chat ${word} maps to 502 kept`, 
   expect(response.headers.get("X-Magpie-Sign-In")).toBe("kept")
   expect((await response.json()).error.message).toContain("task_abc123")
 })
-test("wrong path and invalid JSON are 404 and 400", async () => {
+for (const text of ["not finished", "not done", "not complete", "isn't done", "has not completed", "setup complete, starting agent"]) test(`prose is not status: ${text}`, () => expect(_internal.stateOf(text)).toBe("running"))
+for (const text of ["Task completed. Fixed the failing test.", "Done — no errors.", "Completed: 12 tests passing, 0 failures", "Succeeded with 0 errors and 0 warnings", "Finished. Updated the error handling.", "Finished successfully, 1 cancelled job cleaned up", "Completed successfully, nothing expired"]) test(`explicit success survives summary: ${text}`, () => expect(_internal.stateOf(text)).toBe("succeeded"))
+test("echoed prompt stays running and a resend never creates another task", async () => {
+  let creates = 0, polls = 0
+  const cli = async args => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") { creates++; return reply("task_abc123") }
+    if (args[1] === "diff") return reply("the diff")
+    return reply(++polls === 1 ? "task_abc123  fix the failing test  [in progress]" : "Status: succeeded")
+  }
+  const loader = await makeCodexCloud({}, { cli }).auth.loader(async () => auth)
+  const messages = [{ role: "user", content: "fix the failing test" }]
+  expect((await loader.fetch(endpoint, request(messages))).status).toBe(200)
+  expect((await loader.fetch(endpoint, request(messages))).status).toBe(200)
+  expect(creates).toBe(1)
+})
+for (const prose of ["task-related", "task-oriented", "task_manager", "Tasks-running"]) test(`task prose has no reference: ${prose}`, () => expect(_internal.taskOf(prose)).toBe(null))
+test("stderr warnings never override a running marker", async () => {
+  const driver = _internal.makeDriver({}, scripted([reply("in progress", 0, "warning: error reading config, using defaults")]).cli)
+  expect((await driver.poll({}, { ref: "task_abc123" })).state).toBe("running")
+})
+test("conflicting markers and echoed terminal prompts stay running", () => {
+  expect(_internal.stateOf("Status: done\nStatus: running")).toBe("running")
+  expect(_internal.stateOf("task_abc123  done  [in progress]", "done")).toBe("running")
+  expect(_internal.stateOf("failed", "failed")).toBe("running")
+})
+test("fallback warns in the returned answer while a directly parsed task does not", async () => {
+  for (const inferred of [true, false]) {
+    const script = scripted([reply("Logged in"), reply(inferred ? "Applied task-related changes" : "task_abc123"), ...(inferred ? [reply("task_def456")] : []), reply("Status: succeeded"), reply("another diff")])
+    const loader = await makeCodexCloud({}, script).auth.loader(async () => auth)
+    const response = await loader.fetch(endpoint, request())
+    const text = (await response.json()).choices[0].message.content
+    expect(text.includes("ownership is unverified")).toBe(inferred)
+    expect(text).toContain("another diff")
+    expect(script.calls.some(call => call.args[1] === "list")).toBe(inferred)
+  }
+})
+test("slow diff stays attached and retries the same completed task", async () => {
+  let creates = 0, diffs = 0
+  const cli = async (args, options) => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") { creates++; return reply("task_abc123") }
+    if (args[1] === "status") return reply("Status: succeeded")
+    expect(options.timeoutMs).toBe(3000)
+    if (++diffs === 1) throw Object.assign(new Error("the codex CLI timed out"), { status: 502 })
+    return reply("retried diff")
+  }
+  const loader = await makeCodexCloud({}, { cli }).auth.loader(async () => auth)
+  const response = await loader.fetch(endpoint, request())
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toContain("retried diff")
+  expect(creates).toBe(1)
+  expect(diffs).toBe(2)
+})
+test("aborting loader login kills the registered fake child promptly", async () => {
+  let children
+  const controller = new AbortController()
+  const cli = (args, options) => {
+    children = options.children
+    const pending = _internal.spawnCodex([fixture], { ...options, env: { PATH: directory, FAKE_REPLY: JSON.stringify({ hang: true }) } })
+    queueMicrotask(() => controller.abort(new Error("caller cancelled login")))
+    return pending
+  }
+  const loader = await makeCodexCloud({}, { cli }).auth.loader(async () => auth)
+  const started = Date.now()
+  await loader.fetch(endpoint, { ...request(), signal: controller.signal })
+  expect(Date.now() - started).toBeLessThan(2000)
+  expect(children.size).toBe(0)
+})
+test("driver cancel can kill a registered login child", async () => {
+  const cli = (args, options) => {
+    const pending = _internal.spawnCodex([fixture], { ...options, env: { PATH: directory, FAKE_REPLY: JSON.stringify({ hang: true }) } })
+    void _internal.makeDriver({}, scripted([]).cli).cancel({}, { children: options.children })
+    return pending
+  }
+  const loader = await makeCodexCloud({}, { cli }).auth.loader(async () => auth)
+  expect((await loader.fetch(endpoint, request())).status).toBe(401)
+})
+for (const options of [{ codexCloud: { env: 123 } }, {}]) test(`non-string environment is a 400: ${JSON.stringify(options)}`, async () => {
+  const driver = _internal.makeDriver(options, scripted([]).cli)
+  await expect(driver.create(options.codexCloud ? {} : { metadata: { env: 123 } }, { prompt: "hi" })).rejects.toMatchObject({ status: 400, message: "metadata.env and codexCloud.env must be strings" })
+})
+test("failed login checks are never cached", async () => {
+  const script = scripted([reply("not logged in"), reply("not logged in")])
+  const loader = await makeCodexCloud({}, script).auth.loader(async () => auth)
+  expect((await loader.fetch(endpoint, request())).status).toBe(401)
+  expect((await loader.fetch(endpoint, request())).status).toBe(401)
+  expect(script.calls).toHaveLength(2)
+})
+test("wrong path and invalid JSON are 404 and 400",async () => {
   const loader = await makeCodexCloud({}, scripted([reply("Logged in")])).auth.loader(async () => auth)
   expect((await loader.fetch(endpoint + "/wrong", request())).status).toBe(404)
   expect((await loader.fetch(endpoint, { body: "not json" })).status).toBe(400)

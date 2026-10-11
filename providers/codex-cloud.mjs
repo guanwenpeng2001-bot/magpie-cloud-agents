@@ -51,15 +51,26 @@ function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, childr
 }
 
 function taskOf(text) {
-  const match = /task[_-]?[a-z0-9-]{6,}|https:\/\/\S*?\/tasks?\/[\w-]+/i.exec(text)
+  const match = /https:\/\/[^\s/]+\/\S*?\btasks?\/[\w-]+|\btask[_-](?=[a-z0-9-]*\d)[a-z0-9-]{6,}\b/i.exec(text)
   if (!match) return null
   return match[0].startsWith("https://") ? { ref: new URL(match[0]).pathname.split("/").pop(), url: match[0] } : { ref: match[0] }
 }
-function stateOf(text) {
-  if (/\bexpir\w*\b/i.test(text)) return "expired"
-  if (/\b(fail|error|cancel)\w*\b/i.test(text)) return "failed"
-  if (/\b(complet|succeed|done|finish)\w*\b/i.test(text)) return "succeeded"
-  return "running"
+function stateOf(text, prompt = "") {
+  const states = []
+  const echoed = new Set(prompt.split(/\r?\n/).map(line => line.trim()).filter(Boolean))
+  for (let line of text.split(/\r?\n/)) {
+    for (const echo of echoed) line = line.split(echo).join(" ")
+    line = line.trim()
+    const positioned = /\[([^\]]+)\]\s*$/.exec(line)?.[1] ?? /^(?:status|state)\s*:\s*(.+)$/i.exec(line)?.[1] ?? /^task[_-][\w-]+\s+.+\s{2,}([a-z]+|in progress)$/i.exec(line)?.[1]
+    const candidate = positioned ?? line.replace(/^task\s+/i, "")
+    const match = /^(complet\w*|succeed\w*|done|finish\w*|fail\w*|error\w*|cancel\w*|expir\w*|running|working|queued|pending|in progress)\b(?=$|[.:,\s—])/i.exec(candidate)
+    if (!match) { if (positioned) states.push("running"); continue }
+    const word = match[1]
+    const rest = candidate.slice(match[0].length)
+    if (!positioned && rest && !/^(?:\s*[.:,—]|\s+(?:successfully\b|with\s+\d|by user\b))/.test(rest)) continue
+    states.push(/^expir/i.test(word) ? "expired" : /^(fail|error|cancel)/i.test(word) ? "failed" : /^(complet|succeed|done|finish)/i.test(word) ? "succeeded" : "running")
+  }
+  return states.length && states.every(state => state === states[0]) ? states[0] : "running"
 }
 function checkExit(result) {
   const text = outputOf(result)
@@ -72,14 +83,16 @@ function makeDriver(options, cli) {
   return {
     id: ID, name: NAME, staticModels: MODELS,
     async create(credential, { prompt }, signal) {
+      for (const value of [credential.metadata?.env, options.codexCloud?.env]) if (value != null && typeof value !== "string") throw chatError(400, "metadata.env and codexCloud.env must be strings")
       const env = credential.metadata?.env?.trim() || options.codexCloud?.env?.trim()
       if (!env) throw chatError(400, "Codex Cloud requires account metadata.env (the sign-in environment id) or option codexCloud.env")
       const attempts = options.codexCloud?.attempts ?? 1
       if (!Number.isInteger(attempts) || attempts < 1) throw chatError(400, "codexCloud.attempts must be a positive integer")
-      const run = { children: new Set() }
+      const run = { children: new Set(), prompt }
       const created = checkExit(await cli(["cloud", "exec", "--env", env, "--attempts", String(attempts), "--", prompt], { signal, children: run.children }))
       let task = taskOf(created.stdout)
       if (!task) {
+        run.inferred = true
         const listed = checkExit(await cli(["cloud", "list", "--env", env, "--limit", "1"], { signal, children: run.children }))
         task = taskOf(listed.stdout)
         if (!task) throw chatError(502, outputOf(created) + "\n" + outputOf(listed))
@@ -91,10 +104,15 @@ function makeDriver(options, cli) {
       const progress = outputOf(result)
       if (result.code !== 0 && /not found|no such task/i.test(progress)) return { state: "failed", progress }
       checkExit(result)
-      const state = stateOf(progress)
+      const state = stateOf(result.stdout, run.prompt)
       if (state !== "succeeded") return { state, progress }
-      const diff = checkExit(await cli(["cloud", "diff", run.ref], { signal, children: run.children })).stdout
-      const text = (Buffer.byteLength(progress) <= 2048 ? progress + "\n\n" : "") + trimBytes(diff, 102400) + (Buffer.byteLength(diff) > 102400 ? "\n[diff truncated at 100 KiB]" : "")
+      let diff
+      try { diff = checkExit(await cli(["cloud", "diff", run.ref], { signal, children: run.children, timeoutMs: 3000 })).stdout }
+      catch (error) {
+        if (!signal?.aborted && (error.name === "TimeoutError" || error.message === "the codex CLI timed out")) return { state: "running", progress: progress + "\nDiff retrieval timed out; waiting to retry the same task" }
+        throw error
+      }
+      const text = (run.inferred ? "WARNING: Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.\n\n" : "") + (Buffer.byteLength(progress) <= 2048 ? progress + "\n\n" : "") + trimBytes(diff, 102400) + (Buffer.byteLength(diff) > 102400 ? "\n[diff truncated at 100 KiB]" : "")
       return { state, text: text.trim(), progress }
     },
     async cancel(credential, run) { for (const child of run.children) child.kill() },
@@ -103,8 +121,8 @@ function makeDriver(options, cli) {
 
 export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now, timers } = {}) {
   const driver = makeDriver(options, cli)
-  const verify = async signal => {
-    const result = await cli(["login", "status"], { signal, timeoutMs: 10000 })
+  const verify = async (signal, children = new Set()) => {
+    const result = await cli(["login", "status"], { signal, children, timeoutMs: 10000 })
     if (result.code !== 0 || !/logged in/i.test(result.stdout) || loggedOut(outputOf(result))) throw chatError(401, LOGGED_OUT, "expired")
   }
   return {
@@ -124,7 +142,8 @@ export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now,
             try {
               if (!marker(await getAuth())) throw chatError(401, `${NAME} isn't signed in — magpie plugin login ${ID}`, "expired")
               if (now() - checkedAt >= 60000) {
-                checking ??= verify().then(() => { checkedAt = now() }).finally(() => { checking = undefined })
+                const signal = init.signal ?? (input instanceof Request ? input.signal : undefined)
+                checking ??= verify(signal).then(() => { checkedAt = now() }).finally(() => { checking = undefined })
                 await checking
               }
               return await completion(input, init)
