@@ -145,7 +145,9 @@ export class DotsTunnel {
     if (!command) command = [await this.binary({ directory: this.directory }), "tunnel", "--url", this.localUrl, "--no-autoupdate"]
     if (this.stopped || generation !== this.generation) throw dotsFailure("down")
     return new Promise((resolve, reject) => {
-      let child, settled = false, output = "", checking = false, truncated = false
+      let child, settled = false, output = "", checking = false, truncated = false, retryTimer, healthFailure, probes = 0
+      const deadline = Date.now() + this.startupMs
+      const inactive = () => settled || this.stopped || generation !== this.generation || child?.exitCode !== null
       const downFailure = () => {
         const tail = diagnosticTail(truncated ? output.replace(/^[^\r\n]*/, "") : output, this.knownSecrets)
         return chatError(502, DOTS_FAILURES.down + (tail ? " — " + tail : ""), "kept")
@@ -153,29 +155,43 @@ export class DotsTunnel {
       this.downFailure = downFailure
       const finish = error => {
         if (settled) return
-        settled = true; this.timers.clearTimeout(timeout)
+        settled = true; this.timers.clearTimeout(timeout); this.timers.clearTimeout(retryTimer)
         if (error) {
           if (error.message === DOTS_FAILURES.down) error = downFailure()
           this.lastError = error; reject(error)
         } else { this.lastError = null; resolve(this.publicUrl) }
       }
-      const timeout = this.timers.setTimeout(() => { finish(dotsFailure("down")); child?.kill() }, this.startupMs)
+      const timeout = this.timers.setTimeout(() => { finish(healthFailure ?? dotsFailure(checking ? "unreachable" : "down")); child?.kill() }, this.startupMs)
       this.abortStart = () => finish(dotsFailure("down"))
       const ready = async url => {
-        if (checking || settled || this.stopped) return
+        if (checking || inactive()) return
         checking = true
         try {
-          await healthCheck(url, { fetch: this.fetcher })
-          if (this.stopped || generation !== this.generation || child.exitCode !== null) throw dotsFailure("down")
+          await healthCheck(url, { fetch: this.fetcher, timeoutMs: Math.max(1, Math.min(10000, deadline - Date.now())) })
+          if (inactive()) return
           await mkdir(this.directory, { recursive: true, mode: 0o700 })
+          if (inactive()) return
           await writeFile(join(this.directory, "tunnel-state.json"), JSON.stringify({ publicUrl: url, startedAt: Date.now(), pid: child.pid }), { mode: 0o600 })
+          if (inactive()) return
           this.publicUrl = url
           this.rotated = Boolean(this.previousUrl && this.previousUrl !== url)
           this.previousUrl = url
           this.setState("ready")
           for (const waiter of this.waiters) waiter(url)
           finish()
-        } catch (error) { finish(error); child.kill() }
+        } catch (error) {
+          if (inactive()) return
+          if (error.message === DOTS_FAILURES.unreachable) {
+            healthFailure = error
+            const remaining = deadline - Date.now()
+            if (remaining > 0) {
+              const delay = Math.min(this.backoffMs * 2 ** probes++, 1000, remaining)
+              retryTimer = this.timers.setTimeout(() => { checking = false; void ready(url) }, delay)
+              return
+            }
+          }
+          finish(error); child.kill()
+        }
       }
       try { child = this.spawnChild(command[0], command.slice(1), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: false }) }
       catch { this.setState("down"); finish(dotsFailure("down")); return }

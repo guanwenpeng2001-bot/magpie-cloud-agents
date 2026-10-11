@@ -168,6 +168,129 @@ test("fake tunnel allocates a URL, health-checks it and records state", () => wi
   await tunnel.check()
 }))
 
+function stubTunnelChild() {
+  const child = new EventEmitter()
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
+  child.exitCode = null; child.kills = 0
+  child.kill = () => { child.kills++; child.exitCode = 1; child.emit("exit", 1) }
+  return child
+}
+
+for (const initialFailure of ["network", "status"]) test(`startup retries ${initialFailure} until the public URL answers`, async () => {
+  const child = stubTunnelChild()
+  let probes = 0
+  await withTunnel(async ({ tunnel, directory, states }) => {
+    const pending = tunnel.start()
+    child.stderr.emit("data", "https://synthetic-dots.trycloudflare.com\n")
+    expect(await pending).toBe("https://synthetic-dots.trycloudflare.com")
+    expect(probes).toBe(4)
+    expect(tunnel.state).toBe("ready")
+    expect(states.filter(state => state === "ready")).toHaveLength(1)
+    expect(child.kills).toBe(0)
+    expect(JSON.parse(await readFile(join(directory, "tunnel-state.json"), "utf8")).publicUrl).toBe(tunnel.publicUrl)
+  }, { command: ["fixture"], spawnChild: () => child, startupMs: 1000, backoffMs: 5, fetch: async () => {
+    if (++probes <= 3) {
+      if (initialFailure === "network") throw new TypeError("not ready")
+      return { status: 200 }
+    }
+    return { status: 401 }
+  } })
+})
+
+test("startup unreachable deadline kills the child and stops probing", async () => {
+  const child = stubTunnelChild()
+  let probes = 0
+  await withTunnel(async ({ tunnel }) => {
+    const started = performance.now(), pending = tunnel.start()
+    child.stderr.emit("data", "https://synthetic-dots.trycloudflare.com\n")
+    await expect(pending).rejects.toThrow(tunnelModule.DOTS_FAILURES.unreachable)
+    const elapsed = performance.now() - started
+    expect(elapsed).toBeGreaterThanOrEqual(70)
+    expect(elapsed).toBeLessThan(250)
+    expect(probes).toBeGreaterThan(1)
+    expect(child.kills).toBe(1)
+    await tunnel.stop()
+    const stoppedProbes = probes
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(probes).toBe(stoppedProbes)
+  }, { command: ["fixture"], spawnChild: () => child, startupMs: 80, backoffMs: 5, fetch: async () => { probes++; throw new TypeError("not ready") } })
+})
+
+test("startup 5xx fails as down without retrying", async () => {
+  const child = stubTunnelChild()
+  let probes = 0
+  await withTunnel(async ({ tunnel }) => {
+    const started = performance.now(), pending = tunnel.start()
+    child.stderr.emit("data", "https://synthetic-dots.trycloudflare.com\n")
+    await expect(pending).rejects.toThrow(tunnelModule.DOTS_FAILURES.down)
+    expect(performance.now() - started).toBeLessThan(250)
+    expect(probes).toBe(1)
+    expect(child.kills).toBe(1)
+  }, { command: ["fixture"], spawnChild: () => child, startupMs: 1000, backoffMs: 5, fetch: async () => { probes++; return { status: 502 } } })
+})
+
+test("startup stop cancels scheduled probes", async () => {
+  const child = stubTunnelChild()
+  let probes = 0, retryScheduled
+  const scheduled = new Promise(resolve => { retryScheduled = resolve })
+  await withTunnel(async ({ tunnel, states }) => {
+    const pending = tunnel.start()
+    const rejected = pending.catch(error => error)
+    child.stderr.emit("data", "https://synthetic-dots.trycloudflare.com\n")
+    await scheduled
+    await tunnel.stop()
+    expect((await rejected).message).toContain(tunnelModule.DOTS_FAILURES.down)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(probes).toBe(1)
+    expect(tunnel.state).toBe("stopped")
+    expect(states).not.toContain("ready")
+  }, { command: ["fixture"], spawnChild: () => child, startupMs: 1000, backoffMs: 20,
+    timers: { clearTimeout, setTimeout: (callback, delay) => { const timer = setTimeout(callback, delay); if (delay === 20) retryScheduled(); return timer } },
+    fetch: async () => { probes++; throw new TypeError("not ready") },
+  })
+})
+
+test("startup hung probe respects deadline and late success cannot resurrect the tunnel", async () => {
+  const child = stubTunnelChild()
+  let completeProbe
+  await withTunnel(async ({ tunnel, directory, states }) => {
+    const started = performance.now(), pending = tunnel.start()
+    child.stderr.emit("data", "https://synthetic-dots.trycloudflare.com\n")
+    await expect(pending).rejects.toThrow(tunnelModule.DOTS_FAILURES.unreachable)
+    expect(performance.now() - started).toBeLessThan(250)
+    expect(child.kills).toBe(1)
+    await tunnel.stop()
+    completeProbe({ status: 401 })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(tunnel.state).toBe("stopped")
+    expect(states).not.toContain("ready")
+    expect(await readdir(directory)).toEqual([])
+  }, { command: ["fixture"], spawnChild: () => child, startupMs: 80, backoffMs: 1000,
+    fetch: () => new Promise(resolve => { completeProbe = resolve }),
+  })
+})
+
+test("startup old generation cannot replace a restarted tunnel", async () => {
+  const children = [stubTunnelChild(), stubTunnelChild()]
+  let spawned = 0, probes = 0, completeOldProbe
+  await withTunnel(async ({ tunnel, states }) => {
+    const pending = tunnel.start()
+    const rejected = pending.catch(error => error)
+    children[0].stderr.emit("data", "https://synthetic-old.trycloudflare.com\n")
+    await tunnel.stop()
+    expect((await rejected).message).toContain(tunnelModule.DOTS_FAILURES.down)
+    const restarted = tunnel.start()
+    children[1].stderr.emit("data", "https://synthetic-new.trycloudflare.com\n")
+    expect(await restarted).toBe("https://synthetic-new.trycloudflare.com")
+    completeOldProbe({ status: 401 })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(tunnel.publicUrl).toBe("https://synthetic-new.trycloudflare.com")
+    expect(states.filter(state => state === "ready")).toHaveLength(1)
+  }, { command: ["fixture"], spawnChild: () => children[spawned++], startupMs: 1000, backoffMs: 5,
+    fetch: () => ++probes === 1 ? new Promise(resolve => { completeOldProbe = resolve }) : Promise.resolve({ status: 401 }),
+  })
+})
+
 test("health check distinguishes bridge outage from unreachable URL", async () => {
   await expect(tunnelModule.healthCheck("https://synthetic-dots.trycloudflare.com", { fetch: async () => ({ status: 502 }) })).rejects.toThrow(tunnelModule.DOTS_FAILURES.down)
   await expect(tunnelModule.healthCheck("https://synthetic-dots.trycloudflare.com", { fetch: async () => { throw new Error("network down") } })).rejects.toThrow(tunnelModule.DOTS_FAILURES.unreachable)
