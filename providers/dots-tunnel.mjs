@@ -72,6 +72,7 @@ function wrappedFragment(value) {
   const field = /^([A-Za-z][A-Za-z_-]*)=([^=]+)$/.exec(value)
   const credential = /^(?:bearer|(?:[\w-]*[_-])?(?:token|secret|password|authorization|cookie|key))$/i
   if (field && credential.test(field[1])) return true
+  // Excluded camelCase, uppercase-with-digits, + and % values are redacted rather than preserved.
   if (field && /^(?:[a-z0-9_.\/-]+|[A-Z]+|[A-Za-z]+\/[0-9.]+)$/.test(field[2])) return false
   return credential.test(value) || /[0-9]|[a-z][A-Z]|[A-Z].*[A-Z]/.test(value) || value.length >= 12
 }

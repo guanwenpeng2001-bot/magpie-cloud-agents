@@ -606,7 +606,7 @@ for (const width of [8, 10, 11]) test(`known credential metadata fragments width
 
 for (const value of ["usWest2a", "USWEST2A", "gzip+br", "gzip%20br"]) test(`documented metadata loss class ${value}`, async () => {
   const input = "INF connection=" + value + " location=lax01"
-  expect((await diagnosticMessage(input)).endsWith(input)).toBe(false)
+  expect(await diagnosticMessage(input)).toBe("Dots: The Dots bridge is unreachable — the tunnel is not running. Start the tunnel or provide a public address. — [redacted] location=lax01")
 })
 
 test("metadata fragment boundary preserves colon-bearing multi-field line", async () => {
