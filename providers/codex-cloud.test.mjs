@@ -54,7 +54,7 @@ test("stateOf matches vocabulary word-wise, so unfinished is not finish", () => 
   expect(_internal.stateOf("Completed successfully")).toBe("succeeded")
   expect(_internal.stateOf("done")).toBe("succeeded")
   expect(_internal.stateOf("FAILED")).toBe("failed")
-  expect(_internal.stateOf("error: no such task")).toBe("failed")
+  expect(_internal.stateOf("error: no such task")).toBe("running")
   expect(_internal.stateOf("cancelled by user")).toBe("failed")
   expect(_internal.stateOf("expired")).toBe("expired")
   expect(_internal.stateOf("in progress")).toBe("running")
@@ -237,14 +237,32 @@ test("fallback warns in the returned answer while a directly parsed task does no
     expect(script.calls.some(call => call.args[1] === "list")).toBe(inferred)
   }
 })
-test("slow diff stays attached and retries the same completed task", async () => {
+const continuingRows = ["Status: completed the refactor, now running the tests", "Status: failing test identified, fix in progress", "Done, starting the tests", "Done — still running the test suite", "Done with 3 retries, continuing", "Error: connection reset, retrying", "task_abc123  Please investigate.\nError: tests fail on Windows."]
+for (const text of continuingRows) test(`continuation cannot terminate: ${text}`, () => expect(_internal.stateOf(text)).toBe("running"))
+for (const text of continuingRows) test(`continuation remains attached through the core: ${text}`, async () => {
+  let creates = 0, diffs = 0, polls = 0
+  const cli = async args => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") { creates++; return reply("task_abc123") }
+    if (args[1] === "diff") { diffs++; return reply("partial diff") }
+    polls++; return reply(text)
+  }
+  const loader = await makeCodexCloud({ maxRunMinutes: 0.001 }, { cli }).auth.loader(async () => auth)
+  expect((await loader.fetch(endpoint, request())).status).toBe(504)
+  expect((await loader.fetch(endpoint, request())).status).toBe(504)
+  expect(creates).toBe(1)
+  expect(diffs).toBe(0)
+  expect(polls).toBe(2)
+})
+test("expired prose preserves its terminal verdict", () => expect(_internal.stateOf("Expired before finishing")).toBe("expired"))
+test("real diff timer retries the same completed task", async () => {
   let creates = 0, diffs = 0
   const cli = async (args, options) => {
     if (args[0] === "login") return reply("Logged in")
     if (args[1] === "exec") { creates++; return reply("task_abc123") }
     if (args[1] === "status") return reply("Status: succeeded")
     expect(options.timeoutMs).toBe(3000)
-    if (++diffs === 1) throw Object.assign(new Error("the codex CLI timed out"), { status: 502 })
+    if (++diffs === 1) return _internal.spawnCodex([fixture], { ...options, env: { PATH: directory, FAKE_REPLY: JSON.stringify({ hang: true }) } })
     return reply("retried diff")
   }
   const loader = await makeCodexCloud({}, { cli }).auth.loader(async () => auth)
@@ -253,6 +271,21 @@ test("slow diff stays attached and retries the same completed task", async () =>
   expect((await response.json()).choices[0].message.content).toContain("retried diff")
   expect(creates).toBe(1)
   expect(diffs).toBe(2)
+}, 10000)
+test("real diff sign-in expiry surfaces 401 expired without retry", async () => {
+  let diffs = 0
+  const cli = async (args, options) => {
+    if (args[0] === "login") return reply("Logged in")
+    if (args[1] === "exec") return reply("task_abc123")
+    if (args[1] === "status") return reply("Status: succeeded")
+    diffs++
+    return _internal.spawnCodex([fixture], { ...options, env: { PATH: directory, FAKE_REPLY: JSON.stringify(reply("Not logged in", 1)) } })
+  }
+  const loader = await makeCodexCloud({ maxRunMinutes: 0.02 }, { cli }).auth.loader(async () => auth)
+  const response = await loader.fetch(endpoint, request())
+  expect(response.status).toBe(401)
+  expect(response.headers.get("X-Magpie-Sign-In")).toBe("expired")
+  expect(diffs).toBe(1)
 })
 test("aborting loader login kills the registered fake child promptly", async () => {
   let children

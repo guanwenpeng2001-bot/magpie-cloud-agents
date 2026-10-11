@@ -45,7 +45,7 @@ function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, childr
     child.once("error", error => finish(error.code === "ENOENT" ? chatError(401, MISSING, "kept") : error))
     child.once("close", code => finish(stopped, { code, stdout, stderr }))
     signal?.addEventListener("abort", aborted, { once: true })
-    timer = setTimeout(() => stop(chatError(502, "the codex CLI timed out")), timeoutMs)
+    timer = setTimeout(() => stop(Object.assign(chatError(502, "the codex CLI timed out"), { code: "CODEX_CLI_TIMEOUT" })), timeoutMs)
     if (signal?.aborted) aborted()
   })
 }
@@ -67,7 +67,9 @@ function stateOf(text, prompt = "") {
     if (!match) { if (positioned) states.push("running"); continue }
     const word = match[1]
     const rest = candidate.slice(match[0].length)
-    if (!positioned && rest && !/^(?:\s*[.:,—]|\s+(?:successfully\b|with\s+\d|by user\b))/.test(rest)) continue
+    if (!/^expir/i.test(word) && /\b(?:running|starting|continuing|retrying|in progress|pending|queued)\b/i.test(rest)) { states.push("running"); continue }
+    if (!positioned && /^error/i.test(word) && rest) { states.push("running"); continue }
+    if (!positioned && !/^expir/i.test(word) && rest && !/^(?:\s*[.:,—]|\s+(?:successfully\b|with\s+\d|by user\b))/.test(rest)) continue
     states.push(/^expir/i.test(word) ? "expired" : /^(fail|error|cancel)/i.test(word) ? "failed" : /^(complet|succeed|done|finish)/i.test(word) ? "succeeded" : "running")
   }
   return states.length && states.every(state => state === states[0]) ? states[0] : "running"
@@ -109,7 +111,7 @@ function makeDriver(options, cli) {
       let diff
       try { diff = checkExit(await cli(["cloud", "diff", run.ref], { signal, children: run.children, timeoutMs: 3000 })).stdout }
       catch (error) {
-        if (!signal?.aborted && (error.name === "TimeoutError" || error.message === "the codex CLI timed out")) return { state: "running", progress: progress + "\nDiff retrieval timed out; waiting to retry the same task" }
+        if (!signal?.aborted && error.code === "CODEX_CLI_TIMEOUT") return { state: "running", progress: progress + "\nDiff retrieval timed out; waiting to retry the same task" }
         throw error
       }
       const text = (run.inferred ? "WARNING: Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.\n\n" : "") + (Buffer.byteLength(progress) <= 2048 ? progress + "\n\n" : "") + trimBytes(diff, 102400) + (Buffer.byteLength(diff) > 102400 ? "\n[diff truncated at 100 KiB]" : "")
