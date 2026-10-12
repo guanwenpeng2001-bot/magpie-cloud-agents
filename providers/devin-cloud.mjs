@@ -1,5 +1,5 @@
 import { emulate } from "../lib/emulate.mjs"
-import { chatError, FollowupRejected } from "../lib/errors.mjs"
+import { chatError, errorResponse, FollowupRejected } from "../lib/errors.mjs"
 import { fetchWithTimeout } from "../lib/http.mjs"
 import { sessionOf, SESSION_HEADER } from "../lib/sessions.mjs"
 
@@ -7,7 +7,33 @@ const ID = "devin-cloud"
 const NAME = "Devin Cloud"
 const BASE = "https://devin-cloud.cloud-agents.invalid/v1"
 const MODELS = { "devin-session": { name: "Devin session", tool_call: false, reasoning: false } }
-const credentialOf = auth => auth?.type === "api" && typeof auth.key === "string" && auth.key.trim() ? { type: "api", key: auth.key } : null
+const mechanismOf = key => /^cog_\S+$/.test(key) ? "codeium" : /^apk_\S+$/.test(key) ? "devin" : null
+const UNRECOGNIZED = "Use a Codeium credential (cog_…) or a Devin platform API key (apk_…); legacy Devin CLI session tokens (devin-session-token$…) are not supported by this provider"
+const storedKey = auth => auth?.type === "api" ? auth.key : auth?.type === "oauth" && ["devin", "codeium"].includes(auth.mechanism ?? auth.metadata?.mechanism) ? auth.access : undefined
+function credentialOf(auth) {
+  const value = storedKey(auth)
+  if (typeof value !== "string" || !value.trim()) return null
+  const key = value.trim()
+  const inferred = mechanismOf(key)
+  const mechanism = auth.mechanism ?? auth.metadata?.mechanism ?? inferred
+  if (!inferred || mechanism !== inferred) throw chatError(401, UNRECOGNIZED + " matching the saved sign-in mechanism")
+  return { type: "api", key, mechanism }
+}
+function signIn(mechanism, label) {
+  return {
+    type: "oauth", label,
+    prompts: [{ type: "text", key: "key", message: UNRECOGNIZED }],
+    async authorize(inputs = {}) {
+      return { url: "", method: "auto", instructions: label, callback: async () => {
+        try {
+          const credential = credentialOf({ type: "api", key: inputs.key, mechanism })
+          if (!credential) throw new Error(UNRECOGNIZED)
+          return { type: "success", access: credential.key, refresh: "", expires: 0, mechanism, metadata: { mechanism } }
+        } catch (error) { return { type: "failed", error: error.message } }
+      } }
+    },
+  }
+}
 
 export function makeDevinDriver(options = {}) {
   const base = (options.apiBase?.[ID] ?? "https://api.devin.ai").replace(/\/$/, "")
@@ -84,22 +110,47 @@ export function makeDevinDriver(options = {}) {
 }
 
 export function makeDevinCloud(options = {}) {
+  let codeium
+  const codeiumChat = async () => codeium ??= (await import("./devin-cloud-codeium.mjs")).makeCodeiumChat(options)
   return {
     auth: {
       provider: ID,
       maxConcurrency: 4,
       async loader(getAuth) {
-        if (!credentialOf(await getAuth())) return {}
-        return { baseURL: BASE, fetch: emulate(makeDevinDriver(options), async () => credentialOf(await getAuth()), options) }
+        const saved = await getAuth()
+        const key = storedKey(saved)
+        if (typeof key !== "string" || !key.trim()) return {}
+        const platform = emulate(makeDevinDriver(options), async () => {
+          const current = credentialOf(await getAuth())
+          return current?.mechanism === "devin" ? current : null
+        }, options)
+        return { baseURL: BASE, async fetch(input, init = {}) {
+          try {
+            const current = credentialOf(await getAuth())
+            if (current?.mechanism === "codeium") return (await codeiumChat()).complete(current, input, init)
+            return platform(input, init)
+          } catch (error) { return errorResponse(error, { id: ID }) }
+        } }
       },
-      methods: [{ type: "api", label: "Devin API key", placeholder: "apk_user_… (app.devin.ai → Settings → API)" }],
+      methods: [
+        signIn("devin", "Devin platform API key (apk_…) — api.devin.ai sessions"),
+        signIn("codeium", "Codeium / Cognition credential (cog_…) — Codeium Connect chat"),
+      ],
     },
     async config(config) {
       config.provider ??= {}
       const was = config.provider[ID] ?? {}
       config.provider[ID] = { name: NAME, npm: "@ai-sdk/openai-compatible", api: BASE, ...was, models: { ...MODELS, ...(was.models ?? {}) } }
     },
-    provider: { id: ID, async models(provider) { return provider.models } },
+    provider: { id: ID, async models(provider, { auth } = {}) {
+      try {
+        if (credentialOf(auth)?.mechanism === "codeium") {
+          const { "devin-session": session, ...custom } = provider.models ?? {}
+          return { ...(await codeiumChat()).models(), ...custom }
+        }
+      } catch {}
+      return provider.models
+    } },
     async "chat.headers"(input, output) {
       if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
       const session = sessionOf(input)

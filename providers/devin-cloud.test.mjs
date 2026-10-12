@@ -8,7 +8,8 @@ import { startFakeCloud } from "../scripts/fake-cloud.mjs"
 
 const servers = []
 afterEach(() => { for (const server of servers.splice(0)) server.stop() })
-const auth = () => ({ type: "api", key: "SYNTHETIC" })
+const auth = () => ({ type: "api", key: "apk_user_synthetic" })
+const codeiumAuth = () => ({ type: "api", key: "cog_" + "a".repeat(52) })
 const messages = [{ role: "user", content: "Explain the change" }]
 async function setup(scenario, options = {}) {
   const server = startFakeCloud({ scenario }); servers.push(server)
@@ -21,6 +22,40 @@ const request = (loader, body = {}, init = {}) => loader.fetch(loader.baseURL + 
 
 const run = { ref: "synthetic", url: "http://127.0.0.1/session/synthetic" }
 const polling = payload => ({ request }) => request.method === "GET" ? Response.json(payload) : undefined
+
+// a fake Connect endpoint: records method, path, headers and raw body, and
+// answers GetChatMessage with one text frame and the stream's end.
+function startFakeCodeium({ scenario } = {}) {
+  const requests = []
+  const enc = new TextEncoder()
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    async fetch(request) {
+      const url = new URL(request.url)
+      const headers = {}
+      for (const name of ["authorization", "content-type", "connect-protocol-version"]) headers[name] = request.headers.get(name)
+      const body = new Uint8Array(await request.arrayBuffer())
+      requests.push({ method: request.method, path: url.pathname, headers, body })
+      if (scenario) {
+        const response = await scenario({ request, url, headers, body })
+        if (response) return response
+      }
+      if (request.method === "POST" && url.pathname === "/exa.api_server_pb.ApiServerService/GetChatMessage") {
+        const text = enc.encode("Synthetic Codeium answer")
+        const msg = new Uint8Array(2 + text.length) // field 3, wire 2, the reply text
+        msg[0] = 0x1a; msg[1] = text.length; msg.set(text, 2)
+        const end = enc.encode("{}")
+        const out = new Uint8Array(10 + msg.length + end.length)
+        const view = new DataView(out.buffer)
+        out[0] = 0; view.setUint32(1, msg.length); out.set(msg, 5)
+        out[5 + msg.length] = 2; view.setUint32(6 + msg.length, end.length); out.set(end, 10 + msg.length)
+        return new Response(out, { headers: { "Content-Type": "application/connect+proto" } })
+      }
+      return new Response("unknown synthetic route", { status: 404 })
+    },
+  })
+  return { url: server.url.origin, requests, stop: () => server.stop(true) }
+}
 const fastTimers = {
   now: () => Date.now(), random: () => 0.5,
   setTimeout: (callback, delay) => setTimeout(callback, delay < 15000 ? 0 : delay),
@@ -30,7 +65,7 @@ const fastTimers = {
 test.each([undefined, 0, 12])("create fields and optional ACU ceiling %s", async maxAcuLimit => {
   let authorized = false, privateHeader = false
   const { loader, server } = await setup(({ request }) => {
-    authorized = request.headers.get("authorization") === "Bearer SYNTHETIC"
+    authorized = request.headers.get("authorization") === "Bearer apk_user_synthetic"
     privateHeader ||= request.headers.has(SESSION_HEADER)
   }, { devinCloud: { maxAcuLimit } })
   const promptMessages = [{ role: "user", content: "x".repeat(100) }]
@@ -129,8 +164,13 @@ test("static model, auth methods, config preservation and scoped session header"
   expect(config.provider["devin-cloud"].models["devin-session"]).toEqual({ name: "Devin session", tool_call: false, reasoning: false })
   expect(config.provider["devin-cloud"].name).toBe("Custom")
   expect(await plugin.provider.models(config.provider["devin-cloud"])).toEqual(config.provider["devin-cloud"].models)
-  expect(plugin.auth.methods[0].type).toBe("api")
-  expect(plugin.auth.methods[0].authorize).toBeUndefined()
+  expect(plugin.auth.methods).toHaveLength(2)
+  expect(plugin.auth.methods.every(method => method.type === "oauth" && typeof method.authorize === "function")).toBe(true)
+  expect(new Set(plugin.auth.methods.map(method => method.label)).size).toBe(2)
+  expect(plugin.auth.methods[0].label).toContain("apk_")
+  expect(plugin.auth.methods[0].label).toContain("api.devin.ai")
+  expect(plugin.auth.methods[1].label).toContain("cog_")
+  expect(plugin.auth.methods[1].label).toContain("Codeium")
   expect(plugin.auth.maxConcurrency).toBe(4)
   expect(driver.cancel).toBeUndefined()
   expect(driver.stream).toBeUndefined()
@@ -258,4 +298,221 @@ test("fake vendor create and poll produce a chat answer", async () => {
   expect(response.status).toBe(200)
   expect((await response.json()).choices[0].message.content).toBe("Synthetic Devin answer")
   expect(server.requests.map(row => [row.method, row.path])).toEqual([["POST", "/devin/v1/sessions"], ["GET", "/devin/v1/sessions/devin-1"]])
+})
+
+test("an apk_ credential keeps going to api.devin.ai with Bearer", async () => {
+  let bearer = ""
+  const { loader, server } = await setup(({ request }) => { bearer = request.headers.get("authorization") })
+  const response = await request(loader)
+  expect(response.status).toBe(200)
+  expect(bearer).toBe("Bearer apk_user_synthetic")
+  expect(server.requests[0].path).toBe("/devin/v1/sessions")
+})
+
+test("a cog_ credential goes to the Codeium Connect endpoint with Basic auth and connect+proto", async () => {
+  const codeiumServer = startFakeCodeium(); servers.push(codeiumServer)
+  const plugin = makeDevinCloud({ apiBase: { "devin-cloud-codeium": codeiumServer.url } })
+  const loader = await plugin.auth.loader(codeiumAuth)
+  const response = await loader.fetch(loader.baseURL + "/chat/completions", { body: JSON.stringify({ model: "swe-2", messages }) })
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toBe("Synthetic Codeium answer")
+  const row = codeiumServer.requests[0]
+  expect(row.path).toBe("/exa.api_server_pb.ApiServerService/GetChatMessage")
+  expect(row.headers.authorization).toBe(`Basic cog_${"a".repeat(52)}`)
+  expect(row.headers["content-type"]).toBe("application/connect+proto")
+  expect(row.headers["connect-protocol-version"]).toBe("1")
+  expect(new TextDecoder().decode(row.body)).toContain("swe-2-high")
+})
+
+test("the loader dispatches on the stored mechanism, so each credential reaches only its own endpoint", async () => {
+  const devinServer = startFakeCloud({}); servers.push(devinServer)
+  const codeiumServer = startFakeCodeium(); servers.push(codeiumServer)
+  const plugin = makeDevinCloud({ apiBase: { "devin-cloud": devinServer.url + "/devin", "devin-cloud-codeium": codeiumServer.url } })
+  let current = auth()
+  const loader = await plugin.auth.loader(() => current)
+  expect((await request(loader)).status).toBe(200)
+  current = codeiumAuth()
+  const codeiumLoader = await plugin.auth.loader(() => current)
+  expect((await codeiumLoader.fetch(codeiumLoader.baseURL + "/chat/completions", { body: JSON.stringify({ model: "swe-2", messages }) })).status).toBe(200)
+  expect(devinServer.requests.map(row => [row.method, row.path])).toEqual([["POST", "/devin/v1/sessions"], ["GET", "/devin/v1/sessions/devin-1"]])
+  expect(codeiumServer.requests).toHaveLength(1)
+  expect(codeiumServer.requests[0].headers.authorization).toContain("Basic cog_")
+  expect(codeiumServer.requests[0].headers["content-type"]).toBe("application/connect+proto")
+})
+
+test("an unrecognized credential shape fails naming both accepted forms without a vendor call", async () => {
+  const { plugin, server } = await setup()
+  const loader = await plugin.auth.loader(() => ({ type: "api", key: "sk-neither-shape" }))
+  const response = await loader.fetch(loader.baseURL + "/chat/completions", { body: JSON.stringify({ model: "devin-session", messages }) })
+  expect(response.status).toBe(401)
+  expect(response.headers.get("X-Magpie-Sign-In")).toBe("expired")
+  const message = (await response.json()).error.message
+  expect(message).toContain("apk_")
+  expect(message).toContain("cog_")
+  expect(server.requests).toHaveLength(0)
+})
+
+test("a devin-path account whose key becomes cog_ returns 401 expired before any vendor call", async () => {
+  const { plugin, server } = await setup()
+  let current = auth()
+  const loader = await plugin.auth.loader(() => current)
+  current = { ...codeiumAuth(), mechanism: "devin" }
+  const response = await request(loader)
+  expect(response.status).toBe(401)
+  expect(response.headers.get("X-Magpie-Sign-In")).toBe("expired")
+  expect(server.requests).toHaveLength(0)
+})
+
+test("a Codeium account is offered the Connect model list, an apk_ account the session floor", async () => {
+  const { plugin } = await setup()
+  const config = { provider: { "devin-cloud": { models: {} } } }
+  await plugin.config(config)
+  const floor = await plugin.provider.models(config.provider["devin-cloud"])
+  expect(Object.keys(floor)).toEqual(["devin-session"])
+  const codeium = await plugin.provider.models(config.provider["devin-cloud"], { auth: codeiumAuth() })
+  expect(Object.keys(codeium)).toContain("swe-2")
+  expect(codeium["swe-2"].tool_call).toBe(false)
+  expect(codeium["devin-session"]).toBeUndefined()
+})
+
+
+test.each([[0, "devin", "apk_user_synthetic"], [1, "codeium", "cog_synthetic"]])("sign-in %s persists its mechanism", async (index, mechanism, key) => {
+  const method = makeDevinCloud().auth.methods[index]
+  expect(await (await method.authorize({ key })).callback()).toEqual({ type: "success", access: key, refresh: "", expires: 0, mechanism, metadata: { mechanism } })
+  const invalid = await (await method.authorize({ key: "unrecognized" })).callback()
+  expect(invalid.type).toBe("failed")
+  expect(invalid.error).toContain("cog_")
+  expect(invalid.error).toContain("apk_")
+  expect((await (await method.authorize({ key: index ? "apk_other" : "cog_other" })).callback()).type).toBe("failed")
+})
+
+test("Codeium streams text before the vendor finishes and maps the existing model", async () => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const textFrame = text => {
+    const bytes = new TextEncoder().encode(text), result = new Uint8Array(7 + bytes.length)
+    new DataView(result.buffer).setUint32(1, bytes.length + 2)
+    result[5] = 26; result[6] = bytes.length; result.set(bytes, 7)
+    return result
+  }
+  const server = startFakeCodeium({ scenario: ({ body }) => {
+    expect(new TextDecoder().decode(body)).toContain("swe-2-high")
+    return new Response(new ReadableStream({ async start(stream) {
+      stream.enqueue(textFrame("First")); await gate
+      stream.enqueue(textFrame(" second"))
+      stream.enqueue(Uint8Array.from([2, 0, 0, 0, 2, 123, 125])); stream.close()
+    } }))
+  } }); servers.push(server)
+  const loader = await makeDevinCloud({ apiBase: { "devin-cloud-codeium": server.url } }).auth.loader(codeiumAuth)
+  try {
+    const reader = (await request(loader, { stream: true })).body.getReader()
+    let first = ""
+    while (!first.includes("First")) first += new TextDecoder().decode((await reader.read()).value)
+    expect(first).not.toContain("[DONE]")
+    release()
+    let rest = ""
+    for (;;) { const part = await reader.read(); if (part.done) break; rest += new TextDecoder().decode(part.value) }
+    expect(rest).toContain(" second"); expect(rest).toContain("[DONE]")
+  } finally { release() }
+})
+
+test.each([["unauthenticated", 401], ["invalid_argument", 400], ["resource_exhausted", 429]])("Connect trailer %s maps to HTTP %s", async (code, status) => {
+  const server = startFakeCodeium({ scenario: () => {
+    const payload = new TextEncoder().encode(JSON.stringify({ error: { code, message: "vendor failure" } }))
+    const frame = new Uint8Array(payload.length + 5)
+    frame[0] = 2; new DataView(frame.buffer).setUint32(1, payload.length); frame.set(payload, 5)
+    return new Response(frame)
+  } }); servers.push(server)
+  const loader = await makeDevinCloud({ apiBase: { "devin-cloud-codeium": server.url } }).auth.loader(codeiumAuth)
+  const response = await request(loader)
+  expect(response.status).toBe(status)
+  expect((await response.json()).error.message).toContain("vendor failure")
+})
+
+
+test("default endpoints isolate stored mechanisms and retain their authorization schemes", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), headers: init.headers })
+    if (String(url).startsWith("https://server.codeium.com/")) return new Response(Uint8Array.from([0, 0, 0, 0, 4, 26, 2, 79, 75, 2, 0, 0, 0, 2, 123, 125]))
+    return Response.json(init.method === "POST" ? { session_id: "default-endpoint" } : { status_enum: "finished", messages: [{ type: "agent_message", message: "OK" }] })
+  }
+  try {
+    const plugin = makeDevinCloud()
+    for (const [key, mechanism] of [["cog_synthetic", "codeium"], ["apk_synthetic", "devin"]]) {
+      const loader = await plugin.auth.loader(() => ({ type: "api", key, metadata: { mechanism } }))
+      expect((await request(loader)).status).toBe(200)
+    }
+    expect(calls.map(call => call.url)).toEqual([
+      "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage",
+      "https://api.devin.ai/v1/sessions", "https://api.devin.ai/v1/sessions/default-endpoint",
+    ])
+    expect(calls[0].headers.Authorization).toBe("Basic cog_synthetic")
+    expect(calls[0].headers["Content-Type"]).toBe("application/connect+proto")
+    expect(calls[1].headers.Authorization).toBe("Bearer apk_synthetic")
+    for (const [key, mechanism] of [["cog_synthetic", "devin"], ["apk_synthetic", "codeium"]]) {
+      const loader = await plugin.auth.loader(() => ({ type: "api", key, metadata: { mechanism } }))
+      expect((await request(loader)).status).toBe(401)
+    }
+    expect(calls).toHaveLength(3)
+  } finally { globalThis.fetch = originalFetch }
+})
+
+
+test.each([0, 1])("successful sign-in %s round trips through stored OAuth into a working loader", async index => {
+  const platform = startFakeCloud(); servers.push(platform)
+  const connect = startFakeCodeium(); servers.push(connect)
+  const plugin = makeDevinCloud({ apiBase: { "devin-cloud": platform.url + "/devin", "devin-cloud-codeium": connect.url } })
+  const method = plugin.auth.methods[index]
+  const outcome = await (await method.authorize({ key: index ? "cog_synthetic" : "apk_synthetic" })).callback()
+  expect(outcome.type).toBe("success")
+  const stored = JSON.parse(JSON.stringify({ ...outcome, type: method.type }))
+  const loader = await plugin.auth.loader(() => stored)
+  expect(typeof loader.fetch).toBe("function")
+  const response = await request(loader)
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toBe(index ? "Synthetic Codeium answer" : "Synthetic Devin answer")
+  expect(index ? platform.requests.length : connect.requests.length).toBe(0)
+})
+
+test.each(["sk_foreign", "devin-session-token$legacy"])("models preserve the floor for unknown credential %s", async key => {
+  const plugin = makeDevinCloud(), provider = { models: { "devin-session": { name: "Custom" } } }
+  expect(await plugin.provider.models(provider, { auth: { type: "api", key } })).toBe(provider.models)
+})
+
+test("legacy credentials are identified and refused before network access", async () => {
+  const { plugin, server } = await setup()
+  const loader = await plugin.auth.loader(() => ({ type: "api", key: "devin-session-token$legacy" }))
+  const response = await request(loader)
+  expect(response.status).toBe(401)
+  const message = (await response.json()).error.message
+  for (const prefix of ["cog_", "apk_", "devin-session-token$"]) expect(message).toContain(prefix)
+  expect(server.requests).toHaveLength(0)
+})
+
+test.each([false, true])("Codeium deadline after first text is 504 with stream=%s", async stream => {
+  const originalTimeout = AbortSignal.timeout, originalFetch = globalThis.fetch
+  const deadline = new AbortController()
+  AbortSignal.timeout = () => deadline.signal
+  globalThis.fetch = async (url, { signal }) => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(Uint8Array.from([0, 0, 0, 0, 4, 26, 2, 79, 75]))
+    signal.addEventListener("abort", () => controller.error(signal.reason), { once: true })
+  } }))
+  try {
+    const loader = await makeDevinCloud().auth.loader(codeiumAuth)
+    const pending = request(loader, { stream })
+    if (stream) {
+      const response = await pending
+      deadline.abort(new DOMException("The operation timed out.", "TimeoutError"))
+      const events = (await response.text()).split("\n\n").filter(value => value.startsWith("data: {")).map(value => JSON.parse(value.slice(6)))
+      expect(events.find(event => event.error)?.error).toMatchObject({ code: 504, message: "Codeium request timed out" })
+    } else {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      deadline.abort(new DOMException("The operation timed out.", "TimeoutError"))
+      const response = await pending
+      expect(response.status).toBe(504)
+      expect((await response.json()).error.message).toBe("Codeium request timed out")
+    }
+  } finally { AbortSignal.timeout = originalTimeout; globalThis.fetch = originalFetch }
 })
