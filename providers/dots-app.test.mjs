@@ -1,0 +1,304 @@
+import { expect, test } from "bun:test"
+import { makeDotsDriver } from "./dots.mjs"
+import { createDotsApp, findChatGptApp, connectCdp, DOTS_APP_ERRORS } from "./dots-app.mjs"
+
+const marker = { type: "oauth", access: "app-local", refresh: "dots-app-cdp", accountId: "dots-app", mechanism: "app-drive" }
+const messages = DOTS_APP_ERRORS
+const DOTS_ROUTE = "app://-/index.html?initialRoute=%2Fdots"
+
+async function expectFailure(operation, key, status = 502, signIn = "kept") {
+  let error
+  try { await operation() } catch (caught) { error = caught }
+  expect(error?.message).toBe(messages[key])
+  const response = (await import("../lib/errors.mjs")).errorResponse(error)
+  expect(response.status).toBe(status)
+  expect(response.headers.get("X-Magpie-Sign-In")).toBe(signIn)
+}
+
+function fixture(settings = {}) {
+  const frames = [], spawns = [], timers = new Map()
+  let timestamp = 0, nextTimer = 0, kills = 0, clients = []
+  const state = { sidebar: true, route: DOTS_ROUTE, composer: true, sendButton: true, rows: [], replies: [], ...settings }
+  const auto = new Set([200, 250])
+  const timerApi = {
+    now: () => timestamp,
+    setTimeout(callback, delay) {
+      const timer = { id: ++nextTimer, unref() {} }
+      if (auto.has(delay)) { timestamp += delay; queueMicrotask(callback) }
+      else timers.set(timer, { callback, delay })
+      return timer
+    },
+    clearTimeout(timer) { timers.delete(timer) }, random: () => 0.5,
+  }
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0,
+    fetch(request, server) { if (server.upgrade(request, { data: { path: new URL(request.url).pathname } })) return; return new Response(null, { status: 404 }) },
+    websocket: {
+      open(socket) { clients.push(socket) },
+      message(socket, data) {
+        const frame = JSON.parse(String(data)); frames.push({ path: socket.data?.path, ...frame })
+        const expression = frame.params?.expression ?? ""
+        const shell = (socket.data?.path ?? "").endsWith("/shell")
+        let value
+        let error
+        if (expression.includes("新聊天")) value = state.sidebar && shell
+        else if (expression.includes("location.assign")) { state.route = DOTS_ROUTE; state.composer = true }
+        else if (expression.includes("location.href")) value = { href: state.route, composer: state.composer }
+        else if (expression.includes("message-row")) value = state.rows
+        else if (expression.includes("发送")) {
+          if (!state.sendButton || !shell) value = false
+          else {
+            value = true
+            if (state.onSubmit) state.onSubmit(state)
+            else {
+              state.rows.push({ id: `user-${state.rows.length}`, self: true, text: "" })
+              if (state.replies.length) state.rows.push({ id: `assistant-${state.rows.length}`, self: false, text: state.replies.shift() })
+            }
+          }
+        }
+        else if (expression.includes("composer.focus()") || expression.includes("ProseMirror")) value = state.composer
+        socket.send(JSON.stringify(error ? { id: frame.id, result: { exceptionDetails: { exception: { description: error } } } } : { id: frame.id, result: frame.method === "Runtime.evaluate" ? { result: { value } } : {} }))
+      },
+    },
+  })
+  const dependencies = {
+    env: {}, exists: async () => !state.missing, appx: async () => ["C:\\Packages\\OpenAI.Codex"],
+    processes: async () => state.previous ? [{
+      pid: 42, port: state.reattach ? server.port : undefined,
+      ...(state.adoptable ? { executable: "C:\\Packages\\OpenAI.Codex\\ChatGPT.exe", created: "start", managedTag: "999999:12345678-1234-4234-8234-123456789abc" } : {}),
+    }] : [],
+    freePort: async () => server.port,
+    spawn(exe, argv, options) { const child = { exitCode: state.exited ? 0 : null, kill() { kills++ }, once() {} }; spawns.push({ exe, argv, options }); return child },
+    fetch: async url => {
+      if (state.unreachable) throw new Error("unreachable")
+      if (String(url).endsWith("/json/version")) return Response.json({ Browser: "Chrome/148.0" })
+      const ws = `ws://127.0.0.1:${server.port}/devtools/page/`
+      return Response.json([
+        ...(state.decoys ? [
+          { type: "page", url: "app://-/index.html", webSocketDebuggerUrl: ws + "avatar-overlay" },
+          { type: "page", url: "app://-/detached-window.html", webSocketDebuggerUrl: ws + "detached" },
+        ] : []),
+        { type: "page", url: "app://-/index.html", webSocketDebuggerUrl: ws + "shell" },
+      ])
+    },
+    timers: state.realTimers ? { now: Date.now, setTimeout, clearTimeout } : timerApi,
+  }
+  const driver = createDotsApp({ keepAliveMinutes: 0.01, launchTimeoutMs: 1200, stableMs: 0, ...(settings.driverOptions ?? {}) }, dependencies)
+  return { state, frames, spawns, dependencies, driver, endpoint: `ws://127.0.0.1:${server.port}/devtools/page/shell`,
+    get kills() { return kills },
+    expireIdle() { for (const [timer, job] of [...timers]) if (job.delay === 600) { timers.delete(timer); job.callback() } },
+    close() { driver.dispose(); server.stop(true) },
+  }
+}
+const send = fixture => fixture.driver.create(marker, { prompt: "hello" })
+
+test("discovery resolves the MSIX install location and refuses a missing install", async () => {
+  const found = await findChatGptApp({ appx: async () => ["C:\\Packages\\OpenAI.Codex"], exists: async path => path === "C:\\Packages\\OpenAI.Codex\\ChatGPT.exe" })
+  expect(found).toBe("C:\\Packages\\OpenAI.Codex\\ChatGPT.exe")
+  await expect(findChatGptApp({ appx: async () => [], exists: async () => false })).rejects.toThrow(messages.missing)
+})
+
+test("CDP client rejects remote websocket endpoints", async () => { await expect(connectCdp("ws://example.invalid:9333/devtools/page/1")).rejects.toThrow(messages.debug) })
+
+test("launch binds debug argv to loopback, clears and types into the Dot surface, then clicks send", async () => {
+  const fake = fixture({ replies: ["收到"] })
+  try {
+    const run = await send(fake)
+    expect(fake.spawns[0].argv.slice(0, 2)).toEqual([`--remote-debugging-port=${new URL(fake.endpoint).port}`, "--remote-debugging-address=127.0.0.1"])
+    expect(fake.spawns[0].argv[2]).toMatch(/^--magpie-dots-managed=\d+:[0-9a-f-]{36}$/)
+    const inserted = fake.frames.filter(frame => frame.method === "Input.insertText")
+    expect(inserted).toHaveLength(1)
+    expect(inserted[0].params.text).toBe(run.prompt)
+    expect(fake.frames.filter(frame => frame.method === "Input.dispatchKeyEvent").map(frame => frame.params.windowsVirtualKeyCode)).toEqual([65, 65, 8, 8])
+    expect(fake.frames.filter(frame => frame.params.expression?.includes("发送"))).toHaveLength(1)
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "收到" })
+  } finally { fake.close() }
+})
+
+test("navigates to the Dot surface when the shell is on another route", async () => {
+  const fake = fixture({ route: "app://-/index.html", composer: false })
+  try {
+    await send(fake)
+    expect(fake.frames.some(frame => frame.params.expression?.includes("location.assign"))).toBe(true)
+    expect(fake.state.route).toBe(DOTS_ROUTE)
+  } finally { fake.close() }
+})
+
+test("attach skips the avatar-overlay and detached-window pages and only drives the shell", async () => {
+  const fake = fixture({ decoys: true, replies: ["answer"] })
+  try {
+    await send(fake)
+    const driven = fake.frames.filter(frame => frame.params.expression?.includes("composer.focus()") || frame.params.expression?.includes("发送"))
+    expect(driven.length).toBeGreaterThan(0)
+    expect(driven.every(frame => frame.path.endsWith("/shell"))).toBe(true)
+  } finally { fake.close() }
+})
+
+test("stale assistant rows from a previous conversation are never reported as the answer", async () => {
+  const fake = fixture({ rows: [{ id: "old", self: false, text: "old answer" }] })
+  try {
+    const run = await send(fake)
+    const first = await fake.driver.poll(marker, run)
+    expect(first.state).toBe("running")
+    expect(first.partial).toBeUndefined()
+    fake.state.rows.push({ id: "new", self: false, text: "fresh answer" })
+    const second = await fake.driver.poll(marker, run)
+    expect(second).toEqual({ state: "running", progress: expect.any(String), partial: "fresh answer" })
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "fresh answer" })
+  } finally { fake.close() }
+})
+
+test("progressive reply text surfaces as cumulative content before the run completes", async () => {
+  const fake = fixture({ realTimers: true, driverOptions: { keepAliveMinutes: 60, stableMs: 300, streamIntervalMs: 20 }, replies: [] })
+  try {
+    const run = await send(fake)
+    const events = []
+    const pending = fake.driver.stream(marker, run, event => events.push(event))
+    await Bun.sleep(60)
+    fake.state.rows.push({ id: "assistant", self: false, text: "收到" })
+    await Bun.sleep(120)
+    expect(events.some(event => event?.content === "收到")).toBe(true)
+    expect(events.some(event => event?.content === "收到，这是完整回答")).toBe(false)
+    fake.state.rows.at(-1).text = "收到，这是完整回答"
+    const outcome = await pending
+    expect(outcome).toEqual({ state: "succeeded", text: "收到，这是完整回答" })
+    expect(events.some(event => event?.content === "收到，这是完整回答")).toBe(true)
+  } finally { fake.close() }
+})
+
+test("conversation reset after the turn was seen fails instead of hanging", async () => {
+  const fake = fixture()
+  try {
+    const run = await send(fake)
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    fake.state.rows = []
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "failed", progress: messages.reset })
+  } finally { fake.close() }
+})
+
+test("second concurrent turn on the same Dot is refused, not interleaved", async () => {
+  const fake = fixture()
+  try {
+    const results = await Promise.allSettled([send(fake), send(fake)])
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1)
+    expect(results.find(result => result.status === "rejected").reason.status).toBe(409)
+    expect(fake.frames.filter(frame => frame.params.expression?.includes("发送"))).toHaveLength(1)
+  } finally { fake.close() }
+})
+
+test("cancel frees the turn slot", async () => {
+  const fake = fixture({ replies: ["first", "second"] })
+  try {
+    const run = await send(fake)
+    await fake.driver.cancel(marker, run)
+    const next = await send(fake)
+    expect(next.prompt).toBe("hello")
+    const keys = fake.frames.filter(frame => frame.method === "Input.insertText").map(frame => frame.params.text)
+    expect(keys).toEqual(["hello", "hello"])
+  } finally { fake.close() }
+})
+
+test("followUp sends the suffix as a new turn with an incremented index", async () => {
+  const fake = fixture({ replies: ["first", "second"] })
+  try {
+    const run = await send(fake)
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "first" })
+    const next = await fake.driver.followUp(marker, run, ["again"])
+    expect(next.turnIndex).toBe(run.turnIndex + 1)
+    expect(fake.frames.filter(frame => frame.method === "Input.insertText").at(-1).params.text).toBe("again")
+    expect((await fake.driver.poll(marker, next)).state).toBe("running")
+    expect(await fake.driver.poll(marker, next)).toEqual({ state: "succeeded", text: "second" })
+  } finally { fake.close() }
+})
+
+test("liveModels reports the Dot from the app shell", async () => {
+  const fake = fixture()
+  try { expect(await fake.driver.liveModels(marker)).toEqual({ dot: { name: "ChatGPT Dot", tool_call: false } }) }
+  finally { fake.close() }
+})
+
+test("sign-in with the app closed launches a managed instance and succeeds", async () => {
+  const fake = fixture()
+  try {
+    expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" })
+    expect(fake.spawns).toHaveLength(1)
+  } finally { fake.close() }
+  expect(fake.kills).toBe(1)
+})
+
+test("sign-in with a running app that cannot be attached fails with the actionable running error", async () => {
+  const fake = fixture({ previous: true, unreachable: true })
+  try { expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "failed", error: messages.running }) }
+  finally { fake.close() }
+})
+
+test("sign-in when the app never opens a debug interface fails and never silently succeeds", async () => {
+  const fake = fixture({ unreachable: true })
+  try {
+    const result = await (await fake.driver.authorize()).callback()
+    expect(result).toEqual({ type: "failed", error: messages.debug })
+    expect(fake.spawns.length).toBeGreaterThan(0)
+  } finally { fake.close() }
+})
+
+test("sign-in without an installation fails with the missing error and never launches", async () => {
+  const fake = fixture({ missing: true })
+  try {
+    expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "failed", error: messages.missing })
+    expect(fake.spawns).toHaveLength(0)
+  } finally { fake.close() }
+})
+
+test("reattaching to a running app with a debug port never launches or kills it", async () => {
+  const fake = fixture({ previous: true, reattach: true })
+  try {
+    expect((await (await fake.driver.authorize()).callback()).type).toBe("success")
+    expect(fake.spawns).toHaveLength(0)
+    fake.expireIdle()
+  } finally { fake.close() }
+  expect(fake.kills).toBe(0)
+})
+
+test("idle teardown stops only the owned app and never while a turn is active", async () => {
+  const fake = fixture({ replies: ["answer"] })
+  try {
+    const run = await send(fake)
+    fake.expireIdle()
+    expect(fake.kills).toBe(0)
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    fake.expireIdle()
+    expect(fake.kills).toBe(0)
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "answer" })
+    fake.expireIdle()
+    expect(fake.kills).toBe(1)
+  } finally { fake.close() }
+})
+
+test("orphan managed instance is adopted and identity revalidated before stop", async () => {
+  const fake = fixture()
+  let stopped = 0
+  const driver = createDotsApp({ keepAliveMinutes: 0.01 }, { ...fake.dependencies, processes: async () => [{ pid: 42, port: Number(new URL(fake.endpoint).port), executable: "C:\\Packages\\OpenAI.Codex\\ChatGPT.exe", created: "start", managedTag: "999999:12345678-1234-4234-8234-123456789abc" }], parentAlive: () => false, stopManaged: async () => { stopped++ } })
+  try { await driver.liveModels(marker); driver.dispose(); await Bun.sleep(10); expect(stopped).toBe(1) } finally { driver.dispose(); fake.close() }
+})
+
+test("factory exposes two methods, app-drive live models, and the loader dispatches on the stored mechanism", async () => {
+  const fake = fixture({ replies: ["app answer"] })
+  const plugin = makeDotsDriver({}, { dotsApp: { stableMs: 0 } }, { app: fake.dependencies })
+  try {
+    expect(plugin.auth.methods).toHaveLength(2)
+    expect(plugin.auth.methods[0].label).toContain("ChatGPT")
+    expect(plugin.auth.methods[1].label).toContain("tunnel")
+    const result = await (await plugin.auth.methods[0].authorize()).callback()
+    expect(result).toEqual({ type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" })
+    const loader = await plugin.auth.loader(async () => marker)
+    const response = await loader.fetch("https://dots.cloud-agents.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify({ model: "dot", messages: [{ role: "user", content: "hi" }] }) })
+    expect(response.status).toBe(200)
+    expect((await response.json()).choices[0].message.content).toBe("app answer")
+    fake.expireIdle()
+    const models = await plugin.provider.models({ models: { dot: { name: "floor" } } }, { auth: marker })
+    expect(models.dot.name).toBe("ChatGPT Dot")
+    const tunnelLoader = await plugin.auth.loader(async () => ({ type: "oauth", access: "dots-local", refresh: "dots-tunnel", accountId: "dot", dot_token: "x".repeat(32) }))
+    await expect(tunnelLoader.fetch("https://dots.cloud-agents.invalid/v1/chat/completions", { method: "POST", body: "{}" })).resolves.toHaveProperty("status")
+  } finally { await plugin._internal.close(); fake.close() }
+})

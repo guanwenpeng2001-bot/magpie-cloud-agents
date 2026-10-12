@@ -339,6 +339,22 @@ test("Dots factory exposes a driver with create/poll and intentionally no follow
   expect(plugin._internal.driver.followUp).toBeUndefined()
 })
 
+test("app-drive sign-in is offered first, fails closed without the app, and the tunnel stays second", async () => {
+  const { makeDotsDriver } = await import("./dots.mjs")
+  const plugin = makeDotsDriver({}, {}, { app: { env: {}, exists: async () => false, appx: async () => [], processes: async () => [], spawn: () => { throw new Error("must not launch") } } })
+  try {
+    expect(plugin.auth.methods).toHaveLength(2)
+    expect(plugin.auth.methods[0].label).toContain("ChatGPT")
+    expect(plugin.auth.methods[0].label).toContain("zero setup")
+    expect(plugin.auth.methods[1].label).toContain("tunnel")
+    const flow = await plugin.auth.methods[0].authorize()
+    expect(flow.method).toBe("auto")
+    const result = await flow.callback()
+    expect(result.type).toBe("failed")
+    expect(result.error).toBe("ChatGPT desktop isn't installed — install the OpenAI ChatGPT app from the Microsoft Store and sign in once, then retry")
+  } finally { await plugin._internal.close() }
+})
+
 async function withProvider(run, { options = {}, handshake = true, ...overrides } = {}) {
   const { makeDotsDriver } = await import("./dots.mjs")
   let time = 0, server, token, callbackStatus = 200
@@ -351,7 +367,8 @@ async function withProvider(run, { options = {}, handshake = true, ...overrides 
   })
   const call = async (method, params = {}) => (await fetch(server.url, { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) })).json()
   try {
-    const flow = await plugin.auth.methods[0].authorize()
+    const tunnelMethod = plugin.auth.methods.find(method => method.label.includes("tunnel"))
+    const flow = await tunnelMethod.authorize()
     if (handshake && server) {
       await call("initialize", { protocolVersion: "2026-07-28" })
       await call("events/subscribe", { name: "task.available", arguments: { queue: "dot" }, delivery: { mode: "webhook", url: "https://callback.invalid/events", secret: mcpModule.mintSigningSecret() } })
@@ -381,7 +398,8 @@ test("sign-in failure branch returns no url and keeps method auto", async () => 
   const { makeDotsDriver } = await import("./dots.mjs")
   const plugin = makeDotsDriver({}, {}, { startMcp: () => ({ url: "http://127.0.0.1:9/mcp", close: async () => {} }), createTunnel: () => { throw new Error("synthetic tunnel failure") } })
   try {
-    const flow = await plugin.auth.methods[0].authorize()
+    const tunnelMethod = plugin.auth.methods.find(method => method.label.includes("tunnel"))
+    const flow = await tunnelMethod.authorize()
     expect(flow.url).toBe("")
     expect(flow.method).toBe("auto")
     expect(flow.instructions).toBe("synthetic tunnel failure")
