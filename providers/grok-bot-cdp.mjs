@@ -3,14 +3,15 @@ import { access } from "node:fs/promises"
 import { spawn, execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { win32 } from "node:path"
+import { tmpdir } from "node:os"
 import { createServer } from "node:net"
 import { chatError } from "../lib/errors.mjs"
 import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
 
 export const CDP_ERRORS = {
   missing: "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry",
-  signedOut: "Grok Bot desktop isn't signed in — open it and sign in once; Magpie will drive it after that",
-  running: "Grok Bot is already running and Magpie can't attach to it — close Grok Bot (or pick the direct-protocol sign-in) and retry",
+  signedOut: "Grok Bot isn't signed in in the connected window. Sign in in the Grok Bot window opened by Magpie (or the existing debug-enabled window), then retry. Magpie's separate profile does not inherit your usual app's sign-in; your usual app can stay open.",
+  running: "Magpie couldn't start its own Grok Bot instance — the launch exited before its debug interface opened; retry the sign-in",
   fallback: "Grok Bot updated and its automation bridge changed — falling back to UI input; if this repeats, the provider needs an update",
   changed: "Grok Bot changed its UI; the provider needs an update",
   crashed: "Grok Bot closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
@@ -20,7 +21,7 @@ const failure = key => chatError(key === "signedOut" ? 401 : key === "running" ?
 const execute = promisify(execFile)
 
 async function processes() {
-  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='Grok Bot.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,CreationDate) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
+  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='Grok Bot.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().Ticks.ToString()}}) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
   const rows = JSON.parse(stdout || "[]")
   return (Array.isArray(rows) ? rows : [rows]).map(row => ({ pid: row.ProcessId, executable: row.ExecutablePath, created: row.CreationDate, managedTag: row.CommandLine?.match(/--magpie-grok-managed=([0-9]+:[0-9a-f-]+)/)?.[1], port: Number(row.CommandLine?.match(/--remote-debugging-port[= ](\d+)/)?.[1]) || undefined }))
 }
@@ -28,7 +29,7 @@ function parentAlive(pid) {
   try { process.kill(pid, 0); return true } catch (error) { return error.code !== "ESRCH" }
 }
 async function stopManaged(row) {
-  const script = `$expected = [Console]::In.ReadToEnd() | ConvertFrom-Json; $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"; if ($process -and $process.ExecutablePath -eq $expected.executable -and $process.CreationDate -eq $expected.created -and $process.CommandLine.Contains("--magpie-grok-managed=$($expected.managedTag)")) { Invoke-CimMethod -InputObject $process -MethodName Terminate | Out-Null }`
+  const script = `$expected = [Console]::In.ReadToEnd() | ConvertFrom-Json; $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"; if ($process -and $process.ExecutablePath -eq $expected.executable -and $process.CreationDate.ToUniversalTime().Ticks.ToString() -ceq $expected.created -and $expected.managedTag -cmatch '^[1-9][0-9]*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' -and $process.CommandLine -cmatch ('(?:^|\\s)--magpie-grok-managed=' + [regex]::Escape($expected.managedTag) + '(?=\\s|$)')) { Invoke-CimMethod -InputObject $process -MethodName Terminate | Out-Null }`
   const child = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 5000 })
   child.stdin.end(JSON.stringify(row))
   await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", code => code === 0 ? resolve() : reject(failure("debug"))) })
@@ -176,7 +177,6 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     const previous = await runningProcesses()
     const attached = await reattach(previous)
     if (attached) attached.client.close()
-    else if (previous.length) throw failure("running")
   }
   async function start(signal) {
     const executable = await findGrokBot(deps)
@@ -193,9 +193,16 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
       return client
     }
     const port = await deps.freePort()
-    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-grok-managed=${process.pid}:${randomUUID()}`], { stdio: "ignore", windowsHide: false })
+    const managedTag = `${process.pid}:${randomUUID()}`
+    const userDataDir = win32.join(deps.env.LOCALAPPDATA || tmpdir(), "Magpie", "grok-bot-managed-profile")
+    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-grok-managed=${managedTag}`, `--user-data-dir=${userDataDir}`], { stdio: "ignore", windowsHide: false })
     child.once?.("error", () => launchErrors.add(child))
-    if (!previous.length) owned = child
+    owned = { exitCode: null, kill: () => {
+      void deps.processes().then(rows => {
+        const row = rows.find(current => current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
+        if (row) return deps.stopManaged(row)
+      }).catch(() => {})
+    } }
     const started = timers.now()
     while (timers.now() - started < (options.launchTimeoutMs ?? 10000)) {
       signal?.throwIfAborted()
@@ -324,7 +331,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
   return {
     id: "grok-bot", name: "Grok Bot",
     async authorize() {
-      return { url: "", method: "auto", instructions: "Keep Grok Bot signed in; Magpie will open and drive it when you chat. Sending a turn brings the app window to the front. No credential leaves the app. A unique Magpie turn identifier is appended to each submitted prompt for reply correlation. If the app status bridge is unavailable or unreadable, a paused answer may be delivered as final after two unchanged transcript reads.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Magpie attaches to an available debug-enabled Grok Bot window, or opens its own window with a separate profile when you chat. That profile does not inherit your usual app's sign-in: sign in once in the window Magpie opens, then retry your request. Your usual app can stay open. This setup checks drivability, not account sign-in. Sending a turn brings the app window to the front. No credential leaves the app. A unique Magpie turn identifier is appended to each submitted prompt for reply correlation. If the app status bridge is unavailable or unreadable, a paused answer may be delivered as final after two unchanged transcript reads.", callback: async () => {
         try { await checkDrivable(); return { type: "success", refresh: "grok-bot-cdp", access: "app-local", expires: 0, accountId: "grok-bot-cdp", mechanism: "cdp" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
