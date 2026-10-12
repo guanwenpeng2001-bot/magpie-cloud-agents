@@ -293,6 +293,112 @@ test("send fields, two stable polls, multi-turn same bot and cancel", async () =
   expect(calls[0].body).toEqual({ agent_id: "bot-one", limit: 50 })
 })
 
+for (const delivery of [3, "DUPLICATE", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"]) test(`completed identical turn answers again after duplicate delivery ${delivery}`, async () => {
+  let rows = [assistant(1, "previous answer")], echoEntryId
+  const messages = new Map()
+  const { driver, calls } = harness((method, call) => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
+    if (method === "SendGrokBotUserMessage") {
+      if (messages.has(call.body.message_id)) return { delivery }
+      echoEntryId = "row-2"
+      messages.set(call.body.message_id, echoEntryId)
+      rows = [...rows, entry(2, { kind: "message", role: "user", content: call.body.text }), assistant(3, "current answer")]
+      return { delivery: "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL" }
+    }
+    if (method === "GetGrokBotSendStatus") return { status: "GROK_BOT_SEND_STATUS_ACCEPTED", echo_entry_id: echoEntryId }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", client: {} }] }
+    throw new Error(`Unexpected RPC ${method}`)
+  })
+  const complete = async run => {
+    for (let poll = 0; poll < 4; poll++) {
+      const outcome = await driver.poll({}, run)
+      if (outcome.state !== "running") return outcome
+    }
+    throw new Error("Turn did not complete within 4 polls despite an accepted message and stable answer")
+  }
+  try {
+    const request = { model: "bot-one", prompt: "same question", identity: { key: "fixture-session:same-messages", sessionKey: "fixture-session" } }
+    const first = await driver.create({}, request)
+    expect(await complete(first)).toEqual({ state: "succeeded", text: "current answer" })
+    const repeated = await driver.create({}, request)
+    expect(repeated.ref.messageId).toBe(first.ref.messageId)
+    // Without a visible echo, an old baseline answer must not be trusted.
+    echoEntryId = undefined
+    for (let poll = 0; poll < 2; poll++) expect((await driver.poll({}, repeated)).state).toBe("running")
+    echoEntryId = messages.get(repeated.ref.messageId)
+    expect(await complete(repeated)).toEqual({ state: "succeeded", text: "current answer" })
+    expect(calls.filter(call => call.url.endsWith("SendGrokBotUserMessage"))).toHaveLength(2)
+    expect(messages.size).toBe(1)
+  } finally { driver.dispose() }
+})
+
+for (const echoEntryId of [undefined, "row-1"]) test(`fresh turn excludes previous answers with echo ${echoEntryId}`, async () => {
+  let rows = [entry(1, { kind: "message", role: "user", content: "previous question" }), assistant(2, "previous answer")]
+  const { driver } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
+    if (method === "SendGrokBotUserMessage") return { delivery: "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL" }
+    if (method === "GetGrokBotSendStatus") return { status: "GROK_BOT_SEND_STATUS_ACCEPTED", echoEntryId }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", isRunning: false }] }
+    throw new Error(`Unexpected RPC ${method}`)
+  })
+  try {
+    const run = await driver.create({}, { model: "bot-one", prompt: "new question", identity: { key: "new-turn" } })
+    for (let poll = 0; poll < 3; poll++) expect((await driver.poll({}, run)).state).toBe("running")
+    rows.push(assistant(3, "new answer"))
+    expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "new answer" })
+  } finally { driver.dispose() }
+})
+
+for (const delivery of [3, "DUPLICATE", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"]) test(`retry Q1 after Q2 returns Q1 answer with delivery ${delivery}`, async () => {
+  const rows = [], echoes = new Map()
+  const { driver } = harness((method, call) => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: [...rows].reverse() }
+    if (method === "SendGrokBotUserMessage") {
+      if (echoes.has(call.body.message_id)) return { delivery }
+      const echo = entry(rows.length + 1, { kind: "message", role: "user", content: call.body.text })
+      echoes.set(call.body.message_id, echo.entryId)
+      rows.push(echo, assistant(rows.length + 2, call.body.text.includes("Q1") ? "ANSWER-ONE" : "ANSWER-TWO"))
+      return { delivery: "ACCEPTED_TEMPORAL" }
+    }
+    if (method === "GetGrokBotSendStatus") return { status: "ACCEPTED", echoEntryId: echoes.get(call.body.message_id) }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", isRunning: false }] }
+    throw new Error(`Unexpected RPC ${method}`)
+  })
+  // Reload the adapter for each request so the retry reaches the vendor duplicate path.
+  const post = async question => {
+    const completion = emulate(driver, async () => ({ type: "oauth", access: "synthetic" }), { progress: false })
+    const response = await completion("https://fixture.invalid/v1/chat/completions", {
+      headers: { "x-magpie-cloud-agents-session": "turn-boundary-session" },
+      body: JSON.stringify({ model: "bot-one", messages: [{ role: "user", content: question }], stream: false }),
+    })
+    expect(response.status).toBe(200)
+    return (await response.json()).choices[0].message.content
+  }
+  try {
+    expect(await post("Q1")).toBe("ANSWER-ONE")
+    expect(await post("Q2")).toBe("ANSWER-TWO")
+    expect(await post("Q1")).toBe("ANSWER-ONE")
+    expect(echoes.size).toBe(2)
+  } finally { driver.dispose() }
+})
+
+for (const delivery of [3, "DUPLICATE", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"]) test(`duplicate without its own answer excludes pre-echo text with delivery ${delivery}`, async () => {
+  const rows = [assistant(1, "PREVIOUS ANSWER"), entry(2, { kind: "message", role: "user", content: "current question" })]
+  const { driver } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
+    if (method === "SendGrokBotUserMessage") return { delivery }
+    if (method === "GetGrokBotSendStatus") return { status: "ACCEPTED", echoEntryId: "row-2" }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", isRunning: false }] }
+    throw new Error(`Unexpected RPC ${method}`)
+  })
+  try {
+    const run = await driver.create({}, { model: "bot-one", prompt: "current question", identity: { key: "pending-duplicate" } })
+    for (let poll = 0; poll < 3; poll++) expect((await driver.poll({}, run)).state).toBe("running")
+    rows.push(assistant(3, "CURRENT ANSWER"))
+    expect(await driver.poll({}, run)).toEqual({ state: "succeeded", text: "CURRENT ANSWER" })
+  } finally { driver.dispose() }
+})
+
 test("pending cannot finish; rejected status maps to exact protocol error", async () => {
   let status = 4, rows = []
   const { driver } = harness(method => method === "GetGrokBotSendStatus" ? { status, rejection_code: "not allowed" } : method === "ListGrokBotTranscriptEntries" ? { entries: rows } : { dispatched: true })

@@ -8,6 +8,7 @@ const SERVICE = "aiserver.v1.GrokBotService"
 // Live replies use the full ACCEPTED_TEMPORAL, DUPLICATE and SEND_STATUS_ACCEPTED strings below; keep older wire aliases too.
 const DELIVERY = {
   accepted: [1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE", "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_BOX", "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"],
+  duplicate: [3, "DUPLICATE", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"],
   refused: [4, "REFUSED", "GROK_BOT_USER_MESSAGE_DELIVERY_REFUSED"],
 }
 const SEND_STATUS = {
@@ -144,7 +145,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     const response = await request("SendGrokBotUserMessage", { agent_id: agentId, message_id: messageId, text: prompt, sent_at_ms: String(now()), is_fork: false }, signal)
     if (response.refusal || DELIVERY.refused.includes(response.delivery)) throw protocolError(response.refusal?.message ?? "Message refused")
     if (response.dispatched !== true && !DELIVERY.accepted.includes(response.delivery)) throw protocolError("Message dispatch was not acknowledged")
-    return { url: agentId, ref: { agentId, messageId }, view: { baseline: new Set(baseline.map(row => row.entryId ?? row.entry_id ?? String(row.seq))), stable: undefined } }
+    return { url: agentId, ref: { agentId, messageId }, view: { baseline: new Set(baseline.map(row => row.entryId ?? row.entry_id ?? String(row.seq))), duplicate: DELIVERY.duplicate.includes(response.delivery), stable: undefined } }
   }
   const driver = {
     id: "grok-bot", name: "Grok Bot direct", staticModels: { "app-bot": { name: "App bot", tool_call: false } },
@@ -194,7 +195,10 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
         try { const difference = BigInt(left.seq) - BigInt(right.seq); return difference < 0n ? -1 : difference > 0n ? 1 : 0 } catch { return 0 }
       })
       const echoIndex = ordered.findIndex(row => (row.entryId ?? row.entry_id) === echoId && echoId)
-      const candidates = ordered.filter((row, index) => !run.view.baseline.has(row.entryId ?? row.entry_id ?? String(row.seq)) && (echoIndex < 0 || index > echoIndex))
+      // A duplicate's baseline may already contain its answer; trust the located echo instead.
+      const replay = run.view.duplicate && echoIndex >= 0
+      const nextUserIndex = replay ? ordered.findIndex((row, index) => index > echoIndex && transcriptEntry(row)?.role === "user") : -1
+      const candidates = ordered.filter((row, index) => (replay || !run.view.baseline.has(row.entryId ?? row.entry_id ?? String(row.seq))) && (echoIndex < 0 || index > echoIndex) && (nextUserIndex < 0 || index < nextUserIndex))
       const replies = candidates.map(transcriptEntry).filter(row => row?.role === "assistant" && row.text.trim())
       const fingerprint = JSON.stringify(ordered)
       const accepted = SEND_STATUS.accepted.includes(status.status)
