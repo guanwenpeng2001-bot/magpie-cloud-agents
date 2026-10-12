@@ -81,8 +81,9 @@ function fixture(settings = {}) {
     stopManaged: async row => { stoppedRows.push(row) },
     spawn(exe, argv, options) {
       const tag = argv.find(flag => flag.startsWith("--magpie-dots-managed="))?.split("=")[1]
-      const child = { exitCode: state.exited ? 0 : null, once(name, callback) { if (name === "error" && state.spawnError) queueMicrotask(() => callback(new Error(state.spawnError))) } }
-      if (tag) managedRows.push({ pid: 100 + spawns.length, executable: exe, created: "spawned", managedTag: tag })
+      const pid = 100 + spawns.length
+      const child = { pid, exitCode: state.exited ? 0 : null, once(name, callback) { if (name === "error" && state.spawnError) queueMicrotask(() => callback(new Error(state.spawnError))) } }
+      if (tag) managedRows.push({ pid, executable: exe, created: "spawned", managedTag: tag })
       spawns.push({ exe, argv, options })
       return child
     },
@@ -347,12 +348,30 @@ test("idle teardown of a launched instance terminates only the tagged instance, 
   } finally { fake.close() }
 })
 
+test("launch teardown stops its own spawned child, never a same-tag same-exe foreign row", async () => {
+  const fake = fixture({ previous: false, reattach: false })
+  try {
+    await send(fake)
+    expect(fake.spawns).toHaveLength(1)
+    // A row this plugin instance never launched, listed before the child, carrying the identical
+    // tag and executable path: the teardown must still stop the spawned pid only.
+    const tag = fake.spawns[0].argv.find(flag => flag.startsWith("--magpie-dots-managed="))?.split("=")[1]
+    fake.managedRows.unshift({ pid: 777, executable: fake.spawns[0].exe, created: "spawned", managedTag: tag })
+  } finally { fake.close() }
+  await Bun.sleep(10)
+  expect(fake.stoppedRows).toHaveLength(1)
+  expect(fake.stoppedRows[0].pid).toBe(100)
+  expect(fake.stoppedRows.some(row => row.pid === 777)).toBe(false)
+})
+
 test("launch hands off to an already running instance without a port and fails without killing anything", async () => {
   const fake = fixture({ previous: true, reattach: false, unreachable: true, exited: true })
   try { await expectFailure(() => send(fake), "running", 409) } finally { fake.close() }
   expect(fake.spawns).toHaveLength(1)
   await Bun.sleep(10)
-  expect(fake.stoppedRows.every(row => row.managedTag)).toBe(true)
+  // The fake's process table still lists the exited child, so the teardown may stop that child
+  // (pid 100, this launch's own spawn) — but nothing else, and never the pre-existing pid 42.
+  expect(fake.stoppedRows.map(row => row.pid)).toEqual([100])
   expect(fake.stoppedRows.some(row => row.pid === 42)).toBe(false)
 })
 
@@ -374,6 +393,13 @@ test("a spawn failure surfaces the underlying reason instead of a generic error"
 test("waiting for the launched app's debug port is bounded and reports the debug error on timeout", async () => {
   const fake = fixture({ previous: false, reattach: false, unreachable: true })
   try { await expectFailure(() => send(fake), "debug") } finally { fake.close() }
+})
+
+test("a slow handoff alongside a pre-existing instance reports the running error on timeout, not the debug error", async () => {
+  const fake = fixture({ previous: true, reattach: false, unreachable: true })
+  try { await expectFailure(() => send(fake), "running", 409) } finally { fake.close() }
+  await Bun.sleep(10)
+  expect(fake.stoppedRows.some(row => row.pid === 42)).toBe(false)
 })
 
 test("sign-in instructions describe the launch behaviour instead of manual debug flags", async () => {

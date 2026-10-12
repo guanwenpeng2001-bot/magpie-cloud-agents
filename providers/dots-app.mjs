@@ -212,9 +212,16 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     const spawnErrors = new Set()
     child.once?.("error", error => spawnErrors.add(error))
     owned = { exitCode: null, kill: () => {
+      // Identity is pinned to the child this instance spawned, as adopt() does: the pid comes
+      // from the spawn return, the creation stamp is read back for that pid, and the same pid +
+      // tag + executable + stamp must still be listed on a fresh read before stopManaged runs.
       void deps.processes().then(rows => {
-        const row = rows.find(current => current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
-        if (row) return deps.stopManaged(row)
+        const stamp = rows.find(current => current.pid === child.pid && current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
+        if (!stamp) return
+        return deps.processes().then(latest => {
+          const row = latest.find(current => current.pid === stamp.pid && current.created === stamp.created && current.executable === stamp.executable && current.managedTag === stamp.managedTag)
+          if (row) return deps.stopManaged(row)
+        })
       }).catch(() => {})
     } }
     const started = timers.now()
@@ -232,6 +239,10 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
       if (previous.length) throw failure("running")
       throw failure("launch")
     }
+    // Same handoff discrimination as the exit branch above: at the bound, a pre-existing
+    // instance is the likeliest cause of a slow handoff, so point the user at quitting
+    // ChatGPT rather than at a security tool.
+    if (previous.length) throw failure("running")
     throw failure("debug")
   }
   async function start(signal) {
