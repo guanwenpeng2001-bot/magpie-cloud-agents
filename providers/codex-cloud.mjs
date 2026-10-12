@@ -13,6 +13,12 @@ const MODELS = { "cloud-task": { name: "Codex Cloud task", tool_call: false, rea
 const STATUS_NOTES = "Status interpretation is experimental and tested only on constructed examples; real CLI wording is unverified. Product limit: despite recognizing grammatical patterns across arbitrary action verbs, continuations with no marker or with a marker outside the recognized set, including 'work continues on the parser', 'the worker proceeds to packaging', 'the agent keeps indexing the tree', and 'the migration is underway', can be mistaken for completion and return an unfinished diff. Verify task completion independently before using a returned diff. Conversely, completed summaries can remain attached and time out without a diff: subject gerunds ('testing is complete', 'indexing is finished', 'checking revealed no issues', 'monitoring is in place', 'testing passed', 'monitoring shows no errors'); predicate adjectives ('the file is missing', 'one test is failing', 'the results are promising', 'the report is outstanding', 'the remaining work is existing scope'); sequencing summaries ('now the tests pass', 'now everything is green', 'then the suite went green', 'meanwhile the cache was cleared', 'subsequently reviewed and merged'); modal summaries ('the tests will pass on retry', 'the API can be extended later'); and intent summaries ('nothing left to be verified', 'the fix is ready to be merged'). Bare Error diagnostics also remain running. An identical resend reuses the task; delivery can resume if the status later becomes unambiguous, but unchanged wording can keep timing out indefinitely."
 const LOGGED_OUT = "the codex CLI isn't signed in — run `codex login` (or `codex login --device-auth` on a headless box), then sign in again"
 const MISSING = "the codex CLI wasn't found on PATH — install the `codex` CLI from OpenAI first"
+// The CLI's own refusal for a workspace with no Codex Cloud environment, measured live (2026-10-12):
+// `codex cloud list --env <any-id>` exits 1 with exactly this sentence, and a bogus id produces the
+// identical message, so it is the workspace's answer, not a complaint about the id. It is the only
+// configuration refusal measured; other configuration refusals may exist and stay unclassified.
+const NO_CLOUD_ENVIRONMENT = /\bno cloud environments are available for this workspace\b/i
+const noCloudEnvironmentMessage = refusal => `the codex CLI refused this workspace: ${refusal.trim()} — your account has no Codex Cloud environment. Create one in your OpenAI Codex Cloud settings, or point the plugin at an existing environment with account metadata.env or option codexCloud.env`
 const marker = auth => auth?.type === "oauth" && auth.access === "codex-cli" && auth.refresh === "codex-cli"
 const outputOf = result => [result.stdout, result.stderr].filter(Boolean).join("\n")
 const loggedOut = text => /\b(not logged in|logged out)\b/i.test(text)
@@ -102,7 +108,13 @@ function stateOf(text, prompt = "") {
 function checkExit(result) {
   const text = outputOf(result)
   if (loggedOut(text)) throw chatError(401, LOGGED_OUT, "expired")
-  if (result.code !== 0) throw chatError(/\b(rate limit|rate limited|too many requests|429)\b/i.test(text) ? 429 : 502, text || "the codex CLI exited without output")
+  if (result.code !== 0) {
+    // A workspace without a Codex Cloud environment is account configuration the user must change,
+    // so it is a 400 client error (normalizeError passes 4xx through to the client), never a
+    // retryable 502.
+    if (NO_CLOUD_ENVIRONMENT.test(text)) throw chatError(400, noCloudEnvironmentMessage(text))
+    throw chatError(/\b(rate limit|rate limited|too many requests|429)\b/i.test(text) ? 429 : 502, text || "the codex CLI exited without output")
+  }
   return result
 }
 

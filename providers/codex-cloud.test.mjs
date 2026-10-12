@@ -12,6 +12,9 @@ writeFileSync(fixture, `const args = process.argv.slice(2); const row = JSON.par
 afterAll(() => rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
 const auth = { type: "oauth", access: "codex-cli", refresh: "codex-cli", env: "env_fake" }
 const reply = (stdout, code = 0, stderr = "") => ({ stdout, code, stderr })
+// Verbatim from the live capture (evidence/live-acceptance-sweep/raw-codex-cloud.txt line 16):
+// the real CLI emits this sentence with a trailing newline on exit 1, so the fixture keeps it.
+const workspaceRefusal = "Error: no cloud environments are available for this workspace\n"
 function scripted(rows) {
   const calls = []
   const cli = async (args, options) => {
@@ -254,6 +257,33 @@ test("AbortSignal kills the fake process", async () => {
 })
 for (const [row, status] of [[reply("rate limited", 1), 429], [reply("vendor unavailable", 1), 502]]) test(`create CLI errors preserve wording and status ${status}`, async () => {
   await expect(_internal.makeDriver({ codexCloud: { env: "fake" } }, scripted([row]).cli).create({}, { prompt: "hi" })).rejects.toMatchObject({ status, signIn: "kept", message: row.stdout })
+})
+test("a workspace without a cloud environment is a 400 configuration error naming cause and action", async () => {
+  const script = scripted([reply(workspaceRefusal, 1)])
+  let error
+  try { await _internal.makeDriver({ codexCloud: { env: "fake" } }, script.cli).create({}, { prompt: "hi" }) } catch (caught) { error = caught }
+  expect(error?.status).toBe(400)
+  expect(error?.message).toContain("no cloud environments are available for this workspace")
+  expect(error?.message).toContain("has no Codex Cloud environment")
+  expect(error?.message).toContain("metadata.env")
+  expect(error?.message).toContain("codexCloud.env")
+})
+test("loader reports a missing cloud environment as a 400 the client must act on", async () => {
+  const script = scripted([reply("Logged in"), reply(workspaceRefusal, 1)])
+  const loader = await makeCodexCloud({ codexCloud: { env: "fake" } }, script).auth.loader(async () => auth)
+  const response = await loader.fetch(endpoint, request())
+  expect(response.status).toBe(400)
+  expect(response.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  const body = await response.json()
+  expect(body.error.code).toBe(400)
+  expect(body.error.message).toContain("no cloud environments are available for this workspace")
+  expect(body.error.message).toContain("codexCloud.env")
+})
+for (const [text, label] of [
+  ["Error: no cloud environments are available for other workspaces\n", "a phrase about other workspaces"],
+  ["Error: no environments are available for this workspace\n", "the same sentence without 'cloud'"],
+]) test(`near-miss exit-1 output stays a plain 502: ${label}`, async () => {
+  await expect(_internal.makeDriver({ codexCloud: { env: "fake" } }, scripted([reply(text, 1)]).cli).create({}, { prompt: "hi" })).rejects.toMatchObject({ status: 502, message: text })
 })
 for (const word of ["failed", "expired"]) test(`chat ${word} maps to 502 kept`, async () => {
   const loader = await makeCodexCloud({}, scripted([reply("Logged in"), reply("task_abc123"), reply(word)])).auth.loader(async () => auth)
