@@ -357,6 +357,35 @@ test("models parse accepts the wrapped and bare shapes and falls back to the flo
   })
 })
 
+test("models parse accepts the vendor's measured items envelope, surfaces displayName, and keeps the floor", async () => {
+  // Transcribed verbatim (a representative subset of rows, real field structure
+  // preserved) from the sweep's captured vendor response:
+  // runs/cloud-agent-providers/evidence/live-acceptance-sweep/probe-cursor-models.txt
+  //   GET https://api.cursor.com/v1/models -> HTTP 200  {"items":[ ... ]}
+  const floor = { "composer-2": { name: "Composer 2" }, "claude-sonnet-4-5": { name: "Claude Sonnet 4.5" } }
+  const probe = {
+    items: [
+      { "id":"default","displayName":"Auto","aliases":["auto"],"variants":[{"params":[],"displayName":"Auto","isDefault":true}] },
+      { "id":"composer-2.5","displayName":"Composer 2.5","aliases":["composer-latest","composer","composer-2-5"],"parameters":[{"id":"fast","displayName":"Fast","values":[{"value":"false"},{"value":"true","displayName":"Fast"}]}],"variants":[{"params":[{"id":"fast","value":"true"}],"displayName":"Composer 2.5","isDefault":true},{"params":[{"id":"fast","value":"false"}],"displayName":"Composer 2.5"}] },
+      { "id":"gemini-3.1-pro","displayName":"Gemini 3.1 Pro","aliases":["gemini-latest","gemini-pro-latest","gemini","gemini-pro"],"variants":[{"params":[],"displayName":"Gemini 3.1 Pro","isDefault":true}] },
+      { "id":"claude-sonnet-4-5","displayName":"Claude Sonnet 4.5","aliases":["sonnet","sonnet-4.5","sonnet-4-5"],"parameters":[{"id":"thinking","displayName":"Thinking","values":[{"value":"false"},{"value":"true"}]},{"id":"context","displayName":"Context","values":[{"value":"200k","displayName":"200K"}]}],"variants":[{"params":[{"id":"thinking","value":"false"},{"id":"context","value":"200k"}],"displayName":"Claude Sonnet 4.5"},{"params":[{"id":"thinking","value":"true"},{"id":"context","value":"200k"}],"displayName":"Claude Sonnet 4.5","isDefault":true}] },
+      { "id":"kimi-k3","displayName":"Kimi K3","parameters":[{"id":"reasoning","displayName":"Reasoning","values":[{"value":"low","displayName":"Low"},{"value":"high","displayName":"High"},{"value":"max","displayName":"Max"}]}],"variants":[{"params":[{"id":"reasoning","value":"low"}],"displayName":"Kimi K3"},{"params":[{"id":"reasoning","value":"high"}],"displayName":"Kimi K3"},{"params":[{"id":"reasoning","value":"max"}],"displayName":"Kimi K3","isDefault":true}] },
+    ],
+  }
+  await withHarness(({ url }) => {
+    if (url.pathname.endsWith("/v1/models")) return Response.json(probe)
+  }, async ({ plugin }) => {
+    const models = await plugin.provider.models({ models: floor }, { auth: AUTH })
+    expect(Object.keys(models).sort()).toEqual(["claude-sonnet-4-5", "composer-2", "composer-2.5", "default", "gemini-3.1-pro", "kimi-k3"])
+    expect(models["default"]).toMatchObject({ name: "Auto", capabilities: { toolcall: false, reasoning: false } })
+    expect(models["composer-2.5"]).toMatchObject({ name: "Composer 2.5", capabilities: { toolcall: false, reasoning: false } })
+    expect(models["gemini-3.1-pro"]).toMatchObject({ name: "Gemini 3.1 Pro", capabilities: { toolcall: false, reasoning: false } })
+    expect(models["kimi-k3"]).toMatchObject({ name: "Kimi K3", capabilities: { toolcall: false, reasoning: false } })
+    expect(models["claude-sonnet-4-5"]).toMatchObject({ name: "Claude Sonnet 4.5" })
+    expect(models["composer-2"]).toMatchObject({ name: "Composer 2" })
+  })
+})
+
 test("the chat.headers hook sets the session only for this provider and real sessions", async () => {
   const plugin = makeCursorCloud()
   const set = async (input, sessionID) => {
