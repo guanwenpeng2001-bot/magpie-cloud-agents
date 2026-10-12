@@ -143,7 +143,7 @@ function makeDriver(options) {
               const status = { "agent.session.turn.completed": "completed", "agent.session.turn.failed": "failed", "agent.session.failed": "failed", "agent.session.turn.cancelled": "cancelled", "agent.session.action_required": "action_required" }[type]
               if (status) return await outcome(cred, run, status, signal, payload, payload.turn_id ?? payload.data?.turn_id)
               if (type) {
-                // Keep the event name on the progress channel and additively surface what the payload carries: the failure cause of a non-terminal error event, and an assistant message item's text (the same shape the items endpoint returns, per the captured item.added frame) as cumulative content.
+                // Keep the event name on the progress channel and additively surface what the payload carries: the failure cause of a non-terminal error event, and an assistant message item's text as cumulative content. The assistant-item shape is inferred from the items-endpoint reader, not observed on the stream: the captured item.added frame carries only the user's message (role "user", input_text), which answerText() rejects, so this emission fires on no captured shape and is unverified live.
                 emit(type)
                 const reason = failureReason(failureCause(payload))
                 if (reason) emit({ progress: `${type} — ${reason}` })
