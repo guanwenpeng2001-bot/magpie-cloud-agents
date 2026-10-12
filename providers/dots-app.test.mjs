@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { makeDotsDriver } from "./dots.mjs"
-import { createDotsApp, findChatGptApp, connectCdp, DOTS_APP_ERRORS } from "./dots-app.mjs"
+import { createDotsApp, findChatGptApp, connectCdp, SEND_BUTTON_MATCH, DOTS_APP_ERRORS } from "./dots-app.mjs"
 
 const marker = { type: "oauth", access: "app-local", refresh: "dots-app-cdp", accountId: "dots-app", mechanism: "app-drive" }
 const messages = DOTS_APP_ERRORS
@@ -16,8 +16,8 @@ async function expectFailure(operation, key, status = 502, signIn = "kept") {
 }
 
 function fixture(settings = {}) {
-  const frames = [], spawns = [], timers = new Map()
-  let timestamp = 0, nextTimer = 0, kills = 0, clients = []
+  const frames = [], spawns = [], timers = new Map(), managedRows = [], stoppedRows = []
+  let timestamp = 0, nextTimer = 0, clients = []
   const state = { sidebar: true, route: DOTS_ROUTE, composer: true, sendButton: true, rows: [], replies: [], ...settings }
   const auto = new Set([200, 250])
   const timerApi = {
@@ -45,9 +45,15 @@ function fixture(settings = {}) {
         else if (expression.includes("location.href")) value = { href: state.route, composer: state.composer }
         else if (expression.includes("message-row")) value = state.rows
         else if (expression.includes("发送")) {
-          if (!state.sendButton || !shell) value = false
-          else {
-            value = true
+          let clicked = false
+          const button = { getAttribute: () => "发送", innerText: "", textContent: "", getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }), click() { clicked = true } }
+          const document = {
+            querySelector: () => ({ getBoundingClientRect: () => ({ left: 482, top: 760, width: 600, height: 36 }) }),
+            querySelectorAll: () => state.sendButton && shell ? [button] : [],
+          }
+          value = new Function("document", `return ${expression}`)(document)
+          if (clicked) {
+            state.sendClicks = (state.sendClicks ?? 0) + 1
             if (state.onSubmit) state.onSubmit(state)
             else {
               state.rows.push({ id: `user-${state.rows.length}`, self: true, text: "" })
@@ -61,13 +67,20 @@ function fixture(settings = {}) {
     },
   })
   const dependencies = {
-    env: {}, exists: async () => !state.missing, appx: async () => ["C:\\Packages\\OpenAI.Codex"],
-    processes: async () => state.previous ? [{
-      pid: 42, port: state.reattach ? server.port : undefined,
-      ...(state.adoptable ? { executable: "C:\\Packages\\OpenAI.Codex\\ChatGPT.exe", created: "start", managedTag: "999999:12345678-1234-4234-8234-123456789abc" } : {}),
-    }] : [],
+    env: { LOCALAPPDATA: "C:\\Local" }, exists: async () => !state.missing, appx: async () => ["C:\\Packages\\OpenAI.Codex"],
+    processes: async () => [
+      ...(state.previous ? [{ pid: 42, port: state.reattach ? server.port : undefined }] : []),
+      ...managedRows,
+    ],
     freePort: async () => server.port,
-    spawn(exe, argv, options) { const child = { exitCode: state.exited ? 0 : null, kill() { kills++ }, once() {} }; spawns.push({ exe, argv, options }); return child },
+    stopManaged: async row => { stoppedRows.push(row) },
+    spawn(exe, argv, options) {
+      const tag = argv.find(flag => flag.startsWith("--magpie-dots-managed="))?.split("=")[1]
+      const child = { exitCode: state.exited ? 0 : null, once() {} }
+      if (tag) managedRows.push({ pid: 100 + spawns.length, executable: exe, created: "spawned", managedTag: tag })
+      spawns.push({ exe, argv, options })
+      return child
+    },
     fetch: async url => {
       if (state.unreachable) throw new Error("unreachable")
       if (String(url).endsWith("/json/version")) return Response.json({ Browser: "Chrome/148.0" })
@@ -83,21 +96,37 @@ function fixture(settings = {}) {
     timers: state.realTimers ? { now: Date.now, setTimeout, clearTimeout } : timerApi,
   }
   const driver = createDotsApp({ keepAliveMinutes: 0.01, launchTimeoutMs: 1200, stableMs: 0, ...(settings.driverOptions ?? {}) }, dependencies)
-  return { state, frames, spawns, dependencies, driver, endpoint: `ws://127.0.0.1:${server.port}/devtools/page/shell`,
-    get kills() { return kills },
+  return { state, frames, spawns, dependencies, driver, endpoint: `ws://127.0.0.1:${server.port}/devtools/page/shell`, managedRows, stoppedRows,
     expireIdle() { for (const [timer, job] of [...timers]) if (job.delay === 600) { timers.delete(timer); job.callback() } },
     close() { driver.dispose(); server.stop(true) },
   }
 }
 const send = fixture => fixture.driver.create(marker, { prompt: "hello" })
 
-test("discovery resolves the MSIX install location and refuses a missing install", async () => {
-  const found = await findChatGptApp({ appx: async () => ["C:\\Packages\\OpenAI.Codex"], exists: async path => path === "C:\\Packages\\OpenAI.Codex\\ChatGPT.exe" })
-  expect(found).toBe("C:\\Packages\\OpenAI.Codex\\ChatGPT.exe")
+test("discovery resolves the exe under the app\\ subdirectory and at the install root", async () => {
+  const underApp = await findChatGptApp({ appx: async () => ["C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1007.2314.0_x64__2p2nqsd0c76g0"], exists: async path => path === "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1007.2314.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe" })
+  expect(underApp).toBe("C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1007.2314.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe")
+  const atRoot = await findChatGptApp({ appx: async () => ["C:\\Packages\\OpenAI.Codex"], exists: async path => path === "C:\\Packages\\OpenAI.Codex\\ChatGPT.exe" })
+  expect(atRoot).toBe("C:\\Packages\\OpenAI.Codex\\ChatGPT.exe")
   await expect(findChatGptApp({ appx: async () => [], exists: async () => false })).rejects.toThrow(messages.missing)
 })
 
 test("CDP client rejects remote websocket endpoints", async () => { await expect(connectCdp("ws://example.invalid:9333/devtools/page/1")).rejects.toThrow(messages.debug) })
+
+test("send control is matched by accessible name without inner text, and geometry still applies", () => {
+  const match = (0, eval)(SEND_BUTTON_MATCH)
+  const box = { left: 482, top: 760, width: 600, height: 36 }
+  const iconButton = { getAttribute: () => "发送", innerText: "", textContent: "", getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }) }
+  expect(match(iconButton, box)).toBe(true)
+  expect(match({ ...iconButton, getAttribute: () => "复制" }, box)).toBe(false)
+  expect(match({ ...iconButton, getBoundingClientRect: () => ({ left: 10, top: 764, width: 28, height: 28 }) }, box)).toBe(false)
+  expect(match({ getAttribute: () => "", innerText: "发送", textContent: "发送", getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }) }, box)).toBe(true)
+})
+
+test("a surface with no send control fails with the changed-UI error", async () => {
+  const fake = fixture({ sendButton: false })
+  try { await expectFailure(() => send(fake), "changed") } finally { fake.close() }
+})
 
 test("launch binds debug argv to loopback, clears and types into the Dot surface, then clicks send", async () => {
   const fake = fixture({ replies: ["收到"] })
@@ -105,10 +134,12 @@ test("launch binds debug argv to loopback, clears and types into the Dot surface
     const run = await send(fake)
     expect(fake.spawns[0].argv.slice(0, 2)).toEqual([`--remote-debugging-port=${new URL(fake.endpoint).port}`, "--remote-debugging-address=127.0.0.1"])
     expect(fake.spawns[0].argv[2]).toMatch(/^--magpie-dots-managed=\d+:[0-9a-f-]{36}$/)
+    expect(fake.spawns[0].argv[3]).toMatch(/^--user-data-dir=.+/)
     const inserted = fake.frames.filter(frame => frame.method === "Input.insertText")
     expect(inserted).toHaveLength(1)
     expect(inserted[0].params.text).toBe(run.prompt)
     expect(fake.frames.filter(frame => frame.method === "Input.dispatchKeyEvent").map(frame => frame.params.windowsVirtualKeyCode)).toEqual([65, 65, 8, 8])
+    expect(fake.state.sendClicks).toBe(1)
     expect(fake.frames.filter(frame => frame.params.expression?.includes("发送"))).toHaveLength(1)
     expect((await fake.driver.poll(marker, run)).state).toBe("running")
     expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "收到" })
@@ -182,6 +213,7 @@ test("second concurrent turn on the same Dot is refused, not interleaved", async
     const results = await Promise.allSettled([send(fake), send(fake)])
     expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1)
     expect(results.find(result => result.status === "rejected").reason.status).toBe(409)
+    expect(fake.state.sendClicks).toBe(1)
     expect(fake.frames.filter(frame => frame.params.expression?.includes("发送"))).toHaveLength(1)
   } finally { fake.close() }
 })
@@ -218,19 +250,32 @@ test("liveModels reports the Dot from the app shell", async () => {
   finally { fake.close() }
 })
 
-test("sign-in with the app closed launches a managed instance and succeeds", async () => {
+test("sign-in with the app closed launches a tagged managed instance and succeeds", async () => {
   const fake = fixture()
   try {
     expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" })
     expect(fake.spawns).toHaveLength(1)
   } finally { fake.close() }
-  expect(fake.kills).toBe(1)
+  await Bun.sleep(10)
+  expect(fake.stoppedRows).toHaveLength(1)
+  expect(fake.stoppedRows[0].managedTag).toMatch(/^[0-9]+:[0-9a-f-]{36}$/)
 })
 
-test("sign-in with a running app that cannot be attached fails with the actionable running error", async () => {
-  const fake = fixture({ previous: true, unreachable: true })
-  try { expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "failed", error: messages.running }) }
-  finally { fake.close() }
+test("sign-in with a running untagged app launches its own managed instance instead of failing", async () => {
+  const fake = fixture({ previous: true })
+  try {
+    expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" })
+    expect(fake.spawns).toHaveLength(1)
+    expect(fake.spawns[0].argv[3]).toMatch(/^--user-data-dir=.+/)
+  } finally { fake.close() }
+  await Bun.sleep(10)
+  expect(fake.stoppedRows).toHaveLength(1)
+  expect(fake.stoppedRows.every(row => row.pid !== 42)).toBe(true)
+})
+
+test("a launch that exits while the app is running reports 409 without telling the user to close anything", async () => {
+  const fake = fixture({ previous: true, exited: true, unreachable: true })
+  try { await expectFailure(() => send(fake), "running", 409) } finally { fake.close() }
 })
 
 test("sign-in when the app never opens a debug interface fails and never silently succeeds", async () => {
@@ -250,28 +295,31 @@ test("sign-in without an installation fails with the missing error and never lau
   } finally { fake.close() }
 })
 
-test("reattaching to a running app with a debug port never launches or kills it", async () => {
+test("reattaching to a running app with a debug port never launches or terminates anything", async () => {
   const fake = fixture({ previous: true, reattach: true })
   try {
     expect((await (await fake.driver.authorize()).callback()).type).toBe("success")
     expect(fake.spawns).toHaveLength(0)
     fake.expireIdle()
   } finally { fake.close() }
-  expect(fake.kills).toBe(0)
+  await Bun.sleep(10)
+  expect(fake.stoppedRows).toHaveLength(0)
 })
 
-test("idle teardown stops only the owned app and never while a turn is active", async () => {
-  const fake = fixture({ replies: ["answer"] })
+test("idle teardown stops only the owned managed instance and never while a turn is active", async () => {
+  const fake = fixture({ previous: true, replies: ["answer"] })
   try {
     const run = await send(fake)
     fake.expireIdle()
-    expect(fake.kills).toBe(0)
+    expect(fake.stoppedRows).toHaveLength(0)
     expect((await fake.driver.poll(marker, run)).state).toBe("running")
     fake.expireIdle()
-    expect(fake.kills).toBe(0)
+    expect(fake.stoppedRows).toHaveLength(0)
     expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "answer" })
     fake.expireIdle()
-    expect(fake.kills).toBe(1)
+    await Bun.sleep(10)
+    expect(fake.stoppedRows).toHaveLength(1)
+    expect(fake.stoppedRows.every(row => row.pid !== 42)).toBe(true)
   } finally { fake.close() }
 })
 

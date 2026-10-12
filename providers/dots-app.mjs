@@ -3,6 +3,7 @@ import { access } from "node:fs/promises"
 import { spawn, execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { win32 } from "node:path"
+import { tmpdir } from "node:os"
 import { createServer } from "node:net"
 import { chatError } from "../lib/errors.mjs"
 import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
@@ -10,7 +11,7 @@ import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
 export const DOTS_APP_ERRORS = {
   missing: "ChatGPT desktop isn't installed — install the OpenAI ChatGPT app from the Microsoft Store and sign in once, then retry",
   signedOut: "ChatGPT desktop isn't signed in — open it and sign in once; Magpie will drive the Dot after that",
-  running: "ChatGPT is already running and Magpie can't attach to it — close ChatGPT (including the tray icon) and retry",
+  running: "Magpie couldn't start its own ChatGPT instance — the launch exited before its debug interface opened; retry the sign-in",
   changed: "ChatGPT changed its UI; the dots provider needs an update",
   crashed: "ChatGPT closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
   reset: "The Dot conversation was reset — asking again sends it as a new task",
@@ -53,8 +54,11 @@ async function readAppxLocations() {
 
 export async function findChatGptApp({ env = process.env, exists = path => access(path).then(() => true, () => false), appx = readAppxLocations } = {}) {
   for (const location of await appx()) {
-    const candidate = win32.join(String(location).replace(/^"|"$/g, ""), "ChatGPT.exe")
-    if (await exists(candidate)) return candidate
+    const root = String(location).replace(/^"|"$/g, "")
+    // The MSIX layout moved the exe under app\ (OpenAI.Codex 26.1007.x); older builds keep it at the install root.
+    for (const candidate of [win32.join(root, "ChatGPT.exe"), win32.join(root, "app", "ChatGPT.exe")]) {
+      if (await exists(candidate)) return candidate
+    }
   }
   throw failure("missing")
 }
@@ -104,19 +108,24 @@ export async function connectCdp(url, { WebSocket: Socket = globalThis.WebSocket
   }
 }
 
+// Hidden Dot renderers support CDP input without bringing the window to the foreground.
 const shellProbe = `(() => { const text = document.body?.innerText ?? ""; return text.includes("新聊天") || text.includes("插件"); })()`
 const surfaceProbe = `(() => ({ href: location.href, composer: !!document.querySelector('div.ProseMirror[contenteditable="true"]') }))()`
 const composerProbe = `(() => !!document.querySelector('div.ProseMirror[contenteditable="true"]'))()`
 const focusProbe = `(() => { const composer = document.querySelector('div.ProseMirror[contenteditable="true"]'); if (!composer) return false; composer.focus(); return true; })()`
 const transcriptRead = `(() => [...document.querySelectorAll('.messages-scroll article.message-row')].map(row => ({ id: row.dataset.messageId || "", self: /(^|\\s)self/.test(row.className || ""), text: ((row.querySelector('.message-text, .message-body') || row).innerText || "") })))()`
+// The send control is an icon button with no inner text; its accessible name carries 发送.
+// Exported so tests evaluate the exact predicate string the page runs.
+export const SEND_BUTTON_MATCH = `((candidate, box) => {
+  const area = candidate.getBoundingClientRect();
+  const name = (candidate.getAttribute("aria-label") || candidate.innerText || candidate.textContent || "").trim();
+  return name === "发送" && area.left > box.left && Math.abs((area.top + area.height / 2) - (box.top + box.height / 2)) < 80;
+})`
 const sendProbe = `(() => {
   const composer = document.querySelector('div.ProseMirror[contenteditable="true"]');
   if (!composer) return false;
   const box = composer.getBoundingClientRect();
-  const button = [...document.querySelectorAll("button")].find(candidate => {
-    const area = candidate.getBoundingClientRect();
-    return (candidate.innerText || candidate.textContent || "").trim() === "发送" && area.left > box.left && Math.abs((area.top + area.height / 2) - (box.top + box.height / 2)) < 80;
-  });
+  const button = [...document.querySelectorAll("button")].find(candidate => ${SEND_BUTTON_MATCH}(candidate, box));
   if (!button) return false;
   button.click();
   return true;
@@ -201,9 +210,19 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
       return attached.client
     }
     const port = await deps.freePort()
-    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-dots-managed=${process.pid}:${randomUUID()}`], { stdio: "ignore", windowsHide: false })
+    const managedTag = `${process.pid}:${randomUUID()}`
+    const userDataDir = win32.join(deps.env.LOCALAPPDATA || tmpdir(), "Magpie", "dots-app-managed-profile")
+    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-dots-managed=${managedTag}`, `--user-data-dir=${userDataDir}`], { stdio: "ignore", windowsHide: false })
     child.once?.("error", () => launchErrors.add(child))
-    if (!previous.length) owned = child
+    // A separate user-data-dir lets a managed instance run beside the user's own app.
+    // Teardown revalidates tag, executable and creation time through the live process
+    // table, so a process without our tag is never terminated.
+    owned = { exitCode: null, kill: () => {
+      void deps.processes().then(rows => {
+        const row = rows.find(current => current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
+        if (row) return deps.stopManaged(row)
+      }).catch(() => {})
+    } }
     const started = timers.now()
     let lastError
     while (timers.now() - started < (options.launchTimeoutMs ?? 20000)) {
@@ -228,11 +247,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
   async function checkDrivable() {
     await findChatGptApp(deps)
     if (connection?.open) return
-    const previous = await runningProcesses()
-    const attached = await reattach(previous)
-    if (attached) { attached.client.close(); return }
-    if (previous.length) throw failure("running")
-    await start()
+    await ensure()
   }
   async function openSurface(client, signal) {
     const state = await client.evaluate(surfaceProbe, signal)
@@ -323,7 +338,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
   return {
     id: "dots", name: "ChatGPT Dot (app-drive)",
     async authorize() {
-      return { url: "", method: "auto", instructions: "Magpie drives the Dot inside the installed ChatGPT desktop app — no MCP connector, no bearer token, no developer mode and no tunnel. Keep ChatGPT signed in; when you chat, Magpie opens (or attaches to) the app over a local-only debug port, opens the Dot surface, types the prompt and reads the reply. No credential leaves this PC. If ChatGPT is already running without a debug port, close it first so Magpie can attach.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Magpie drives the Dot inside the installed ChatGPT desktop app — no MCP connector, no bearer token, no developer mode and no tunnel. Keep ChatGPT signed in; when you chat, Magpie opens (or attaches to) the app over a local-only debug port, opens the Dot surface, types the prompt and reads the reply. No credential leaves this PC. If ChatGPT has no attachable debug port, Magpie starts a separate managed instance with its own profile; that profile may require its own sign-in.", callback: async () => {
         try { await checkDrivable(); return { type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
