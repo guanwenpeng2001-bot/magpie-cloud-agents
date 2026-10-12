@@ -79,11 +79,62 @@ test("create falls back to codexCloud.env and defaults attempts to one", async (
   await _internal.makeDriver({ codexCloud: { env: "option" } }, script.cli).create({}, { prompt: "hi" })
   expect(script.calls[0].args).toEqual(["cloud", "exec", "--env", "option", "--attempts", "1", "--", "hi"])
 })
-test("missing environment returns 400 naming both configuration locations without spawning", async () => {
+const stateFile = join(directory, ".codex-global-state.json")
+const cloudState = JSON.stringify({
+  "electron-local-remote-control-environment-id": "env_e_remote_control",
+  "electron-persisted-atom-state": { "cloud-aeon-sidebar-cache-v1": { threads: [
+    { environments: [{ environmentId: "ccarenv_b64_fixture" }] },
+  ] } },
+})
+writeFileSync(stateFile, cloudState)
+
+test("create discovers a cloud environment from Codex state without changing the file", async () => {
+  const script = scripted([reply("task_abc123")])
+  await _internal.makeDriver({}, script.cli, [stateFile]).create({}, { prompt: "hi" })
+  expect(script.calls[0].args[3]).toBe("ccarenv_b64_fixture")
+  expect(readFileSync(stateFile, "utf8")).toBe(cloudState)
+})
+for (const source of ["metadata", "option"]) test(`explicit ${source} environment wins over state discovery`, async () => {
+  const script = scripted([reply("task_abc123")])
+  const options = { codexCloud: { env: "option" } }
+  await _internal.makeDriver(options, script.cli, [stateFile]).create(source === "metadata" ? { metadata: { env: "account" } } : {}, { prompt: "hi" })
+  expect(script.calls[0].args[3]).toBe(source === "metadata" ? "account" : "option")
+})
+test("missing environment names every searched path and configuration location without spawning", async () => {
   const script = scripted([])
-  await expect(_internal.makeDriver({}, script.cli).create({}, { prompt: "hi" })).rejects.toMatchObject({ status: 400, message: expect.stringContaining("metadata.env") })
-  await expect(_internal.makeDriver({}, script.cli).create({}, { prompt: "hi" })).rejects.toThrow("codexCloud.env")
+  const paths = [join(directory, "missing-custom.json"), join(directory, "missing-default.json")]
+  let error
+  try { await _internal.makeDriver({}, script.cli, paths).create({}, { prompt: "hi" }) } catch (caught) { error = caught }
+  expect(error?.status).toBe(400)
+  for (const location of ["metadata.env", "codexCloud.env", ...paths]) expect(error.message).toContain(location)
   expect(script.calls).toHaveLength(0)
+})
+test("sign-in discovers an environment and skips the environment prompt", async () => {
+  const method = makeCodexCloud({}, { ...scripted([reply("Logged in")]), statePaths: [stateFile] }).auth.methods[0]
+  expect(method.prompts).toEqual([])
+  expect(await method.authorize().callback()).toMatchObject({ type: "success", env: "ccarenv_b64_fixture" })
+})
+test("discovery skips corrupt state and never selects a remote-control environment", async () => {
+  const corrupt = join(directory, "corrupt.json")
+  const remoteOnly = join(directory, "remote-only.json")
+  writeFileSync(corrupt, "{")
+  writeFileSync(remoteOnly, JSON.stringify({ "electron-local-remote-control-environment-id": "env_e_remote_only" }))
+  const script = scripted([reply("task_abc123")])
+  await _internal.makeDriver({}, script.cli, [corrupt, remoteOnly, stateFile]).create({}, { prompt: "hi" })
+  expect(script.calls[0].args[3]).toBe("ccarenv_b64_fixture")
+  await expect(_internal.makeDriver({}, scripted([]).cli, [corrupt, remoteOnly]).create({}, { prompt: "hi" })).rejects.toThrow("no cloud task environment")
+  expect(readFileSync(corrupt, "utf8")).toBe("{")
+})
+test("sign-in with configured environment skips the prompt and discovery", async () => {
+  const method = makeCodexCloud({ codexCloud: { env: "configured" } }, { ...scripted([reply("Logged in")]), statePaths: [stateFile] }).auth.methods[0]
+  expect(method.prompts).toEqual([])
+  expect(await method.authorize().callback()).toMatchObject({ type: "success", env: "configured" })
+})
+test("sign-in without discovery reports searched locations after optional blank input", async () => {
+  const path = join(directory, "missing-signin.json")
+  const method = makeCodexCloud({}, { ...scripted([]), statePaths: [path] }).auth.methods[0]
+  expect(method.prompts[0].validate("")).toBeUndefined()
+  expect(await method.authorize({ env: " " }).callback()).toMatchObject({ type: "failed", error: expect.stringContaining(path) })
 })
 test("unparsable create falls back to list then returns 502 carrying CLI output", async () => {
   const script = scripted([reply("submitted opaque output"), reply("task_abc123"), reply("no create identifier", 0, "create diagnostic"), reply("no list identifier")])
@@ -127,9 +178,9 @@ test("sign-in rejects logged-out wording the CLI wrote to stderr", async () => {
 })
 test("oauth sign-in stores only markers and a distinct environment account id", async () => {
   const script = scripted([reply("Logged in using ChatGPT")])
-  const method = makeCodexCloud({}, script).auth.methods[0]
+  const method = makeCodexCloud({}, { ...script, statePaths: [join(directory, "missing.json")] }).auth.methods[0]
   expect(method.type).toBe("oauth")
-  expect(method.prompts[0].validate(" ")).toBe("an environment id is required")
+  expect(method.prompts[0].validate(" ")).toBeUndefined()
   expect(await method.authorize({ env: " fake " }).callback()).toEqual({ type: "success", refresh: "codex-cli", access: "codex-cli", expires: 0, accountId: "env:fake", env: "fake" })
   expect(script.calls[0].options.timeoutMs).toBe(10000)
 })
