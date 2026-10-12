@@ -9,7 +9,7 @@ An installable Magpie package that exposes six vendor cloud-agent services as Op
 - Magpie running this package in its Bun plugin host. The package uses Bun APIs (`Bun.serve`, `bun:ffi`); it does not run under plain Node.
 - `codex-cloud` only: the OpenAI `codex` CLI on PATH, signed in with `codex login` (or `codex login --device-auth` on a headless machine).
 - `grok-bot` only: the Grok Bot desktop app from xAI installed and signed in once (default mechanism); the optional direct mechanism additionally reads the app's own sign-in, only under your explicit authorization.
-- `dots` only: a ChatGPT account that has Dots, and outbound HTTPS for the bundled Cloudflare tunnel.
+- `dots` only: a ChatGPT account that has Dots; app-drive needs the signed-in ChatGPT desktop app with a reachable loopback debug port, while the bundled-tunnel method needs outbound HTTPS.
 
 ## Install
 
@@ -36,26 +36,28 @@ You should see six providers, all `not signed in`. Sign-in methods and static mo
 
 | Provider | Display name | Sign-in | Static models |
 |---|---|---|---|
-| `codex-cloud` | Codex Cloud (codex CLI) | Reuses this machine's `codex` CLI login; asks for an environment id | `cloud-task` |
+| `codex-cloud` | Codex Cloud (codex CLI) | Reuses this machine's `codex` CLI login; discovers the environment id locally unless explicitly configured | `cloud-task` |
 | `codex-agents` | Codex Agents API | OpenAI API key | `gpt-6-astra` |
 | `cursor-cloud` | Cursor Cloud Agents | Cursor user API key (team keys are not supported) | `composer-2`, `claude-sonnet-4-5` |
-| `devin-cloud` | Devin Cloud | Devin API key (`apk_user_…`) | `devin-session` |
-| `dots` | ChatGPT Dot | Bundled tunnel plus a one-time connector paste in ChatGPT | `dot` |
+| `devin-cloud` | Devin Cloud | `devin`: API key (`apk_…`); `codeium`: Codeium / Cognition credential (`cog_…`) | `devin-session` (Devin); Codeium models for `codeium` |
+| `dots` | ChatGPT Dot | Drive the signed-in ChatGPT desktop app (default), or bundled tunnel plus a one-time connector paste | `dot` |
 | `grok-bot` | Grok Bot (xAI desktop) | OAuth auto flows: drive the installed app (default), or direct Connect protocol | `app-bot` |
 
-Remove with `magpie plugin rm <the exact spec you added>`. `dots` and `grok-bot` expose no API-key method; `dots` signs in only through its tunnel setup.
+Remove with `magpie plugin rm <the exact spec you added>`. `dots` and `grok-bot` expose no API-key method; `dots` offers app-drive first (the default) and tunnel setup second.
 
 ## How a turn works
 
 Each provider adapts a Magpie chat request to the vendor's cloud-agent API and returns the vendor's answer as a chat completion. The conversation is folded into one prompt per turn (`lib/transcript.mjs`): system messages first, then the history under `Conversation so far:`, then the latest user text under `Current request:`. Messages beyond a per-message cap are clipped with `[text omitted]`, older history is elided as `[history omitted]` when the fold exceeds `maxPromptBytes`, and image parts are replaced with `[image omitted — this provider takes text only]`. The cap protects system texts and the first/current request: they are never silently dropped, so a conversation that cannot fit fails with HTTP 400 instead.
 
-A session-affinity header `x-magpie-cloud-agents-session` ties follow-up turns to the vendor run or bot transcript from the same session, so a follow-up sends only the new user messages where the vendor supports it. Progress arrives as `reasoning_content` chunks; the final answer is delivered after the vendor run finishes, not streamed token by token from the vendor. When a run produces no usage data, token counts are estimated from text length (characters / 4). Cancellation aborts the vendor call or kills the driven child where the provider supports it.
+A session-affinity header `x-magpie-cloud-agents-session` ties follow-up turns to the vendor run or bot transcript from the same session, so a follow-up sends only the new user messages where the vendor supports it. Progress arrives as `reasoning_content` chunks; providers with cumulative content updates can also deliver progressive answer text, with the authoritative final answer resolved after the vendor run finishes. When a run produces no usage data, token counts are estimated from text length (characters / 4). Cancellation aborts the vendor call or kills the driven child where the provider supports it.
+
+**Driver contract.** A provider's `stream()` cumulative `{content}` updates must be a **prefix-monotone** projection of its final `outcome.text`. A non-prefix (divergent) update stops progressive output and the full authoritative text follows; content counts as activity and resets the run heartbeat. [lib/emulate.mjs](lib/emulate.mjs) is the source of truth.
 
 **Consequence of `tool_call: false`.** These vendors run tools remotely and return prose. An agent that requires a tool-capable model may not offer these providers at all, or may run them without local tools; the cloud agent's own server-side tools are unaffected. Each submitted turn is billable cloud work, and `codex-cloud` starts a new cloud task for every turn — a resend after a terminal verdict can start a second task.
 
 ## Options
 
-Entry functions pass the package's options through to each provider factory (`magpie plugin options <spec> '<json>'`):
+Entry functions pass the package's options through to each provider factory (`magpie plugin options <spec> '<json>'`). No provider validates unknown option keys, so a mistyped `dotsApp` key is silently ignored:
 
 | Option | Default | Effect |
 |---|---|---|
@@ -63,10 +65,15 @@ Entry functions pass the package's options through to each provider factory (`ma
 | `maxRunMinutes` | `30` | Per-run cap; expiry returns HTTP 504 with a rejoin instruction |
 | `maxPromptBytes` | `262144` | Fold cap; see How a turn works |
 | `apiBase` | provider-id map | Override the vendor base URL (used by `codex-agents`, `cursor-cloud`, `devin-cloud`) |
-| `codexCloud.env` / `codexCloud.attempts` | — / `1` | Sign-in environment id fallback / `--attempts` passed to `codex cloud exec` |
+| `codexCloud.env` / `codexCloud.attempts` | — / `1` | Environment id override (after account/input `env`, before discovery) / `--attempts` passed to `codex cloud exec` |
 | `cursorCloud.repos` | — | Repositories sent with agent creation |
 | `devinCloud.maxAcuLimit` | — | `max_acu_limit` sent with session creation; `0` or omitted leaves Devin's default |
-| `codexAgents.environment` | — | `environment` object sent with session creation |
+| `codexAgents.environment` | `{ type: "openai_hosted" }` | `environment` object sent with session creation |
+| `dotsApp.keepAliveMinutes` | `15` | Idle minutes before disconnecting CDP (also stops an adopted orphan managed instance) |
+| `dotsApp.reattachPorts` | `[]` | Additional loopback debug ports to try before ports discovered from app processes |
+| `dotsApp.stableMs` | `3000` | Unchanged-reply interval before app-drive infers completion |
+| `dotsApp.streamIntervalMs` | `250` | Interval between app-drive transcript reads during streaming |
+| `dotsApp.surfaceTimeoutMs` | `15000` | Wait limit for the Dot composer to become available |
 | `dots.taskTtlMinutes` | `30` | How long an unclaimed Dots task stays queued |
 | `dots.tunnelCommand` / `dots.publicUrl` | — | Use your own named tunnel command / fixed public URL instead of a quick tunnel |
 | `grokBot.keepAliveMinutes` | `15` | Idle minutes before Magpie closes an app instance it launched itself |
@@ -81,7 +88,7 @@ Every provider runs at `maxConcurrency: 4`.
 
 The `codex` CLI labels this feature experimental, and so does this package. **Billing:** each turn runs a real Codex Cloud task on the ChatGPT account the CLI is signed in with; spend and quota are governed by OpenAI's own surfaces, which this package does not check.
 
-**Sign in.** `magpie plugin login codex-cloud` reuses the CLI's own login — nothing is typed in; you only paste the environment id from Codex web (Environments). The callback runs `codex login status` to prove the CLI is signed in; a logged-out CLI fails with an instruction to run `codex login`.
+**Sign in.** `magpie plugin login codex-cloud` reuses the CLI's own login and discovers the environment id from local Codex state when none is explicitly configured. The environment-id field is optional and is omitted when a configured value or local discovery is available; if discovery is unavailable, supply the id from Codex web (Environments) or set `codexCloud.env`. Explicit account/input `env` takes precedence over `codexCloud.env`, then local discovery. Only the resolved id is stored; Codex state is never changed. The callback runs `codex login status` to prove the CLI is signed in; a logged-out CLI fails with an instruction to run `codex login`.
 
 **Per turn.** The driver spawns `codex cloud exec --env <env> --attempts <n> -- <prompt>` (CLI calls time out after 30 seconds; the diff fetch after 3, and a timed-out diff leaves the turn running to retry the same task), parses the task reference from the output, and falls back to the environment's newest task when parsing fails — in that case the reply carries the warning `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.` Polling runs `codex cloud status`; a successful state fetches `codex cloud diff` (truncated at 100 KiB). An identical resend reuses the same task; a resend after a failed or expired verdict starts a new one.
 
@@ -113,13 +120,17 @@ The `codex` CLI labels this feature experimental, and so does this package. **Bi
 
 **Billing.** Devin bills in ACUs. This package can send a spend ceiling per session (`devinCloud.maxAcuLimit` → `max_acu_limit`); Devin's ACU rate card is not stated in the API docs this package was built from, and the v1 responses it consumes do not report consumed ACUs — check spend in Devin's own dashboard.
 
-**Sign in.** `magpie plugin login devin-cloud` with a Devin API key (`apk_user_…` from app.devin.ai → Settings → API).
+**Sign in.** `magpie plugin login devin-cloud` offers two methods: `devin` accepts a Devin platform API key (`apk_…`, including `apk_user_…` from app.devin.ai → Settings → API) and uses `https://api.devin.ai`; `codeium` accepts a Codeium / Cognition credential (`cog_…`) and uses Codeium Connect chat. The credential prefix must match the selected method, and the saved credential selects the route per turn. Legacy `devin-session-token$…` tokens are not supported. The ACU billing and session behaviour described here apply to the `devin` method.
 
 **Behaviour.** Sessions are created with the title `magpie: ` plus the first 60 characters of the prompt and tagged `magpie`. A finished session returns the last non-user message, or the structured output, or an explicit no-reply sentence; a blocked session appends `Devin is waiting for input — continue at <url>`, and a pull request link is appended when the session produced one. A follow-up to a suspended session is rejected and re-created fresh, with a `Devin follow-up moved from <old> to <new>` announcement. Expired sessions map to the expired state; 401/403 mark the sign-in expired.
 
 ### dots — ChatGPT Dot (the heaviest provider)
 
-Dots is the heaviest provider in this package, and nothing about it is one-click. It exposes a local MCP listener to the public internet through a bundled Cloudflare quick tunnel: the Dot, running on OpenAI's network, calls this PC to pick up tasks. No OpenAI credential is involved — the plugin never touches your ChatGPT login.
+Dots offers two sign-in methods through `magpie plugin login dots`; app-drive is first and the default.
+
+**Method 1 (default): app-drive.** Magpie attaches to the already-signed-in ChatGPT desktop app over an existing loopback-only debug port. It does not launch another app or copy your profile. No MCP connector, bearer token, developer mode or tunnel is needed when that endpoint is available. If unavailable, choose bundled-tunnel sign-in or use `--remote-debugging-port=9333 --remote-debugging-address=127.0.0.1` on your next normal app launch; debugging cannot be enabled in an already-running instance. A hidden renderer works, but the process must remain alive. Reply text can arrive progressively; completion is inferred after `dotsApp.stableMs` (`3000` ms by default) of unchanged text, so a longer pause mid-answer can truncate the result. Increase that option to lengthen the interval.
+
+**Method 2: bundled tunnel.** The remaining setup, limits and troubleshooting below apply to this method. It exposes a local MCP listener to the public internet through a bundled Cloudflare quick tunnel: the Dot, running on OpenAI's network, calls this PC to pick up tasks. No OpenAI credential is involved — the plugin never touches your ChatGPT login.
 
 **What runs on this machine.** A loopback-only MCP server (bound to `127.0.0.1`, never `0.0.0.0`) speaks JSON-RPC over `POST /mcp` and publishes exactly four tools: `list_tasks`, `claim_task`, `complete_task`, `release_task`. It mints a 192-bit bearer token shown to you exactly once, answers 401 to unauthenticated calls and 404 to every non-MCP route, caps bodies at 256 KiB, rate-limits per IP, and times requests out after 30 seconds. Outbound webhook delivery verifies the callback URL (HTTPS, public address, no redirects) before a subscription is stored. The bundled `cloudflared` quick tunnel (version-pinned 2026.10.0, SHA-256 verified against Cloudflare's published digest) forwards a public `*.trycloudflare.com` URL to that loopback port; on first sign-in the binary is downloaded from Cloudflare's GitHub releases into the plugin state directory (`~/.config/magpie/cloud-agents/dots/`, or `XDG_CONFIG_HOME`).
 
@@ -239,7 +250,7 @@ Everything below is unverified, stated plainly. None of it was tested, and nothi
 - Magpie 以 Bun 插件宿主运行本包。包内使用了 Bun 专属 API（`Bun.serve`、`bun:ffi`），不能在纯 Node 下运行。
 - 仅 `codex-cloud`：PATH 上装有 OpenAI `codex` CLI，并已用 `codex login` 登录（无界面机器用 `codex login --device-auth`）。
 - 仅 `grok-bot`：已安装并登录过一次 xAI 的 Grok Bot 桌面应用（默认机制）；可选的直连机制还会读取应用自身的登录态，且仅在你的明确授权下进行。
-- 仅 `dots`：一个开通了 Dots 的 ChatGPT 账号，以及供内置 Cloudflare 隧道使用的出站 HTTPS。
+- 仅 `dots`：一个开通了 Dots 的 ChatGPT 账号；app-drive 需要已登录且有可达环回调试端口的 ChatGPT 桌面应用，内置隧道方式则需要出站 HTTPS。
 
 ### 安装
 
@@ -266,26 +277,28 @@ magpie plugin list
 
 | Provider | 显示名 | 登录方式 | 静态模型 |
 |---|---|---|---|
-| `codex-cloud` | Codex Cloud (codex CLI) | 复用本机 `codex` CLI 登录；询问 environment id | `cloud-task` |
+| `codex-cloud` | Codex Cloud (codex CLI) | 复用本机 `codex` CLI 登录；未显式配置时从本地发现 environment id | `cloud-task` |
 | `codex-agents` | Codex Agents API | OpenAI API key | `gpt-6-astra` |
 | `cursor-cloud` | Cursor Cloud Agents | Cursor 用户 API key（不支持团队 key） | `composer-2`、`claude-sonnet-4-5` |
-| `devin-cloud` | Devin Cloud | Devin API key（`apk_user_…`） | `devin-session` |
-| `dots` | ChatGPT Dot | 内置隧道加一次性 ChatGPT 连接器配置 | `dot` |
+| `devin-cloud` | Devin Cloud | `devin`：API key（`apk_…`）；`codeium`：Codeium / Cognition 凭据（`cog_…`） | `devin-session`（Devin）；`codeium` 使用 Codeium 模型 |
+| `dots` | ChatGPT Dot | 驱动已登录的 ChatGPT 桌面应用（默认），或内置隧道加一次性连接器配置 | `dot` |
 | `grok-bot` | Grok Bot (xAI desktop) | OAuth 自动流程：驱动已装应用（默认）或直连 Connect 协议 | `app-bot` |
 
-卸载使用 `magpie plugin rm <你添加时输入的原样 spec>`。`dots` 与 `grok-bot` 没有 API-key 登录方式；`dots` 只能通过隧道设置流程登录。
+卸载使用 `magpie plugin rm <你添加时输入的原样 spec>`。`dots` 与 `grok-bot` 没有 API-key 登录方式；`dots` 首先提供 app-drive（默认），其次是隧道设置流程。
 
 ### 一次对话轮次如何运行
 
 每个 provider 把 Magpie 的 chat 请求适配到厂商的云端 agent API，并把厂商的答复作为 chat completion 返回。整个对话按轮折叠成一条提示词（`lib/transcript.mjs`）：system 消息在最前，随后是 `Conversation so far:` 下的历史，最后是 `Current request:` 下的最新用户文本。超出单条上限的消息以 `[text omitted]` 截断；折叠总长超过 `maxPromptBytes` 时，较旧的历史以 `[history omitted]` 省略；图片部分替换为 `[image omitted — this provider takes text only]`。上限保护 system 文本与首条/当前请求：它们绝不会被悄悄丢弃，因此放不下的对话会直接返回 HTTP 400。
 
-会话亲和头 `x-magpie-cloud-agents-session` 把后续轮次绑定到同一会话对应的厂商运行或 bot 记录，厂商支持时后续轮只发送新增的用户消息。进度以 `reasoning_content` 分块呈现；最终答复在厂商运行结束后一次性送达，并不是从厂商逐 token 流式返回。运行没有用量数据时，token 数按文本长度估算（字符数 / 4）。取消操作会中止厂商调用，或在 provider 支持时结束被驱动的子进程。
+会话亲和头 `x-magpie-cloud-agents-session` 把后续轮次绑定到同一会话对应的厂商运行或 bot 记录，厂商支持时后续轮只发送新增的用户消息。进度以 `reasoning_content` 分块呈现；提供累积内容更新的 provider 还可以渐进输出答复文本，权威的最终答复在厂商运行结束后确定。运行没有用量数据时，token 数按文本长度估算（字符数 / 4）。取消操作会中止厂商调用，或在 provider 支持时结束被驱动的子进程。
+
+**驱动器契约。** provider 的 `stream()` 累积 `{content}` 更新必须是最终 `outcome.text` 的**前缀单调（prefix-monotone）**投影。非前缀（分歧）更新会停止渐进输出，随后送达完整的权威文本；内容输出计为活动并重置运行心跳。以 [lib/emulate.mjs](lib/emulate.mjs) 为准。
 
 **`tool_call: false` 的后果。** 这些厂商在远端执行工具、只返回文本。要求具备工具调用模型的 agent 可能不会提供这些 provider，也可能在没有本地工具的情况下运行；云端 agent 自身的服务端工具不受影响。每一轮提交都是计费云工作，`codex-cloud` 每一轮都会启动一个新的云任务——在终局判定之后重发可能启动第二个任务。
 
 ### 选项
 
-入口函数把包选项透传给各 provider 工厂（`magpie plugin options <spec> '<json>'`）：
+入口函数把包选项透传给各 provider 工厂（`magpie plugin options <spec> '<json>'`）。所有 provider 都不校验未知选项键，因此拼错的 `dotsApp` 键会被静默忽略：
 
 | 选项 | 默认 | 作用 |
 |---|---|---|
@@ -293,10 +306,15 @@ magpie plugin list
 | `maxRunMinutes` | `30` | 单次运行上限；超时返回 HTTP 504 并附重连指引 |
 | `maxPromptBytes` | `262144` | 折叠上限；见上一节 |
 | `apiBase` | 按 provider 的映射 | 覆盖厂商基础 URL（`codex-agents`、`cursor-cloud`、`devin-cloud` 使用） |
-| `codexCloud.env` / `codexCloud.attempts` | — / `1` | 登录 environment id 兜底 / 传给 `codex cloud exec` 的 `--attempts` |
+| `codexCloud.env` / `codexCloud.attempts` | — / `1` | environment id 显式配置（在账号/输入 `env` 之后、本地发现之前） / 传给 `codex cloud exec` 的 `--attempts` |
 | `cursorCloud.repos` | — | 创建 agent 时携带的仓库 |
 | `devinCloud.maxAcuLimit` | — | 创建会话时发送的 `max_acu_limit`；`0` 或缺省沿用 Devin 默认 |
-| `codexAgents.environment` | — | 创建会话时发送的 `environment` 对象 |
+| `codexAgents.environment` | `{ type: "openai_hosted" }` | 创建会话时发送的 `environment` 对象 |
+| `dotsApp.keepAliveMinutes` | `15` | 空闲多少分钟后断开 CDP（也会停止接管的孤立托管实例） |
+| `dotsApp.reattachPorts` | `[]` | 在应用进程发现的端口之前尝试的额外环回调试端口 |
+| `dotsApp.stableMs` | `3000` | app-drive 推断完成前要求答复文本保持不变的时长 |
+| `dotsApp.streamIntervalMs` | `250` | app-drive 流式输出期间读取对话记录的间隔 |
+| `dotsApp.surfaceTimeoutMs` | `15000` | 等待 Dot 输入框可用的时限 |
 | `dots.taskTtlMinutes` | `30` | 未被认领的 Dots 任务在队列中保留的时长 |
 | `dots.tunnelCommand` / `dots.publicUrl` | — | 改用自己的命名隧道命令 / 固定公网 URL，替代快速隧道 |
 | `grokBot.keepAliveMinutes` | `15` | Magpie 自行启动的应用实例在空闲多少分钟后被关闭 |
@@ -311,7 +329,7 @@ magpie plugin list
 
 `codex` CLI 将此功能标记为实验性，本包同样如此。**计费：** 每一轮都在 CLI 登录的 ChatGPT 账号上运行真实的 Codex Cloud 任务；花费与配额由 OpenAI 自己的面板管理，本包不做校验。
 
-**登录。** `magpie plugin login codex-cloud` 复用 CLI 自身的登录——无需输入任何内容；你只需粘贴 Codex 网页（Environments）中的 environment id。回调会运行 `codex login status` 证明 CLI 已登录；CLI 未登录时失败并提示运行 `codex login`。
+**登录。** `magpie plugin login codex-cloud` 复用 CLI 自身的登录；未显式配置 environment id 时，从本地 Codex 状态中发现。environment id 输入框是可选的，已有配置值或能从本地发现时不显示；无法发现时，可填写 Codex 网页（Environments）中的 id，或设置 `codexCloud.env`。显式的账号/输入 `env` 优先于 `codexCloud.env`，最后才是本地发现。只保存解析出的 id，绝不修改 Codex 状态。回调会运行 `codex login status` 证明 CLI 已登录；CLI 未登录时失败并提示运行 `codex login`。
 
 **每轮行为。** 驱动器启动 `codex cloud exec --env <env> --attempts <n> -- <prompt>`（CLI 调用 30 秒超时；diff 拉取 3 秒，超时的 diff 会让该轮保持运行以便重试同一任务），从输出解析任务引用；解析失败时回退为该环境的最新任务——此时回复会带上警告 `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.`（任务引用由环境最新任务推断；归属未验证，可能是其他会话的工作）。轮询运行 `codex cloud status`；成功状态会拉取 `codex cloud diff`（100 KiB 处截断）。完全相同的重发会复用同一任务；失败或过期判定后的重发会启动新任务。
 
@@ -343,13 +361,17 @@ magpie plugin list
 
 **计费。** Devin 按 ACU 计费。本包可以随会话发送消费上限（`devinCloud.maxAcuLimit` → `max_acu_limit`）；本包所依据的 API 文档没有给出 ACU 费率表，且其消费的 v1 响应不回报已消耗 ACU——请在 Devin 自己的面板核对花费。
 
-**登录。** `magpie plugin login devin-cloud`，使用 Devin API key（`apk_user_…`，来自 app.devin.ai → Settings → API）。
+**登录。** `magpie plugin login devin-cloud` 提供两种方式：`devin` 接受 Devin 平台 API key（`apk_…`，包括来自 app.devin.ai → Settings → API 的 `apk_user_…`），访问 `https://api.devin.ai`；`codeium` 接受 Codeium / Cognition 凭据（`cog_…`），访问 Codeium Connect chat。凭据前缀必须匹配所选方式，每轮按已保存的凭据选择路由。不支持旧的 `devin-session-token$…` token。本节的 ACU 计费与会话行为说明适用于 `devin` 方式。
 
 **行为。** 会话以 `magpie: ` 加提示词前 60 字符为标题创建，并打上 `magpie` 标签。完成的会话返回最后一条非用户消息，或结构化输出，或明确的未答复说明；blocked 会话追加 `Devin is waiting for input — continue at <url>`；会话产出 PR 时附上链接。对已挂起会话的追加消息会被拒绝并重新创建新会话，并广播 `Devin follow-up moved from <old> to <new>`。过期会话映射为 expired 状态；401/403 将登录标记为过期。
 
 #### dots —— ChatGPT Dot（最重的 provider）
 
-Dots 是本包中最重的 provider，完全不是一键式。它通过内置的 Cloudflare 快速隧道把一个本地 MCP 监听端暴露到公网：运行在 OpenAI 网络上的 Dot 会回调这台电脑来领取任务。不涉及任何 OpenAI 凭据——插件绝不触碰你的 ChatGPT 登录。
+Dots 通过 `magpie plugin login dots` 提供两种登录方式；app-drive 排在第一位，也是默认方式。
+
+**方式一（默认）：app-drive。** Magpie 经已有的仅环回调试端口附着到已登录的 ChatGPT 桌面应用，不启动另一个应用，也不复制你的配置。端点可用时，无需 MCP 连接器、bearer token、开发者模式或隧道。端点不可用时，可选择内置隧道登录，或在下次正常启动应用时加上 `--remote-debugging-port=9333 --remote-debugging-address=127.0.0.1`；无法为已经运行的实例启用调试。隐藏的渲染器也能工作，但进程必须保持存活。答复文本可以渐进送达；文本保持不变达到 `dotsApp.stableMs`（默认 `3000` 毫秒）后会被推断为完成，因此回答中途更长的停顿可能导致结果被截断。调大该选项可以延长等待间隔。
+
+**方式二：内置隧道。** 下文其余设置、限制与故障排查适用于此方式。它通过内置的 Cloudflare 快速隧道把一个本地 MCP 监听端暴露到公网：运行在 OpenAI 网络上的 Dot 会回调这台电脑来领取任务。不涉及任何 OpenAI 凭据——插件绝不触碰你的 ChatGPT 登录。
 
 **本机上运行什么。** 一个仅绑定 `127.0.0.1`（绝不绑定 `0.0.0.0`）的环回 MCP 服务器，经 `POST /mcp` 说 JSON-RPC，只发布四个工具：`list_tasks`、`claim_task`、`complete_task`、`release_task`。它铸造一个仅向你展示一次的 192 位 bearer token，对未认证调用返回 401、对一切非 MCP 路由返回 404，请求体上限 256 KiB，按 IP 限流，请求 30 秒超时。出站 webhook 在订阅入库前会校验回调地址（HTTPS、公网地址、不跟随重定向）。内置的 `cloudflared` 快速隧道（版本锁定 2026.10.0，SHA-256 与 Cloudflare 公布摘要一致）把公网 `*.trycloudflare.com` URL 转发到该环回端口；首次登录时会从 Cloudflare 的 GitHub releases 下载二进制，存入插件状态目录（`~/.config/magpie/cloud-agents/dots/`，或 `XDG_CONFIG_HOME`）。
 
