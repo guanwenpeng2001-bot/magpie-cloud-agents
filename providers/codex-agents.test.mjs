@@ -39,7 +39,7 @@ test("create sends the Agents contract and returns the fake answer through chat"
   expect(headers.get("openai-beta")).toBe("agents=v1")
   expect(headers.get("idempotency-key")).toMatch(/^[0-9a-f]{64}$/)
   expect(server.requests).toEqual([
-    { method: "POST", path: "/openai/v1/agents/sessions", body: { agent: { model: "gpt-6-astra" }, input: [{ role: "user", content: [{ type: "input_text", text: "Current request:\nHello cloud" }] }] } },
+    { method: "POST", path: "/openai/v1/agents/sessions", body: { agent: { model: "gpt-6-astra" }, input: [{ role: "user", content: [{ type: "input_text", text: "Current request:\nHello cloud" }] }], environment: { type: "openai_hosted" } } },
     { method: "GET", path: "/openai/v1/agents/sessions/session_1/events", body: undefined },
     { method: "GET", path: "/openai/v1/agents/sessions/session_1/turns/turn_synthetic/items", body: undefined },
   ])
@@ -463,8 +463,15 @@ test.each(["unrelated", "gpt-6-sol"])("R5 configured model survives populated li
   expect(models["gpt-6-astra"]).toBeDefined()
   if (id === "gpt-6-sol") expect(models[id]).toBeDefined()
 })
-test("environment opt-in and folded system instructions are retained", async () => {
-  const environment = { type: "openai_hosted" }
+test("create sends a default hosted environment without operator configuration", async () => {
+  const { server, request } = await setup()
+  await request()
+  expect(server.requests[0].body.environment).toEqual({ type: "openai_hosted" })
+  expect(server.requests[0].body.agent).toEqual({ model: "gpt-6-astra" })
+  expect(server.requests[0].body.input[0].content[0].text).toContain("Hello cloud")
+})
+test("operator-supplied environment overrides the default, and folded system instructions are retained", async () => {
+  const environment = { type: "operator_custom" }
   const { server, request } = await setup(undefined, { codexAgents: { environment } })
   await request({ messages: [{ role: "system", content: "Always be precise" }, ...messages] })
   expect(server.requests[0].body.environment).toEqual(environment)

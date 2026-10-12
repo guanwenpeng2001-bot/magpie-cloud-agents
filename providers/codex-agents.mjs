@@ -98,7 +98,7 @@ function makeDriver(options) {
     },
     async create(cred, { model, prompt, identity }, signal) {
       const key = hash([hash(cred.key), identity.sessionKey, identity.turnIndex, identity.textsHash])
-      const session = await (await request(cred, "/agents/sessions", { signal, key, body: { agent: { model }, input: inputOf([prompt]), ...(options.codexAgents?.environment ? { environment: options.codexAgents.environment } : {}) } })).json()
+      const session = await (await request(cred, "/agents/sessions", { signal, key, body: { agent: { model }, input: inputOf([prompt]), environment: options.codexAgents?.environment ?? { type: "openai_hosted" } } })).json()
       if (typeof session?.id !== "string" || !session.id) throw chatError(502, "Agents API returned no session id")
       return { ref: session.id, identity, submissionKey: key }
     },
