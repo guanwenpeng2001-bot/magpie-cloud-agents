@@ -213,10 +213,11 @@ function makeDriver(options) {
     async liveModels(credential, signal) {
       try {
         const data = await json(credential, "/v1/models", { signal })
-        const rows = Array.isArray(data) ? data : Array.isArray(data?.models) ? data.models : []
+        const rows = Array.isArray(data) ? data : Array.isArray(data?.models) ? data.models : Array.isArray(data?.items) ? data.items : []
         const models = Object.fromEntries(rows.flatMap(row => {
           const id = [row?.id, row?.model, row?.name].find(value => typeof value === "string" && value)
-          return id ? [[id, { ...MODELS[id], id, tool_call: false, reasoning: false, name: typeof row.name === "string" && row.name ? row.name : id, capabilities: { toolcall: false, reasoning: false } }]] : []
+          const displayName = [row?.name, row?.displayName].find(value => typeof value === "string" && value)
+          return id ? [[id, { ...MODELS[id], id, tool_call: false, reasoning: false, name: displayName ?? id, capabilities: { toolcall: false, reasoning: false } }]] : []
         }))
         return Object.keys(models).length ? models : null
       } catch (error) {
