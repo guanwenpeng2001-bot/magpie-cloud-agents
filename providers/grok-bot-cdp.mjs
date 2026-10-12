@@ -3,6 +3,7 @@ import { access } from "node:fs/promises"
 import { spawn, execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { win32 } from "node:path"
+import { tmpdir } from "node:os"
 import { createServer } from "node:net"
 import { chatError } from "../lib/errors.mjs"
 import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
@@ -10,7 +11,7 @@ import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
 export const CDP_ERRORS = {
   missing: "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry",
   signedOut: "Grok Bot desktop isn't signed in — open it and sign in once; Magpie will drive it after that",
-  running: "Grok Bot is already running and Magpie can't attach to it — close Grok Bot (or pick the direct-protocol sign-in) and retry",
+  running: "Magpie couldn't start its own Grok Bot instance — the launch exited before its debug interface opened; retry the sign-in",
   fallback: "Grok Bot updated and its automation bridge changed — falling back to UI input; if this repeats, the provider needs an update",
   changed: "Grok Bot changed its UI; the provider needs an update",
   crashed: "Grok Bot closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
@@ -176,7 +177,6 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     const previous = await runningProcesses()
     const attached = await reattach(previous)
     if (attached) attached.client.close()
-    else if (previous.length) throw failure("running")
   }
   async function start(signal) {
     const executable = await findGrokBot(deps)
@@ -193,9 +193,16 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
       return client
     }
     const port = await deps.freePort()
-    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-grok-managed=${process.pid}:${randomUUID()}`], { stdio: "ignore", windowsHide: false })
+    const managedTag = `${process.pid}:${randomUUID()}`
+    const userDataDir = win32.join(deps.env.LOCALAPPDATA || tmpdir(), "Magpie", "grok-bot-managed-profile")
+    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-grok-managed=${managedTag}`, `--user-data-dir=${userDataDir}`], { stdio: "ignore", windowsHide: false })
     child.once?.("error", () => launchErrors.add(child))
-    if (!previous.length) owned = child
+    owned = { exitCode: null, kill: () => {
+      void deps.processes().then(rows => {
+        const row = rows.find(current => current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
+        if (row) return deps.stopManaged(row)
+      }).catch(() => {})
+    } }
     const started = timers.now()
     while (timers.now() - started < (options.launchTimeoutMs ?? 10000)) {
       signal?.throwIfAborted()
