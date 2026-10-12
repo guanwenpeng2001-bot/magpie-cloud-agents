@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { access } from "node:fs/promises"
-import { execFile } from "node:child_process"
+import { spawn, execFile } from "node:child_process"
 import { promisify } from "node:util"
+import { createServer } from "node:net"
 import { win32 } from "node:path"
 import { chatError } from "../lib/errors.mjs"
 import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
@@ -9,17 +10,27 @@ import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
 export const DOTS_APP_ERRORS = {
   missing: "ChatGPT desktop isn't installed — install the OpenAI ChatGPT app from the Microsoft Store and sign in once, then retry",
   signedOut: "ChatGPT desktop isn't signed in — open it and sign in once; Magpie will drive the Dot after that",
-  running: "ChatGPT has no reachable loopback debug port. App-drive attaches to an already signed-in ChatGPT started with --remote-debugging-port=9333 --remote-debugging-address=127.0.0.1; it cannot enable debugging in a running instance or launch an isolated signed-in copy. Use the bundled-tunnel sign-in, or enable those flags on your next normal app launch.",
+  running: "ChatGPT is already running without a debug port, so Magpie's launch handed off to that instance and no debug interface opened. Quit the running ChatGPT and retry — Magpie will start it with debugging on its own. The bundled-tunnel sign-in also still works.",
+  launch: "Magpie launched the ChatGPT desktop app but it exited immediately without opening a debug port — open ChatGPT once manually to check for an error dialog, then retry; the bundled-tunnel sign-in also still works",
   changed: "ChatGPT changed its UI; the dots provider needs an update",
   crashed: "ChatGPT closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
   reset: "The Dot conversation was reset — asking again sends it as a new task",
   debug: "ChatGPT didn't open its debug interface — another security tool may be blocking it",
 }
 const failure = key => chatError(key === "signedOut" ? 401 : key === "running" ? 409 : 502, DOTS_APP_ERRORS[key])
+const launchFailed = reason => chatError(502, `Magpie failed to start the ChatGPT desktop app (${reason}) — install or repair the OpenAI ChatGPT app and retry; the bundled-tunnel sign-in also still works`)
 const execute = promisify(execFile)
 
 const SHELL_PAGE = "app://-/index.html"
 const DOTS_ROUTE = "app://-/index.html?initialRoute=%2Fdots"
+
+async function freePort() {
+  const server = createServer()
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve) })
+  const port = server.address().port
+  await new Promise(resolve => server.close(resolve))
+  return port
+}
 
 async function processes() {
   const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().Ticks.ToString()}}) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
@@ -129,7 +140,7 @@ const CLEAR_KEYS = [
 ]
 
 export function createDotsApp(options = {}, dependencies = options.dependencies ?? {}) {
-  const deps = { env: process.env, processes, parentAlive, stopManaged, exists: path => access(path).then(() => true, () => false), appx: readAppxLocations, fetch: globalThis.fetch, timers: clock, connect: connectCdp, ...dependencies }
+  const deps = { env: process.env, processes, parentAlive, stopManaged, exists: path => access(path).then(() => true, () => false), appx: readAppxLocations, fetch: globalThis.fetch, timers: clock, connect: connectCdp, spawn, freePort, ...dependencies }
   const timers = deps.timers
   let connection, connecting, owned, idleTimer
   const active = new Map()
@@ -191,6 +202,38 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
       }).catch(() => {})
     } }
   }
+  async function launch(executable, previous, signal) {
+    // No --user-data-dir on purpose: the ChatGPT app cannot be signed in on a fresh profile,
+    // so a separate profile would produce a signed-OUT instance. The app's own profile is the
+    // only signed-in one, and is required for the Dot to be usable.
+    const port = await deps.freePort()
+    const managedTag = `${process.pid}:${randomUUID()}`
+    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-dots-managed=${managedTag}`], { stdio: "ignore", windowsHide: false })
+    const spawnErrors = new Set()
+    child.once?.("error", error => spawnErrors.add(error))
+    owned = { exitCode: null, kill: () => {
+      void deps.processes().then(rows => {
+        const row = rows.find(current => current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
+        if (row) return deps.stopManaged(row)
+      }).catch(() => {})
+    } }
+    const started = timers.now()
+    while (timers.now() - started < (options.launchTimeoutMs ?? 10000)) {
+      signal?.throwIfAborted()
+      if (await version(port, signal)) return { port, client: await attach(port, signal) }
+      if (spawnErrors.size) throw launchFailed([...spawnErrors][0].message)
+      if (child.exitCode != null) break
+      await sleep(200, signal, timers)
+    }
+    if (child.exitCode != null) {
+      // A single-instance app hands the second launch off to the existing instance and ignores
+      // the debug flags, so an exit alongside a pre-existing instance means the user's ChatGPT
+      // is running normally without a port; never escalate to killing it.
+      if (previous.length) throw failure("running")
+      throw failure("launch")
+    }
+    throw failure("debug")
+  }
   async function start(signal) {
     const executable = await findChatGptApp(deps)
     const previous = await runningProcesses()
@@ -199,7 +242,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
       await adopt(previous, attached.port, executable)
       return attached.client
     }
-    throw failure("running")
+    return (await launch(executable, previous, signal)).client
   }
   async function ensure(signal) {
     touch()
@@ -301,7 +344,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
   return {
     id: "dots", name: "ChatGPT Dot (app-drive)",
     async authorize() {
-      return { url: "", method: "auto", instructions: `Magpie attaches to the signed-in ChatGPT desktop app over an existing loopback-only debug port. It does not launch another app or copy your profile. No MCP connector, bearer token, developer mode or tunnel is needed when that endpoint is available. If unavailable, choose bundled-tunnel sign-in or use --remote-debugging-port=9333 --remote-debugging-address=127.0.0.1 on your next normal app launch. A hidden renderer works; the process must remain alive. Completion is inferred after ${options.stableMs ?? 3000} ms of unchanged reply text; a longer pause mid-answer can truncate the result. Configure dotsApp.stableMs to increase that interval.`, callback: async () => {
+      return { url: "", method: "auto", instructions: `Magpie finds the installed ChatGPT desktop app and, when no loopback debug endpoint is reachable, launches it itself with its normal signed-in profile and a loopback-only debug port, then attaches; an app already started with a debug port is used as-is. If ChatGPT is already running without a debug port, quit it first so Magpie's launch can take effect. No MCP connector, bearer token, developer mode or tunnel is needed. A hidden renderer works; the process must remain alive. Completion is inferred after ${options.stableMs ?? 3000} ms of unchanged reply text; a longer pause mid-answer can truncate the result. Configure dotsApp.stableMs to increase that interval.`, callback: async () => {
         try { await checkDrivable(); return { type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
