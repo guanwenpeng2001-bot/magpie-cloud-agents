@@ -477,3 +477,136 @@ test("operator-supplied environment overrides the default, and folded system ins
   expect(server.requests[0].body.environment).toEqual(environment)
   expect(server.requests[0].body.input[0].content[0].text).toStartWith("Always be precise")
 })
+
+// Fixtures transcribed field-for-field from the live capture in
+// runs/cloud-agent-providers/evidence/live-acceptance-sweep/probe-agents-events.txt
+// (event stream frames 1-3 and the turns row of the same session). The captured
+// turn.failed frame is cut mid-frame by the probe's 900-character display slice, at
+// its top-level "usage" field; the fixture closes the JSON at exactly that point and
+// omits nothing the capture shows.
+const QUOTA_MESSAGE = "Your organization has reached a usage or billing limit. Review your plan, usage limits, and billing settings at https://platform.openai.com/settings/organization/billing/ before retrying."
+const capturedItemAdded = {
+  type: "agent.session.turn.item.added",
+  event_id: "evt_71da07b78c694024b6f3555dcc1c628946f6122825b04c63b0",
+  session_id: "sess_063e450924a7fd88006acc77f052f88198ac9381c48610e69c",
+  turn_id: "turn_063e450924a7fd88006acc77f44c7c8198902f6198f5d92db0",
+  output_index: null,
+  item: {
+    type: "message",
+    id: "msg_b8577f1f922e13c3c1107c03bc220cbd531952dbf0d32ae45d",
+    turn_id: "turn_063e450924a7fd88006acc77f44c7c8198902f6198f5d92db0",
+    role: "user",
+    content: [{ type: "input_text", text: "Say hello in one short sentence." }],
+    status: "completed",
+    phase: null,
+  },
+}
+const capturedError = {
+  type: "error",
+  event_id: "evt_ce31f2b8089f415c98dd8d73f9e6c72022b39c7a356c4daca3",
+  session_id: "sess_063e450924a7fd88006acc77f052f88198ac9381c48610e69c",
+  error: { type: "insufficient_quota", code: "usage_limit_exceeded", message: QUOTA_MESSAGE, param: null },
+}
+const capturedTurnFailed = {
+  type: "agent.session.turn.failed",
+  event_id: "evt_e949601b20dd4fd4a881cfec946e9a7b0de68c337d3d4790b6",
+  session_id: "sess_063e450924a7fd88006acc77f052f88198ac9381c48610e69c",
+  turn_id: "turn_063e450924a7fd88006acc77f44c7c8198902f6198f5d92db0",
+  turn: {
+    id: "turn_063e450924a7fd88006acc77f44c7c8198902f6198f5d92db0",
+    object: "agent.session.turn",
+    session_id: "sess_063e450924a7fd88006acc77f052f88198ac9381c48610e69c",
+    agent_id: "agent_8747f18e98d44c058a7a0494b84f9340574daa9c8dad4aa393",
+    subagent_id: null,
+    status: "failed",
+    created_at: 1791784947,
+    started_at: 1791784947,
+    completed_at: 1791784948,
+    error: { code: "usage_limit_exceeded", message: QUOTA_MESSAGE },
+    usage: null,
+  },
+}
+const capturedTurnRow = {
+  id: "turn_063e450924a7fd88006acc77f44c7c8198902f6198f5d92db0",
+  object: "agent.session.turn",
+  session_id: "sess_063e450924a7fd88006acc77f052f88198ac9381c48610e69c",
+  agent_id: "agent_8747f18e98d44c058a7a0494b84f9340574daa9c8dad4aa393",
+  subagent_id: null,
+  status: "failed",
+  created_at: 1791784947,
+  started_at: 1791784947,
+  completed_at: 1791784948,
+  error: { code: "usage_limit_exceeded", message: QUOTA_MESSAGE },
+  usage: null,
+}
+const frame = (name, data) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`
+const streamOf = frames => new Response(frames.join(""), { headers: { "Content-Type": "text/event-stream" } })
+
+test("captured quota failure surfaces the vendor's own cause", async () => {
+  const { request } = await setup(({ url }) => url.pathname.endsWith("/events") ? streamOf([
+    frame("agent.session.turn.item.added", capturedItemAdded),
+    frame("error", capturedError),
+    frame("agent.session.turn.failed", capturedTurnFailed),
+  ]) : undefined)
+  const response = await request()
+  const body = await response.json()
+  expect(response.status).toBe(502)
+  expect(body.error.message).toContain("agent.session.turn.failed")
+  expect(body.error.message).toContain("usage_limit_exceeded")
+  expect(body.error.message).toContain(QUOTA_MESSAGE)
+})
+test("failed turn carrying no error object anywhere still reports the event type, not undefined", async () => {
+  const { request } = await setup(({ url }) => url.pathname.endsWith("/events") ? streamOf([
+    frame("agent.session.turn.failed", {
+      type: "agent.session.turn.failed",
+      event_id: "evt_no_cause_anywhere",
+      session_id: "sess_063e450924a7fd88006acc77f052f88198ac9381c48610e69c",
+      turn_id: "turn_063e450924a7fd88006acc77f44c7c8198902f6198f5d92db0",
+      turn: { id: "turn_063e450924a7fd88006acc77f44c7c8198902f6198f5d92db0", object: "agent.session.turn", status: "failed", created_at: 1791784947, started_at: 1791784947, completed_at: 1791784948, usage: null },
+    }),
+  ]) : undefined)
+  const response = await request()
+  const body = await response.json()
+  expect(response.status).toBe(502)
+  expect(body.error.message).toContain("agent.session.turn.failed")
+  expect(body.error.message).not.toContain("undefined")
+})
+test("captured item payload flows as content and the error cause reaches progress, while the user echo does not", async () => {
+  const { request } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return streamOf([
+      frame("agent.session.turn.item.added", capturedItemAdded),
+      frame("error", capturedError),
+      frame("agent.session.turn.completed", { type: "agent.session.turn.completed", turn_id: "turn_synthetic" }),
+    ])
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Hello there in one short sentence." }] }] })
+  })
+  const response = await request({ stream: true })
+  const text = await response.text()
+  expect(text).not.toContain("Say hello in one short sentence.")
+  expect(text).toContain("usage_limit_exceeded")
+  expect(text).toContain(QUOTA_MESSAGE)
+  expect(text).toContain("Hello there in one short sentence.")
+})
+test("an assistant message item carried by the stream becomes answer content", async () => {
+  const { request } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return streamOf([
+      frame("agent.session.turn.item.added", { ...capturedItemAdded, item: { ...capturedItemAdded.item, id: "msg_b8577f1f922e13c3c1107c03bc220cbd531952dbf0d32ae45e", role: "assistant", content: [{ type: "output_text", text: "Hello there." }] } }),
+      frame("agent.session.turn.completed", { type: "agent.session.turn.completed", turn_id: "turn_synthetic" }),
+    ])
+    if (url.pathname.endsWith("/items")) return Response.json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Synthetic OpenAI answer" }] }] })
+  })
+  const response = await request({ stream: true })
+  const text = await response.text()
+  expect(text).toContain("Hello there.")
+  expect(text).toContain("Synthetic OpenAI answer")
+})
+test("poll surfaces the captured turn row's own error cause", async () => {
+  const { server } = await setup(({ url }) => {
+    if (url.pathname.endsWith("/events")) return new Response("")
+    if (url.pathname.endsWith("/turns")) return Response.json({ object: "list", data: [capturedTurnRow], first_id: capturedTurnRow.id, last_id: capturedTurnRow.id, has_more: false })
+  })
+  const result = await _internal.makeDriver({ apiBase: { "codex-agents": server.url + "/openai" } }).poll(auth, { ref: "sess_063e450924a7fd88006acc77f052f88198ac9381c48610e69c" })
+  expect(result.state).toBe("failed")
+  expect(result.progress).toContain("usage_limit_exceeded")
+  expect(result.progress).toContain(QUOTA_MESSAGE)
+})
