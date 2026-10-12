@@ -4,6 +4,7 @@ import { SESSION_HEADER, sessionOf } from "../lib/sessions.mjs"
 import { DotsQueue, mintToken } from "./dots-queue.mjs"
 import { startMcp } from "./dots-mcp.mjs"
 import { DotsTunnel, dotsFailure, DOTS_FAILURES } from "./dots-tunnel.mjs"
+import { createDotsApp } from "./dots-app.mjs"
 
 const ID = "dots", NAME = "ChatGPT Dot", BASE = "https://dots.cloud-agents.invalid/v1"
 // Dots setup has no OpenAI authorization page: the Dot calls this PC, so the only useful
@@ -12,6 +13,7 @@ const ID = "dots", NAME = "ChatGPT Dot", BASE = "https://dots.cloud-agents.inval
 const DOTS_SETUP_GUIDE_URL = "https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt"
 const MODELS = { dot: { name: "ChatGPT Dot (replies in minutes)", tool_call: false } }
 const valid = auth => auth?.type === "oauth" && typeof auth.dot_token === "string" && Buffer.from(auth.dot_token, "base64url").length === 24
+const mechanism = auth => auth?.mechanism === "app-drive" || auth?.accountId === "dots-app" || auth?.refresh === "dots-app-cdp" ? "app-drive" : "tunnel"
 export const STANDING_INSTRUCTIONS = `Watch task.available on queue "dot" and renew before refreshBefore.
 Whenever an event arrives, or I ask you to check:
 1. Call list_tasks with queue "dot" and status "queued"; events may arrive without data.
@@ -26,6 +28,7 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
   const now = dependencies.now ?? Date.now
   const resources = new Map()
   const authReaders = new Map()
+  const app = createDotsApp(options.dotsApp ?? {}, dependencies.app ?? options.dotsApp?.dependencies)
   function watchAuth(token, resource) {
     const reader = authReaders.get(token)
     if (!reader || resource.authTimer) return
@@ -131,6 +134,14 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
       provider: ID,
       async loader(getAuth) {
         const initial = await getAuth()
+        if (mechanism(initial) === "app-drive") {
+          if (initial?.type !== "oauth" || !initial.access) return {}
+          const fetchCompletion = emulate(app, async () => {
+            const current = await getAuth()
+            return current?.type === "oauth" && mechanism(current) === "app-drive" ? current : null
+          }, options, dependencies.timers ? { timers: dependencies.timers } : {})
+          return { baseURL: BASE, fetch: fetchCompletion }
+        }
         if (!valid(initial)) return {}
         authReaders.set(initial.dot_token, getAuth)
         const resource = resources.get(initial.dot_token)
@@ -170,9 +181,16 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
           return response
         } }
       },
-      methods: [{ type: "oauth", label: "Bundled tunnel — this PC serves a temporary public MCP endpoint", authorize }],
+      methods: [
+        { type: "oauth", label: "Drive the installed ChatGPT app (default; zero setup)", authorize: () => app.authorize() },
+        { type: "oauth", label: "Bundled tunnel — this PC serves a temporary public MCP endpoint", authorize },
+      ],
       async checkin(getAuth) {
         const auth = await getAuth()
+        if (mechanism(auth) === "app-drive") {
+          try { await app.checkDrivable(); return { outcome: "done", message: "ready" } }
+          catch (error) { return { outcome: "failed", message: error.message } }
+        }
         if (!valid(auth)) return { outcome: "inactive", message: "not set up — magpie plugin login dots" }
         try {
           const resource = await ensure(auth)
@@ -188,7 +206,15 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
       const was = config.provider[ID] ?? {}
       config.provider[ID] = { name: NAME, npm: "@ai-sdk/openai-compatible", api: BASE, ...was, models: { ...MODELS, ...(was.models ?? {}) } }
     },
-    provider: { id: ID, async models(provider) { return provider.models } },
-    _internal: { driver, resources, ensure, doctor, dispose, async close() { for (const token of [...resources.keys()]) await dispose(token) } },
+    provider: {
+      id: ID,
+      async models(provider, { auth } = {}) {
+        const floor = provider.models
+        if (mechanism(auth) !== "app-drive") return floor
+        try { return { ...floor, ...(await app.liveModels(auth)) } }
+        catch { return floor }
+      },
+    },
+    _internal: { driver, appDriver: app, resources, ensure, doctor, dispose, async close() { for (const token of [...resources.keys()]) await dispose(token); app.dispose() } },
   }
 }
