@@ -250,9 +250,9 @@ test("randomUUID is used only for messages, never for a session", async () => {
   for (const call of calls) expect(Object.hasOwn(call.body, "session_id")).toBe(false)
 })
 
-test("observed client-only status requires a stable room transcript", async () => {
+for (const status of [2, "ACCEPTED", "GROK_BOT_SEND_STATUS_ACCEPTED"]) test(`client-only status requires a stable room transcript with ${status}`, async () => {
   let rows = [assistant(1, "old answer")]
-  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", client: {} }] } : { dispatched: true })
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", client: {} }] } : { dispatched: true })
   const run = await driver.create({}, { model: "bot-one", prompt: "question" })
   for (let poll = 0; poll < 2; poll++) expect((await driver.poll({}, run)).state).toBe("running")
   rows.push(assistant(2, "partial"))
@@ -328,9 +328,50 @@ test("non-byte injected keys yield exact 401 instead of TypeError", async () => 
   for (const key of [{}, new ArrayBuffer(32), "invalid"]) await failure(unwrapToken(data.localState, data.secrets, { unprotect: async () => key }), refused, 401, "kept")
 })
 
-for (const delivery of [1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE"]) test(`corroborated delivery ${delivery} is accepted`, async () => {
+for (const delivery of [1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE", "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_BOX", "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"]) test(`corroborated delivery ${delivery} is accepted`, async () => {
   const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: [] } : { delivery })
   expect((await driver.create({}, { model: "bot-one", prompt: "question" })).ref.agentId).toBe("bot-one")
+})
+
+for (const delivery of [4, "REFUSED", "GROK_BOT_USER_MESSAGE_DELIVERY_REFUSED"]) test(`refused delivery ${delivery} preserves vendor reason despite dispatched`, async () => {
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: [] } : { dispatched: true, delivery, refusal: { message: "Bot access revoked" } })
+  await failure(driver.create({}, { model: "bot-one", prompt: "question" }), "Bot access revoked — the provider's protocol table may need an update", 502, "kept")
+})
+
+for (const status of [3, "REJECTED", "GROK_BOT_SEND_STATUS_REJECTED"]) test(`rejected status ${status} preserves vendor reason`, async () => {
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: [] } : method === "GetGrokBotSendStatus" ? { status, rejectionCode: "Bot unavailable" } : { dispatched: true })
+  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
+  await failure(driver.poll({}, run), "Bot unavailable — the provider's protocol table may need an update", 502, "kept")
+})
+
+for (const delivery of [4, "REFUSED", "GROK_BOT_USER_MESSAGE_DELIVERY_REFUSED"]) test(`refused delivery ${delivery} overrides dispatched without refusal detail`, async () => {
+  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: [] } : { dispatched: true, delivery })
+  await failure(driver.create({}, { model: "bot-one", prompt: "question" }), "Message refused — the provider's protocol table may need an update", 502, "kept")
+})
+
+test("direct completion derives a sealed sign-in without a desktop connection and accepts a repeated message", async () => {
+  const data = await fixture()
+  let rows = [], sends = 0
+  const { driver, calls } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") return { entries: rows }
+    if (method === "SendGrokBotUserMessage") return ++sends === 1
+      ? { dispatched: true, mode: "GROK_BOT_TEMPORAL_HARNESS_MODE_LIVE", workflowId: "grok-bot-room-bot-one", delivery: "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL" }
+      : { delivery: "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE" }
+    if (method === "GetGrokBotSendStatus") return { status: "GROK_BOT_SEND_STATUS_ACCEPTED", echoEntryId: "row-1", acceptedAtMs: "1791766534573" }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", client: {} }] }
+    throw new Error(`Unexpected RPC ${method}`)
+  }, {}, { store: makeTokenStore(reader(data)) })
+  try {
+    expect((await driver.authorize().callback()).type).toBe("success")
+    const request = { model: "bot-one", prompt: "question", identity: { key: "repeated-message" } }
+    const original = await driver.create({}, request)
+    const duplicate = await driver.create({}, request)
+    expect(duplicate.ref.messageId).toBe(original.ref.messageId)
+    rows = [entry(1, { kind: "message", role: "user", content: "question" }), assistant(2, "answer")]
+    expect((await driver.poll({}, duplicate)).progress).toContain("using transcript stability")
+    expect(await driver.poll({}, duplicate)).toEqual({ state: "succeeded", text: "answer" })
+    expect(calls.every(call => call.url.startsWith("https://api2.cursor.sh/aiserver.v1.GrokBotService/"))).toBe(true)
+  } finally { driver.dispose(); data.token.fill(0) }
 })
 
 test("bare accepted and rejected status and refused delivery", async () => {

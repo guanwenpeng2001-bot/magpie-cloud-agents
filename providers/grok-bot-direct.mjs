@@ -5,6 +5,15 @@ import { makeTokenStore } from "./grok-bot-token.mjs"
 
 const HOST = "api2.cursor.sh"
 const SERVICE = "aiserver.v1.GrokBotService"
+// Live replies use the full ACCEPTED_TEMPORAL, DUPLICATE and SEND_STATUS_ACCEPTED strings below; keep older wire aliases too.
+const DELIVERY = {
+  accepted: [1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE", "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_BOX", "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL", "GROK_BOT_USER_MESSAGE_DELIVERY_DUPLICATE"],
+  refused: [4, "REFUSED", "GROK_BOT_USER_MESSAGE_DELIVERY_REFUSED"],
+}
+const SEND_STATUS = {
+  accepted: [2, "ACCEPTED", "GROK_BOT_SEND_STATUS_ACCEPTED"],
+  rejected: [3, "REJECTED", "GROK_BOT_SEND_STATUS_REJECTED"],
+}
 // The app's transcript watch uses 90s when a live row omits stale_after_ms (bundle: `var hJ=9e4`).
 const DEFAULT_STALE_AFTER_MS = 90000
 const REFUSED = "Grok Bot direct: the app's sign-in was refused by the server — open Grok Bot desktop once to refresh it, then retry"
@@ -133,8 +142,8 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     const baseline = await tail(agentId, signal)
     const messageId = identity?.key ? createHash("sha256").update(identity.key).digest("hex").replace(/^(.{8})(.{4})(.{4})(.{4})(.{12}).*$/, "$1-$2-$3-$4-$5") : uuid()
     const response = await request("SendGrokBotUserMessage", { agent_id: agentId, message_id: messageId, text: prompt, sent_at_ms: String(now()), is_fork: false }, signal)
-    if (response.refusal || response.delivery === 4 || response.delivery === "REFUSED") throw protocolError(response.refusal?.message ?? "Message refused")
-    if (response.dispatched !== true && ![1, 2, 3, "ACCEPTED_BOX", "ACCEPTED_TEMPORAL", "DUPLICATE"].includes(response.delivery)) throw protocolError("Message dispatch was not acknowledged")
+    if (response.refusal || DELIVERY.refused.includes(response.delivery)) throw protocolError(response.refusal?.message ?? "Message refused")
+    if (response.dispatched !== true && !DELIVERY.accepted.includes(response.delivery)) throw protocolError("Message dispatch was not acknowledged")
     return { url: agentId, ref: { agentId, messageId }, view: { baseline: new Set(baseline.map(row => row.entryId ?? row.entry_id ?? String(row.seq))), stable: undefined } }
   }
   const driver = {
@@ -165,7 +174,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
     async poll(credential, run, signal) {
       const { agentId, messageId } = run.ref
       const status = await request("GetGrokBotSendStatus", { agent_id: agentId, message_id: messageId }, signal)
-      if ([3, "REJECTED"].includes(status.status)) throw protocolError(status.rejectionCode ?? status.rejection_code ?? "Message rejected")
+      if (SEND_STATUS.rejected.includes(status.status)) throw protocolError(status.rejectionCode ?? status.rejection_code ?? "Message rejected")
       let running, stale = false
       try {
         const result = await request("ListGrokBotAgentStatuses", { agent_ids: [agentId] }, signal, false)
@@ -188,7 +197,7 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       const candidates = ordered.filter((row, index) => !run.view.baseline.has(row.entryId ?? row.entry_id ?? String(row.seq)) && (echoIndex < 0 || index > echoIndex))
       const replies = candidates.map(transcriptEntry).filter(row => row?.role === "assistant" && row.text.trim())
       const fingerprint = JSON.stringify(ordered)
-      const accepted = [2, "ACCEPTED"].includes(status.status)
+      const accepted = SEND_STATUS.accepted.includes(status.status)
       const text = replies.at(-1)?.text
       if (running === true) {
         run.view.stable = undefined
