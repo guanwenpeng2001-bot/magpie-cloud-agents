@@ -1,13 +1,59 @@
 import { expect, test } from "bun:test"
+import { execFile, spawn } from "node:child_process"
+import { promisify } from "node:util"
+import { readFile } from "node:fs/promises"
 import { makeGrokBotDriver } from "./grok-bot.mjs"
 import { createGrokBotCdp, findGrokBot, connectCdp } from "./grok-bot-cdp.mjs"
 import { errorResponse } from "../lib/errors.mjs"
 import { SESSION_HEADER } from "../lib/sessions.mjs"
 
+test.skipIf(process.platform !== "win32")("real PowerShell teardown preserves exact process identity through JSON", async () => {
+  const execute = promisify(execFile)
+  const source = await readFile(new URL("./grok-bot-cdp.mjs", import.meta.url), "utf8")
+  const enumeration = JSON.parse(source.match(/await execute\("powershell.exe", \["-NoProfile", "-NonInteractive", "-Command", ("(?:\\.|[^"\\])*")/)[1])
+  const stopScript = source.match(/const script = `([^`]+)`/)[1].replace(/\\\\/g, "\\")
+  const tag = "999999:12345678-1234-4234-8234-123456789abc"
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", `--magpie-grok-managed=${tag}`], { stdio: "ignore" })
+  const exited = new Promise(resolve => child.once("exit", resolve))
+  async function stop(row) {
+    await new Promise((resolve, reject) => {
+      const command = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", stopScript], { timeout: 10000 }, error => error ? reject(error) : resolve())
+      command.stdin.end(JSON.stringify(row))
+    })
+  }
+  try {
+    const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", enumeration.replace("Name='Grok Bot.exe'", `ProcessId=${child.pid}`)])
+    const parsed = JSON.parse(stdout)
+    const observed = Array.isArray(parsed) ? parsed[0] : parsed
+    const row = { pid: child.pid, executable: observed.ExecutablePath, created: observed.CreationDate, managedTag: tag }
+    for (const mismatch of [{ executable: "C:\\not-the-process.exe" }, { created: (BigInt(row.created) + 1n).toString() }, { managedTag: tag.slice(0, -1) }, { managedTag: "" }]) {
+      await stop({ ...row, ...mismatch })
+      expect(child.exitCode).toBeNull()
+      expect(() => process.kill(child.pid, 0)).not.toThrow()
+    }
+    await stop(row)
+    const terminated = await Promise.race([exited.then(() => true), Bun.sleep(1000).then(() => false)])
+    expect(terminated).toBe(true)
+  } finally { if (child.exitCode == null) child.kill(); await exited }
+}, 30000)
+
+test("managed profile explains separate sign-in and recovers after the user signs in", async () => {
+  const fake = fixture({ previous: true, signedIn: false })
+  try {
+    const flow = await fake.driver.authorize()
+    expect(flow.instructions).toContain("separate profile")
+    await expect(send(fake)).rejects.toThrow("Sign in in the Grok Bot window opened by Magpie")
+    expect(fake.frames.some(frame => frame.params.expression?.includes("submitPrompt"))).toBe(false)
+    fake.state.signedIn = true
+    expect((await send(fake)).ref).toBe("bot-id")
+    expect(fake.spawns).toHaveLength(1)
+  } finally { fake.close() }
+})
+
 const marker = { type: "oauth", access: "app-local", mechanism: "cdp" }
 const messages = {
   missing: "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry",
-  signedOut: "Grok Bot desktop isn't signed in — open it and sign in once; Magpie will drive it after that",
+  signedOut: "Grok Bot isn't signed in in the connected window. Sign in in the Grok Bot window opened by Magpie (or the existing debug-enabled window), then retry. Magpie's separate profile does not inherit your usual app's sign-in; your usual app can stay open.",
   running: "Magpie couldn't start its own Grok Bot instance — the launch exited before its debug interface opened; retry the sign-in",
   changed: "Grok Bot changed its UI; the provider needs an update",
   crashed: "Grok Bot closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
