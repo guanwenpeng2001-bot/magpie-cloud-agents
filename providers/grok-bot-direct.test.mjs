@@ -500,61 +500,24 @@ test("running status prevents stable preamble completion until idle and final an
   expect(run.url).toBe("bot-one")
 })
 
-// lib/http.mjs pollWithBackoff forwards a running outcome's `partial` as {content}, and
-// lib/emulate.mjs accumulates cumulative text prefix-monotonically into content deltas.
-test("running polls emit the growing transcript as successive prefix partials", async () => {
-  let rows = []
-  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", isRunning: true }] } : { dispatched: true })
-  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
-  rows = [assistant(1, "Let me work that out.")]
-  const first = await driver.poll({}, run)
-  expect(first.state).toBe("running")
-  expect(first.partial).toBe("Let me work that out.")
-  rows[0] = assistant(1, "Let me work that out. The sky is blue")
-  const second = await driver.poll({}, run)
-  expect(second.state).toBe("running")
-  expect(second.partial).toBe("Let me work that out. The sky is blue")
-  rows[0] = assistant(1, "Let me work that out. The sky is blue because molecules scatter sunlight.")
-  const third = await driver.poll({}, run)
-  expect(third.state).toBe("running")
-  expect(third.partial).toBe("Let me work that out. The sky is blue because molecules scatter sunlight.")
-  const partials = [first.partial, second.partial, third.partial]
-  expect(partials.every((partial, index) => index === 0 || (partial.startsWith(partials[index - 1]) && partial.length > partials[index - 1].length))).toBe(true)
-  driver.dispose()
-})
-
-// The driver emits whatever the transcript currently says without gating on monotonicity;
-// a rewritten text is the emulate layer's divergence case, which stops progressive output
-// and follows with the authoritative whole text (accepted F2 behaviour).
-test("transcript text replaced by a non-prefix is still emitted as the running partial", async () => {
-  let rows = []
-  const { driver } = harness(method => method === "ListGrokBotTranscriptEntries" ? { entries: rows } : method === "GetGrokBotSendStatus" ? { status: 2 } : method === "ListGrokBotAgentStatuses" ? { statuses: [{ agentId: "bot-one", isRunning: true }] } : { dispatched: true })
-  const run = await driver.create({}, { model: "bot-one", prompt: "question" })
-  rows = [assistant(1, "The answer starts with forty-two")]
-  expect((await driver.poll({}, run)).partial).toBe("The answer starts with forty-two")
-  rows[0] = assistant(1, "A completely rewritten opening line about light")
-  const replaced = await driver.poll({}, run)
-  expect(replaced.state).toBe("running")
-  expect(replaced.partial).toBe("A completely rewritten opening line about light")
-  driver.dispose()
-})
-
-test("streaming completion accumulates growing partials into content deltas", async () => {
-  const script = ["First words.", "First words. More text arrives", "First words. More text arrives until the answer is complete."]
-  let rows = [], reads = -1, running = true
+test("streaming multi-row turn contains only the authoritative answer", async () => {
+  const final = "Here is the full answer you asked for."
+  const echo = entry(1, { kind: "message", role: "user", content: "question" })
+  const preview = assistant(2, "Let me look into that for you.")
+  const note = entry(3, { kind: "message", role: "assistant", content: "I have asked the group to introduce themselves." })
+  const script = [[echo, preview], [echo, preview, note], [echo, preview, note, assistant(4, final)]]
+  let reads = -1
   const { driver } = harness(method => {
     if (method === "ListGrokBotTranscriptEntries") {
       reads++
-      if (reads > 0) rows = [assistant(1, script[Math.min(reads - 1, script.length - 1)])]
-      if (reads === script.length) running = false
-      return { entries: rows }
+      return { entries: reads === 0 ? [] : script[Math.min(reads - 1, script.length - 1)] }
     }
-    if (method === "GetGrokBotSendStatus") return { status: 2 }
-    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", isRunning: running }] }
+    if (method === "GetGrokBotSendStatus") return { status: 2, echoEntryId: "row-1" }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", isRunning: reads < script.length }] }
     return { dispatched: true }
   })
   const timers = { now: Date.now, random: () => 0.5, setTimeout: (callback, delay) => setTimeout(callback, delay < 15000 ? 0 : delay), clearTimeout }
-  const completion = emulate(driver, async () => ({ type: "oauth", access: "derived-in-memory" }), { progress: false }, { timers })
+  const completion = emulate(driver, async () => ({ type: "oauth", access: "synthetic" }), { progress: false }, { timers })
   try {
     const response = await completion("https://fixture.invalid/v1/chat/completions", {
       body: JSON.stringify({ model: "bot-one", messages: [{ role: "user", content: "question" }], stream: true }),
@@ -562,8 +525,7 @@ test("streaming completion accumulates growing partials into content deltas", as
     expect(response.status).toBe(200)
     const events = (await response.text()).split("\n").filter(line => line.startsWith("data: ") && line !== "data: [DONE]").map(line => JSON.parse(line.slice(6)))
     const deltas = events.map(event => event.choices?.[0]?.delta?.content).filter(value => typeof value === "string" && value)
-    expect(deltas.join("")).toBe(script[script.length - 1])
-    expect(deltas.length).toBeGreaterThan(1)
+    expect(deltas.join("")).toBe(final)
   } finally { driver.dispose() }
 })
 

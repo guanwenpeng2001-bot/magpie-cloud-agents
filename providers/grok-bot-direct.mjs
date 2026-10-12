@@ -239,18 +239,13 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       const fingerprint = JSON.stringify(ordered)
       const accepted = SEND_STATUS.accepted.includes(status.status)
       const text = replies.at(-1)?.text
-      // The running text goes out as `partial` so pollWithBackoff (lib/http.mjs) forwards it and
-      // the emulate layer accumulates it prefix-monotonically into content deltas. replies are
-      // already trimmed, so the guard only excludes an empty transcript; a rewritten non-prefix
-      // text is tolerated downstream as divergence (accepted F2 behaviour), not gated here.
-      const partial = text ? { partial: text } : {}
       if (running === true) {
         run.view.stable = undefined
-        return { state: "running", progress: "Grok Bot direct: the bot is still running", ...partial }
+        return { state: "running", progress: "Grok Bot direct: the bot is still running" }
       }
       if (accepted && text && (running === false || run.view.stable === fingerprint)) return { state: "succeeded", text }
       run.view.stable = accepted && text ? fingerprint : undefined
-      return { state: "running", progress: running === undefined ? `Grok Bot direct: ${stale ? "stale running status demoted" : "status unavailable"}; using transcript stability — a paused bot's partial answer may be delivered as final` : "Grok Bot direct: waiting for the bot", ...partial }
+      return { state: "running", progress: running === undefined ? `Grok Bot direct: ${stale ? "stale running status demoted" : "status unavailable"}; using transcript stability — a paused bot's partial answer may be delivered as final` : "Grok Bot direct: waiting for the bot" }
     },
     async cancel(credential, run) { await request("InterruptGrokBotAgentRun", { agent_id: run.ref.agentId, reason: "user-cancel" }) },
     dispose() { disposed = true; store.dispose() },
