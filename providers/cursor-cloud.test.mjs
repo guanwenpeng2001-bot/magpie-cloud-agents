@@ -303,6 +303,30 @@ test("the loader stays out of the way when not signed in", async () => {
   expect(loader).toEqual({})
 })
 
+test("first published Cursor model is vendor-recognised while the rejected floor remains", async () => {
+  const recognised = "claude-sonnet-4-5"
+  await withHarness(vendor({
+    run: { status: "FINISHED", result: "recognised model completed" },
+    "/v1/models": () => Response.json({ models: [{ id: recognised, name: "Live Sonnet" }] }),
+    "/v1/agents": ({ body }) => body.model.id === recognised
+      ? Response.json({ agent: { id: "accepted-agent" }, run: { id: "run-1" } })
+      : Response.json({ message: `Model '${body.model.id}' is not available or invalid.` }, { status: 400 }),
+  }), async ({ plugin, fetch }) => {
+    const rejected = await chat(fetch)
+    expect(rejected.status).toBe(400)
+    expect(await rejected.text()).toContain("Model 'composer-2' is not available or invalid.")
+    const config = {}; await plugin.config(config)
+    const models = await plugin.provider.models(config.provider["cursor-cloud"], { auth: AUTH })
+    const first = Object.keys(models)[0]
+    expect(first).toBe(recognised)
+    expect(models["composer-2"]).toBeDefined()
+    expect(models[first].name).toBe("Live Sonnet")
+    const accepted = await chat(fetch, { model: first })
+    expect(accepted.status).toBe(200)
+    expect(await accepted.text()).toContain("recognised model completed")
+  })
+})
+
 test("models parse accepts the wrapped and bare shapes and falls back to the floor", async () => {
   const floor = { "composer-2": { name: "Composer 2" }, "claude-sonnet-4-5": { name: "Claude Sonnet 4.5" } }
   const check = (scenario, probe) => withHarness(scenario, async ({ plugin }) => {

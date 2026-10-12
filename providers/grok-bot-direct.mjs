@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
 import { chatError } from "../lib/errors.mjs"
 import { withTimeout } from "../lib/http.mjs"
 import { makeTokenStore } from "./grok-bot-token.mjs"
@@ -72,6 +74,34 @@ export function transcriptEntry(entry) {
   } else return null
   if (typeof text !== "string") return null
   return { role, text, id: entry.entryId ?? entry.entry_id ?? body.id }
+}
+
+// Persistence filenames are lowercase, unpadded RFC 4648 base32 client keys.
+function persistenceFilename(key) {
+  let output = "", bits = 0, buffer = 0
+  for (const byte of Buffer.from(key)) {
+    buffer = (buffer << 8) | byte
+    bits += 8
+    while (bits >= 5) { bits -= 5; output += "abcdefghijklmnopqrstuvwxyz234567"[(buffer >>> bits) & 31] }
+  }
+  if (bits) output += "abcdefghijklmnopqrstuvwxyz234567"[(buffer << (5 - bits)) & 31]
+  return output
+}
+
+async function selectedAgent(dependencies) {
+  try {
+    const profile = dependencies.profilePath ?? (process.env.APPDATA && join(process.env.APPDATA, "Grok Bot"))
+    if (!profile) return undefined
+    const reader = dependencies.readFile ?? readFile
+    const readValue = async key => {
+      const data = JSON.parse(await reader(join(profile, "sand-client-persistence", persistenceFilename(key)), "utf8"))
+      return data?.schemaVersion === 1 ? data.value : undefined
+    }
+    const slot = await readValue("sand.client.slice.client-meta.account-slot")
+    if (typeof slot !== "string" || !slot) return undefined
+    const selection = await readValue(`sand.client.slice.account.${encodeURIComponent(slot)}.selection.last-agent`)
+    return typeof selection?.agentId === "string" ? selection.agentId : undefined
+  } catch { return undefined }
 }
 
 export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
@@ -163,8 +193,10 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       let agentId = model
       if (!agentId || agentId === "app-bot") {
         const agents = await list(signal)
-        if (agents.length !== 1) throw chatError(400, "Grok Bot direct: select a bot from the model list", "kept")
-        agentId = agents[0].id
+        const selected = await selectedAgent(dependencies)
+        agentId = agents.find(agent => agent.id === selected)?.id
+        if (!agentId && agents.length === 1) agentId = agents[0].id
+        if (!agentId) throw chatError(400, "Grok Bot direct: select a bot by its model ID, or open Grok Bot desktop and select a bot before retrying app-bot", "kept")
       }
       return send(agentId, prompt, identity, signal)
     },
