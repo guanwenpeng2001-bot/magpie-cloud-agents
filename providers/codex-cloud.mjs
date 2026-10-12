@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process"
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join, resolve } from "node:path"
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, errorResponse } from "../lib/errors.mjs"
 import { sessionOf, SESSION_HEADER } from "../lib/sessions.mjs"
@@ -103,13 +106,41 @@ function checkExit(result) {
   return result
 }
 
-function makeDriver(options, cli) {
+function codexStatePaths() {
+  return [...new Set([process.env.CODEX_HOME, join(homedir(), ".codex")].filter(Boolean).map(home => resolve(home, ".codex-global-state.json")))]
+}
+function discoverEnvironment(paths) {
+  const searched = []
+  for (const path of paths) {
+    let state
+    try { state = JSON.parse(readFileSync(path, "utf8")) }
+    catch (error) { searched.push(`${path} (${error.code ?? "invalid JSON"})`); continue }
+    const threads = state?.["electron-persisted-atom-state"]?.["cloud-aeon-sidebar-cache-v1"]?.threads
+    if (Array.isArray(threads)) for (const thread of threads) {
+      if (!Array.isArray(thread?.environments)) continue
+      for (const environment of thread.environments) {
+        const id = environment?.environmentId
+        if (typeof id === "string" && /^(?:env_|ccarenv_)[A-Za-z0-9_-]+$/.test(id)) return { env: id, searched }
+      }
+    }
+    searched.push(`${path} (no cloud task environment)`)
+  }
+  return { searched }
+}
+function resolveEnvironment(metadataEnv, options, paths) {
+  for (const value of [metadataEnv, options.codexCloud?.env]) if (value != null && typeof value !== "string") throw chatError(400, "metadata.env and codexCloud.env must be strings")
+  const explicit = metadataEnv?.trim() || options.codexCloud?.env?.trim()
+  if (explicit) return explicit
+  const discovered = discoverEnvironment(paths)
+  if (discovered.env) return discovered.env
+  throw chatError(400, `Codex Cloud could not discover an environment id. Searched: ${discovered.searched.join("; ")}. Open a Codex cloud task to populate the local cache, or set account metadata.env or option codexCloud.env.`)
+}
+
+function makeDriver(options, cli, statePaths = codexStatePaths()) {
   return {
     id: ID, name: NAME, staticModels: MODELS,
     async create(credential, { prompt }, signal) {
-      for (const value of [credential.metadata?.env, options.codexCloud?.env]) if (value != null && typeof value !== "string") throw chatError(400, "metadata.env and codexCloud.env must be strings")
-      const env = credential.metadata?.env?.trim() || options.codexCloud?.env?.trim()
-      if (!env) throw chatError(400, "Codex Cloud requires account metadata.env (the sign-in environment id) or option codexCloud.env")
+      const env = resolveEnvironment(credential.metadata?.env, options, statePaths)
       const attempts = options.codexCloud?.attempts ?? 1
       if (!Number.isInteger(attempts) || attempts < 1) throw chatError(400, "codexCloud.attempts must be a positive integer")
       const run = { children: new Set(), prompt }
@@ -143,8 +174,8 @@ function makeDriver(options, cli) {
   }
 }
 
-export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now, timers } = {}) {
-  const driver = makeDriver(options, cli)
+export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now, timers, statePaths = codexStatePaths() } = {}) {
+  const driver = makeDriver(options, cli, statePaths)
   const verify = async (signal, children = new Set()) => {
     const result = await cli(["login", "status"], { signal, children, timeoutMs: 10000 })
     // The CLI writes its confirmation to stderr (measured: stdout "", stderr "Logged in using ChatGPT", exit 0),
@@ -179,14 +210,16 @@ export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now,
       },
       methods: [{
         type: "oauth", label: "This machine's codex CLI login (ChatGPT)",
-        prompts: [{ type: "text", key: "env", message: "Codex Cloud environment id (Codex web → Environments; used as `codex cloud exec --env`)", validate: value => typeof value === "string" && value.trim() ? undefined : "an environment id is required" }],
+        get prompts() {
+          if ((typeof options.codexCloud?.env === "string" && options.codexCloud.env.trim()) || discoverEnvironment(statePaths).env) return []
+          return [{ type: "text", key: "env", message: "Optional Codex Cloud environment id (leave blank to discover from local Codex state)", validate: value => value == null || typeof value === "string" ? undefined : "an environment id must be a string" }]
+        },
         authorize(inputs) {
           return {
-            url: "", instructions: "Reuses the codex CLI's own login. Nothing is typed in; only the environment id is stored.\n\nProvider notes: " + STATUS_NOTES, method: "auto",
+            url: "", instructions: "Reuses the codex CLI's own login and discovers the environment from local Codex state unless explicitly configured. Only the resolved environment id is stored; Codex state is never changed.\n\nProvider notes: " + STATUS_NOTES, method: "auto",
             async callback() {
-              const env = inputs?.env?.trim()
-              if (!env) return { type: "failed", error: "an environment id is required" }
-              try { await verify() }
+              let env
+              try { env = resolveEnvironment(inputs?.env, options, statePaths); await verify() }
               catch (error) { return { type: "failed", error: error.message } }
               return { type: "success", refresh: "codex-cli", access: "codex-cli", expires: 0, accountId: "env:" + env, env }
             },
