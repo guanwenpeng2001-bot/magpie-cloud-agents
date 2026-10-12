@@ -178,7 +178,7 @@ export function makeCodeiumChat(options = {}) {
               }
               stream.enqueue(chunk({ content: next.value }))
             } catch (error) {
-              stream.enqueue(encoder.encode(`data: ${JSON.stringify(errorBody(normalizeError(error, identity)))}\n\n`))
+              stream.enqueue(encoder.encode(`data: ${JSON.stringify(errorBody(normalizeError(timeout.aborted ? chatError(504, "Codeium request timed out") : error, identity)))}\n\n`))
               stream.close()
             }
           },

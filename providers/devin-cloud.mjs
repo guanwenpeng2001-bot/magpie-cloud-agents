@@ -8,10 +8,12 @@ const NAME = "Devin Cloud"
 const BASE = "https://devin-cloud.cloud-agents.invalid/v1"
 const MODELS = { "devin-session": { name: "Devin session", tool_call: false, reasoning: false } }
 const mechanismOf = key => /^cog_\S+$/.test(key) ? "codeium" : /^apk_\S+$/.test(key) ? "devin" : null
-const UNRECOGNIZED = "Use a Codeium credential (cog_…) or a Devin platform API key (apk_…)"
+const UNRECOGNIZED = "Use a Codeium credential (cog_…) or a Devin platform API key (apk_…); legacy Devin CLI session tokens (devin-session-token$…) are not supported by this provider"
+const storedKey = auth => auth?.type === "api" ? auth.key : auth?.type === "oauth" && ["devin", "codeium"].includes(auth.mechanism ?? auth.metadata?.mechanism) ? auth.access : undefined
 function credentialOf(auth) {
-  if (auth?.type !== "api" || typeof auth.key !== "string" || !auth.key.trim()) return null
-  const key = auth.key.trim()
+  const value = storedKey(auth)
+  if (typeof value !== "string" || !value.trim()) return null
+  const key = value.trim()
   const inferred = mechanismOf(key)
   const mechanism = auth.mechanism ?? auth.metadata?.mechanism ?? inferred
   if (!inferred || mechanism !== inferred) throw chatError(401, UNRECOGNIZED + " matching the saved sign-in mechanism")
@@ -26,7 +28,7 @@ function signIn(mechanism, label) {
         try {
           const credential = credentialOf({ type: "api", key: inputs.key, mechanism })
           if (!credential) throw new Error(UNRECOGNIZED)
-          return { type: "success", key: credential.key, mechanism, metadata: { mechanism } }
+          return { type: "success", access: credential.key, refresh: "", expires: 0, mechanism, metadata: { mechanism } }
         } catch (error) { return { type: "failed", error: error.message } }
       } }
     },
@@ -116,7 +118,8 @@ export function makeDevinCloud(options = {}) {
       maxConcurrency: 4,
       async loader(getAuth) {
         const saved = await getAuth()
-        if (saved?.type !== "api" || typeof saved.key !== "string" || !saved.key.trim()) return {}
+        const key = storedKey(saved)
+        if (typeof key !== "string" || !key.trim()) return {}
         const platform = emulate(makeDevinDriver(options), async () => {
           const current = credentialOf(await getAuth())
           return current?.mechanism === "devin" ? current : null
@@ -140,10 +143,12 @@ export function makeDevinCloud(options = {}) {
       config.provider[ID] = { name: NAME, npm: "@ai-sdk/openai-compatible", api: BASE, ...was, models: { ...MODELS, ...(was.models ?? {}) } }
     },
     provider: { id: ID, async models(provider, { auth } = {}) {
-      if (credentialOf(auth)?.mechanism === "codeium") {
-        const { "devin-session": session, ...custom } = provider.models ?? {}
-        return { ...(await codeiumChat()).models(), ...custom }
-      }
+      try {
+        if (credentialOf(auth)?.mechanism === "codeium") {
+          const { "devin-session": session, ...custom } = provider.models ?? {}
+          return { ...(await codeiumChat()).models(), ...custom }
+        }
+      } catch {}
       return provider.models
     } },
     async "chat.headers"(input, output) {

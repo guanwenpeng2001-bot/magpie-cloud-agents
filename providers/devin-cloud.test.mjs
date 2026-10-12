@@ -378,7 +378,7 @@ test("a Codeium account is offered the Connect model list, an apk_ account the s
 
 test.each([[0, "devin", "apk_user_synthetic"], [1, "codeium", "cog_synthetic"]])("sign-in %s persists its mechanism", async (index, mechanism, key) => {
   const method = makeDevinCloud().auth.methods[index]
-  expect(await (await method.authorize({ key })).callback()).toEqual({ type: "success", key, mechanism, metadata: { mechanism } })
+  expect(await (await method.authorize({ key })).callback()).toEqual({ type: "success", access: key, refresh: "", expires: 0, mechanism, metadata: { mechanism } })
   const invalid = await (await method.authorize({ key: "unrecognized" })).callback()
   expect(invalid.type).toBe("failed")
   expect(invalid.error).toContain("cog_")
@@ -457,4 +457,62 @@ test("default endpoints isolate stored mechanisms and retain their authorization
     }
     expect(calls).toHaveLength(3)
   } finally { globalThis.fetch = originalFetch }
+})
+
+
+test.each([0, 1])("successful sign-in %s round trips through stored OAuth into a working loader", async index => {
+  const platform = startFakeCloud(); servers.push(platform)
+  const connect = startFakeCodeium(); servers.push(connect)
+  const plugin = makeDevinCloud({ apiBase: { "devin-cloud": platform.url + "/devin", "devin-cloud-codeium": connect.url } })
+  const method = plugin.auth.methods[index]
+  const outcome = await (await method.authorize({ key: index ? "cog_synthetic" : "apk_synthetic" })).callback()
+  expect(outcome.type).toBe("success")
+  const stored = JSON.parse(JSON.stringify({ ...outcome, type: method.type }))
+  const loader = await plugin.auth.loader(() => stored)
+  expect(typeof loader.fetch).toBe("function")
+  const response = await request(loader)
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toBe(index ? "Synthetic Codeium answer" : "Synthetic Devin answer")
+  expect(index ? platform.requests.length : connect.requests.length).toBe(0)
+})
+
+test.each(["sk_foreign", "devin-session-token$legacy"])("models preserve the floor for unknown credential %s", async key => {
+  const plugin = makeDevinCloud(), provider = { models: { "devin-session": { name: "Custom" } } }
+  expect(await plugin.provider.models(provider, { auth: { type: "api", key } })).toBe(provider.models)
+})
+
+test("legacy credentials are identified and refused before network access", async () => {
+  const { plugin, server } = await setup()
+  const loader = await plugin.auth.loader(() => ({ type: "api", key: "devin-session-token$legacy" }))
+  const response = await request(loader)
+  expect(response.status).toBe(401)
+  const message = (await response.json()).error.message
+  for (const prefix of ["cog_", "apk_", "devin-session-token$"]) expect(message).toContain(prefix)
+  expect(server.requests).toHaveLength(0)
+})
+
+test.each([false, true])("Codeium deadline after first text is 504 with stream=%s", async stream => {
+  const originalTimeout = AbortSignal.timeout, originalFetch = globalThis.fetch
+  const deadline = new AbortController()
+  AbortSignal.timeout = () => deadline.signal
+  globalThis.fetch = async (url, { signal }) => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(Uint8Array.from([0, 0, 0, 0, 4, 26, 2, 79, 75]))
+    signal.addEventListener("abort", () => controller.error(signal.reason), { once: true })
+  } }))
+  try {
+    const loader = await makeDevinCloud().auth.loader(codeiumAuth)
+    const pending = request(loader, { stream })
+    if (stream) {
+      const response = await pending
+      deadline.abort(new DOMException("The operation timed out.", "TimeoutError"))
+      const events = (await response.text()).split("\n\n").filter(value => value.startsWith("data: {")).map(value => JSON.parse(value.slice(6)))
+      expect(events.find(event => event.error)?.error).toMatchObject({ code: 504, message: "Codeium request timed out" })
+    } else {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      deadline.abort(new DOMException("The operation timed out.", "TimeoutError"))
+      const response = await pending
+      expect(response.status).toBe(504)
+      expect((await response.json()).error.message).toBe("Codeium request timed out")
+    }
+  } finally { AbortSignal.timeout = originalTimeout; globalThis.fetch = originalFetch }
 })
