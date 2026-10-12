@@ -500,6 +500,35 @@ test("running status prevents stable preamble completion until idle and final an
   expect(run.url).toBe("bot-one")
 })
 
+test("streaming multi-row turn contains only the authoritative answer", async () => {
+  const final = "Here is the full answer you asked for."
+  const echo = entry(1, { kind: "message", role: "user", content: "question" })
+  const preview = assistant(2, "Let me look into that for you.")
+  const note = entry(3, { kind: "message", role: "assistant", content: "I have asked the group to introduce themselves." })
+  const script = [[echo, preview], [echo, preview, note], [echo, preview, note, assistant(4, final)]]
+  let reads = -1
+  const { driver } = harness(method => {
+    if (method === "ListGrokBotTranscriptEntries") {
+      reads++
+      return { entries: reads === 0 ? [] : script[Math.min(reads - 1, script.length - 1)] }
+    }
+    if (method === "GetGrokBotSendStatus") return { status: 2, echoEntryId: "row-1" }
+    if (method === "ListGrokBotAgentStatuses") return { statuses: [{ agentId: "bot-one", isRunning: reads < script.length }] }
+    return { dispatched: true }
+  })
+  const timers = { now: Date.now, random: () => 0.5, setTimeout: (callback, delay) => setTimeout(callback, delay < 15000 ? 0 : delay), clearTimeout }
+  const completion = emulate(driver, async () => ({ type: "oauth", access: "synthetic" }), { progress: false }, { timers })
+  try {
+    const response = await completion("https://fixture.invalid/v1/chat/completions", {
+      body: JSON.stringify({ model: "bot-one", messages: [{ role: "user", content: "question" }], stream: true }),
+    })
+    expect(response.status).toBe(200)
+    const events = (await response.text()).split("\n").filter(line => line.startsWith("data: ") && line !== "data: [DONE]").map(line => JSON.parse(line.slice(6)))
+    const deltas = events.map(event => event.choices?.[0]?.delta?.content).filter(value => typeof value === "string" && value)
+    expect(deltas.join("")).toBe(final)
+  } finally { driver.dispose() }
+})
+
 test("non-byte injected keys yield exact 401 instead of TypeError", async () => {
   const data = await fixture()
   for (const key of [{}, new ArrayBuffer(32), "invalid"]) await failure(unwrapToken(data.localState, data.secrets, { unprotect: async () => key }), refused, 401, "kept")
