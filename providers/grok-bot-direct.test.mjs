@@ -148,20 +148,41 @@ function harness(respond = () => ({ agents: [] }), options = {}, extra = {}) {
   })
   return { driver, calls, rotations, token }
 }
-// Encode fixture keys independently as five-bit groups, including the final padded group.
-const persistenceFilename = key => Buffer.from(key).reduce((bits, byte) => bits + byte.toString(2).padStart(8, "0"), "")
-  .match(/.{1,5}/g).map(bits => "abcdefghijklmnopqrstuvwxyz234567"[parseInt(bits.padEnd(5, "0"), 2)]).join("")
+// Fixture filenames follow the app's shipped encoder, transcribed from the Grok Bot 0.68.1
+// app.asar extraction quoted in runs/cloud-agent-providers/reports/review-fix-floor-model-availability.md:
+//   function pSr(e){return `${Wot(N1.encode(e))}${Kie}`}                    // Kie = ".blob"
+//   function sE(e){return encodeURIComponent(e).replaceAll(".","%2E")}
+// Wot is the base32 loop and N1.encode is UTF-8. The rule is quoted from the app, not re-derived
+// from production code, so the fixture pins the app rather than agreeing with the implementation.
+const APP_BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
+function appPersistenceName(key) {
+  let stem = "", bits = 0, buffer = 0
+  for (const byte of Buffer.from(key)) {
+    buffer = buffer << 8 | byte; bits += 8
+    for (; bits >= 5; bits -= 5) stem += APP_BASE32_ALPHABET[buffer >>> (bits - 5) & 31]
+  }
+  if (bits > 0) stem += APP_BASE32_ALPHABET[buffer << (5 - bits) & 31]
+  return stem + ".blob"
+}
+const appSelectionKey = slot => `sand.client.slice.account.${encodeURIComponent(slot).replaceAll(".", "%2E")}.selection.last-agent`
+
+test("fixture names follow the app's shipped rule, checked against real profile filenames", () => {
+  expect(appPersistenceName("sand.client.slice.client-meta.account-slot"))
+    .toBe("onqw4zbomnwgszlooqxhg3djmnss4y3mnfsw45bnnvsxiyjomfrwg33vnz2c243mn52a.blob")
+  expect(appSelectionKey("auth0|user.name@example.com"))
+    .toBe("sand.client.slice.account.auth0%7Cuser%2Ename%40example%2Ecom.selection.last-agent")
+})
 
 async function withSelection(state, run) {
   const profilePath = await mkdtemp(join(tmpdir(), "grok-selection-"))
   const directory = join(profilePath, "sand-client-persistence")
-  const slot = "google-oauth2|fixture/user +中文"
+  const slot = "google-oauth2|fixture.user +中文"
   const slotKey = "sand.client.slice.client-meta.account-slot"
-  const selectionKey = `sand.client.slice.account.${encodeURIComponent(slot)}.selection.last-agent`
+  const selectionKey = appSelectionKey(slot)
   try {
     await mkdir(directory)
-    await writeFile(join(directory, persistenceFilename(slotKey)), JSON.stringify({ schemaVersion: 1, value: slot }))
-    if (state !== "missing") await writeFile(join(directory, persistenceFilename(selectionKey)), state === "malformed" ? "{" : JSON.stringify({ schemaVersion: 1, value: { agentId: state } }))
+    await writeFile(join(directory, appPersistenceName(slotKey)), JSON.stringify({ schemaVersion: 1, value: slot }))
+    if (state !== "missing") await writeFile(join(directory, appPersistenceName(selectionKey)), state === "malformed" ? "{" : JSON.stringify({ schemaVersion: 1, value: { agentId: state } }))
     await run(profilePath)
   } finally { await rm(profilePath, { recursive: true, force: true }) }
 }
@@ -171,7 +192,7 @@ const otherAgent = "11111111-1111-4111-8111-111111111111"
 const selectionServer = agents => method => method === "ListGrokBotAgents" ? { agents: agents.map(agentId => ({ agentId, name: agentId })) }
   : method === "ListGrokBotTranscriptEntries" ? { entries: [] } : { dispatched: true }
 
-test("app-bot resolves the URL-escaped account selection from base32 files on disk", async () => {
+test("app-bot resolves the app's .blob persisted selection for the dotted slot", async () => {
   await withSelection(selectedAgent, async profilePath => {
     const { driver, calls } = harness(selectionServer([otherAgent, selectedAgent]), {}, { profilePath })
     try {

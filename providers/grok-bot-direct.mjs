@@ -76,7 +76,10 @@ export function transcriptEntry(entry) {
   return { role, text, id: entry.entryId ?? entry.entry_id ?? body.id }
 }
 
-// Persistence filenames are lowercase, unpadded RFC 4648 base32 client keys.
+// Persistence filenames are the app's base32 client keys with its ".blob" extension
+// (Grok Bot 0.68.1 app.asar: pSr = base32(key) + ".blob"). The app also switches oversized
+// keys (encoded name over 240 chars) to a digest-framed base32 + ".kblob" name; both keys
+// in play are ~94 bytes, so that branch cannot fire here and is deliberately not implemented.
 function persistenceFilename(key) {
   let output = "", bits = 0, buffer = 0
   for (const byte of Buffer.from(key)) {
@@ -85,7 +88,7 @@ function persistenceFilename(key) {
     while (bits >= 5) { bits -= 5; output += "abcdefghijklmnopqrstuvwxyz234567"[(buffer >>> bits) & 31] }
   }
   if (bits) output += "abcdefghijklmnopqrstuvwxyz234567"[(buffer << (5 - bits)) & 31]
-  return output
+  return output + ".blob"
 }
 
 async function selectedAgent(dependencies) {
@@ -99,7 +102,8 @@ async function selectedAgent(dependencies) {
     }
     const slot = await readValue("sand.client.slice.client-meta.account-slot")
     if (typeof slot !== "string" || !slot) return undefined
-    const selection = await readValue(`sand.client.slice.account.${encodeURIComponent(slot)}.selection.last-agent`)
+    // The app escapes slots with encodeURIComponent plus "." -> "%2E" (app.asar sE).
+    const selection = await readValue(`sand.client.slice.account.${encodeURIComponent(slot).replaceAll(".", "%2E")}.selection.last-agent`)
     return typeof selection?.agentId === "string" ? selection.agentId : undefined
   } catch { return undefined }
 }
