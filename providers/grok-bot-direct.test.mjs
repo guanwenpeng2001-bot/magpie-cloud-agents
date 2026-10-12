@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test"
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { emulate } from "../lib/emulate.mjs"
 import { unwrapToken, unprotect, makeTokenStore } from "./grok-bot-token.mjs"
 import { makeGrokBotDirect, cursorChecksum, transcriptEntry } from "./grok-bot-direct.mjs"
@@ -145,6 +148,74 @@ function harness(respond = () => ({ agents: [] }), options = {}, extra = {}) {
   })
   return { driver, calls, rotations, token }
 }
+// Fixture filenames follow the app's shipped encoder, transcribed from the Grok Bot 0.68.1
+// app.asar extraction quoted in runs/cloud-agent-providers/reports/review-fix-floor-model-availability.md:
+//   function pSr(e){return `${Wot(N1.encode(e))}${Kie}`}                    // Kie = ".blob"
+//   function sE(e){return encodeURIComponent(e).replaceAll(".","%2E")}
+// Wot is the base32 loop and N1.encode is UTF-8. The rule is quoted from the app, not re-derived
+// from production code, so the fixture pins the app rather than agreeing with the implementation.
+const APP_BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
+function appPersistenceName(key) {
+  let stem = "", bits = 0, buffer = 0
+  for (const byte of Buffer.from(key)) {
+    buffer = buffer << 8 | byte; bits += 8
+    for (; bits >= 5; bits -= 5) stem += APP_BASE32_ALPHABET[buffer >>> (bits - 5) & 31]
+  }
+  if (bits > 0) stem += APP_BASE32_ALPHABET[buffer << (5 - bits) & 31]
+  return stem + ".blob"
+}
+const appSelectionKey = slot => `sand.client.slice.account.${encodeURIComponent(slot).replaceAll(".", "%2E")}.selection.last-agent`
+
+test("fixture names follow the app's shipped rule, checked against real profile filenames", () => {
+  expect(appPersistenceName("sand.client.slice.client-meta.account-slot"))
+    .toBe("onqw4zbomnwgszlooqxhg3djmnss4y3mnfsw45bnnvsxiyjomfrwg33vnz2c243mn52a.blob")
+  expect(appSelectionKey("auth0|user.name@example.com"))
+    .toBe("sand.client.slice.account.auth0%7Cuser%2Ename%40example%2Ecom.selection.last-agent")
+})
+
+async function withSelection(state, run) {
+  const profilePath = await mkdtemp(join(tmpdir(), "grok-selection-"))
+  const directory = join(profilePath, "sand-client-persistence")
+  const slot = "google-oauth2|fixture.user +中文"
+  const slotKey = "sand.client.slice.client-meta.account-slot"
+  const selectionKey = appSelectionKey(slot)
+  try {
+    await mkdir(directory)
+    await writeFile(join(directory, appPersistenceName(slotKey)), JSON.stringify({ schemaVersion: 1, value: slot }))
+    if (state !== "missing") await writeFile(join(directory, appPersistenceName(selectionKey)), state === "malformed" ? "{" : JSON.stringify({ schemaVersion: 1, value: { agentId: state } }))
+    await run(profilePath)
+  } finally { await rm(profilePath, { recursive: true, force: true }) }
+}
+
+const selectedAgent = "22222222-2222-4222-8222-222222222222"
+const otherAgent = "11111111-1111-4111-8111-111111111111"
+const selectionServer = agents => method => method === "ListGrokBotAgents" ? { agents: agents.map(agentId => ({ agentId, name: agentId })) }
+  : method === "ListGrokBotTranscriptEntries" ? { entries: [] } : { dispatched: true }
+
+test("app-bot resolves the app's .blob persisted selection for the dotted slot", async () => {
+  await withSelection(selectedAgent, async profilePath => {
+    const { driver, calls } = harness(selectionServer([otherAgent, selectedAgent]), {}, { profilePath })
+    try {
+      const run = await driver.create({}, { model: "app-bot", prompt: "hello" })
+      expect(run.ref.agentId).toBe(selectedAgent)
+      expect(calls.find(call => call.url.endsWith("SendGrokBotUserMessage")).body.agent_id).toBe(selectedAgent)
+    } finally { driver.dispose() }
+  })
+})
+
+for (const state of ["missing", "stale-agent", "malformed", "unreadable"]) test(`app-bot ${state} selection keeps the single-agent fallback and rejects ambiguity`, async () => {
+  await withSelection(state, async profilePath => {
+    const dependencies = { profilePath, ...(state === "unreadable" ? { readFile: async () => { throw Object.assign(new Error("denied"), { code: "EACCES" }) } } : {}) }
+    const single = harness(selectionServer([otherAgent]), {}, dependencies)
+    const multiple = harness(selectionServer([otherAgent, selectedAgent]), {}, dependencies)
+    try {
+      expect((await single.driver.create({}, { model: "app-bot", prompt: "hello" })).ref.agentId).toBe(otherAgent)
+      await expect(multiple.driver.create({}, { model: "app-bot", prompt: "hello" })).rejects.toMatchObject({ status: 400, signIn: "kept", message: expect.stringContaining("select a bot") })
+      expect(multiple.calls.some(call => call.url.endsWith("SendGrokBotUserMessage"))).toBe(false)
+    } finally { single.driver.dispose(); multiple.driver.dispose() }
+  })
+})
+
 const entry = (seq, body) => ({ seq: String(seq), updatedSeq: String(seq), entryId: `row-${seq}`, body: Buffer.from(JSON.stringify(body)).toString("base64") })
 const assistant = (seq, text) => entry(seq, { kind: "send-message", message: { type: "text", content: text } })
 

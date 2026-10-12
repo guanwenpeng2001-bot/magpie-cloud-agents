@@ -255,7 +255,8 @@ export function makeCursorCloud(options = {}) {
       async models(provider, { auth } = {}) {
         if (!valid(auth)) return provider.models
         const live = await driver.liveModels(auth)
-        return live ? { ...provider.models, ...live } : provider.models
+        // Seed live keys first, retaining floor entries and live metadata precedence.
+        return live ? { ...live, ...provider.models, ...live } : provider.models
       },
     },
   }

@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
 import { chatError } from "../lib/errors.mjs"
 import { withTimeout } from "../lib/http.mjs"
 import { makeTokenStore } from "./grok-bot-token.mjs"
@@ -73,6 +75,38 @@ export function transcriptEntry(entry) {
   } else return null
   if (typeof text !== "string") return null
   return { role, text, id: entry.entryId ?? entry.entry_id ?? body.id }
+}
+
+// Persistence filenames are the app's base32 client keys with its ".blob" extension
+// (Grok Bot 0.68.1 app.asar: pSr = base32(key) + ".blob"). The app also switches oversized
+// keys (encoded name over 240 chars) to a digest-framed base32 + ".kblob" name; both keys
+// in play are ~94 bytes, so that branch cannot fire here and is deliberately not implemented.
+function persistenceFilename(key) {
+  let output = "", bits = 0, buffer = 0
+  for (const byte of Buffer.from(key)) {
+    buffer = (buffer << 8) | byte
+    bits += 8
+    while (bits >= 5) { bits -= 5; output += "abcdefghijklmnopqrstuvwxyz234567"[(buffer >>> bits) & 31] }
+  }
+  if (bits) output += "abcdefghijklmnopqrstuvwxyz234567"[(buffer << (5 - bits)) & 31]
+  return output + ".blob"
+}
+
+async function selectedAgent(dependencies) {
+  try {
+    const profile = dependencies.profilePath ?? (process.env.APPDATA && join(process.env.APPDATA, "Grok Bot"))
+    if (!profile) return undefined
+    const reader = dependencies.readFile ?? readFile
+    const readValue = async key => {
+      const data = JSON.parse(await reader(join(profile, "sand-client-persistence", persistenceFilename(key)), "utf8"))
+      return data?.schemaVersion === 1 ? data.value : undefined
+    }
+    const slot = await readValue("sand.client.slice.client-meta.account-slot")
+    if (typeof slot !== "string" || !slot) return undefined
+    // The app escapes slots with encodeURIComponent plus "." -> "%2E" (app.asar sE).
+    const selection = await readValue(`sand.client.slice.account.${encodeURIComponent(slot).replaceAll(".", "%2E")}.selection.last-agent`)
+    return typeof selection?.agentId === "string" ? selection.agentId : undefined
+  } catch { return undefined }
 }
 
 export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
@@ -164,8 +198,10 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       let agentId = model
       if (!agentId || agentId === "app-bot") {
         const agents = await list(signal)
-        if (agents.length !== 1) throw chatError(400, "Grok Bot direct: select a bot from the model list", "kept")
-        agentId = agents[0].id
+        const selected = await selectedAgent(dependencies)
+        agentId = agents.find(agent => agent.id === selected)?.id
+        if (!agentId && agents.length === 1) agentId = agents[0].id
+        if (!agentId) throw chatError(400, "Grok Bot direct: select a bot by its model ID, or open Grok Bot desktop and select a bot before retrying app-bot", "kept")
       }
       return send(agentId, prompt, identity, signal)
     },
