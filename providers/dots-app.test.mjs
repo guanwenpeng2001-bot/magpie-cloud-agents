@@ -81,8 +81,9 @@ function fixture(settings = {}) {
     stopManaged: async row => { stoppedRows.push(row) },
     spawn(exe, argv, options) {
       const tag = argv.find(flag => flag.startsWith("--magpie-dots-managed="))?.split("=")[1]
-      const child = { exitCode: state.exited ? 0 : null, once() {} }
-      if (tag) managedRows.push({ pid: 100 + spawns.length, executable: exe, created: "spawned", managedTag: tag })
+      const pid = 100 + spawns.length
+      const child = { pid, exitCode: state.exited ? 0 : null, once(name, callback) { if (name === "error" && state.spawnError) queueMicrotask(() => callback(new Error(state.spawnError))) } }
+      if (tag) managedRows.push({ pid, executable: exe, created: "spawned", managedTag: tag })
       spawns.push({ exe, argv, options })
       return child
     },
@@ -294,11 +295,119 @@ test("liveModels reports the Dot from the app shell", async () => {
   finally { fake.close() }
 })
 
-for (const previous of [false, true]) test(`no debug endpoint fails fast without launching (running=${previous})`, async () => {
-  const fake = fixture({ previous, reattach: false })
+test("no reachable debug port launches the installed app with debug flags and no separate profile", async () => {
+  const fake = fixture({ previous: false, reattach: false, replies: ["回答"] })
   try {
-    expect((await (await fake.driver.authorize()).callback()).type).toBe("failed")
-    expect(fake.spawns).toHaveLength(0)
+    expect((await (await fake.driver.authorize()).callback()).type).toBe("success")
+    expect(fake.spawns).toHaveLength(1)
+    const launched = fake.spawns[0]
+    expect(launched.exe).toBe("C:\\Packages\\OpenAI.Codex\\ChatGPT.exe")
+    expect(launched.argv).toContain(`--remote-debugging-port=${Number(new URL(fake.endpoint).port)}`)
+    expect(launched.argv).toContain("--remote-debugging-address=127.0.0.1")
+    expect(launched.argv.some(flag => /^--magpie-dots-managed=\d+:[0-9a-f-]{36}$/.test(flag))).toBe(true)
+    expect(launched.argv.some(flag => flag.startsWith("--user-data-dir"))).toBe(false)
+    const run = await send(fake)
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "回答" })
+  } finally { fake.close() }
+  await Bun.sleep(10)
+  const tag = fake.spawns[0].argv.find(flag => flag.startsWith("--magpie-dots-managed="))?.split("=")[1]
+  expect(fake.stoppedRows).toHaveLength(1)
+  expect(fake.stoppedRows[0].managedTag).toBe(tag)
+})
+
+test("a launched instance that later exits on its own is not force-stopped", async () => {
+  const fake = fixture({ previous: false, reattach: false, replies: ["回答"] })
+  try {
+    const run = await send(fake)
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "回答" })
+    await fake.driver.liveModels(marker)
+    fake.managedRows.length = 0
+    fake.expireIdle()
+    await Bun.sleep(10)
+    expect(fake.stoppedRows).toHaveLength(0)
+  } finally { fake.close() }
+  await Bun.sleep(10)
+  expect(fake.stoppedRows).toHaveLength(0)
+})
+
+test("idle teardown of a launched instance terminates only the tagged instance, never the pre-existing one", async () => {
+  const fake = fixture({ previous: true, reattach: false, replies: ["回答"] })
+  try {
+    const run = await send(fake)
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "回答" })
+    await fake.driver.liveModels(marker)
+    expect(fake.spawns).toHaveLength(1)
+    fake.expireIdle()
+    await Bun.sleep(10)
+    expect(fake.stoppedRows).toHaveLength(1)
+    expect(fake.stoppedRows[0].pid).not.toBe(42)
+    expect(fake.stoppedRows[0].managedTag).toBe(fake.spawns[0].argv.find(flag => flag.startsWith("--magpie-dots-managed="))?.split("=")[1])
+  } finally { fake.close() }
+})
+
+test("launch teardown stops its own spawned child, never a same-tag same-exe foreign row", async () => {
+  const fake = fixture({ previous: false, reattach: false })
+  try {
+    await send(fake)
+    expect(fake.spawns).toHaveLength(1)
+    // A row this plugin instance never launched, listed before the child, carrying the identical
+    // tag and executable path: the teardown must still stop the spawned pid only.
+    const tag = fake.spawns[0].argv.find(flag => flag.startsWith("--magpie-dots-managed="))?.split("=")[1]
+    fake.managedRows.unshift({ pid: 777, executable: fake.spawns[0].exe, created: "spawned", managedTag: tag })
+  } finally { fake.close() }
+  await Bun.sleep(10)
+  expect(fake.stoppedRows).toHaveLength(1)
+  expect(fake.stoppedRows[0].pid).toBe(100)
+  expect(fake.stoppedRows.some(row => row.pid === 777)).toBe(false)
+})
+
+test("launch hands off to an already running instance without a port and fails without killing anything", async () => {
+  const fake = fixture({ previous: true, reattach: false, unreachable: true, exited: true })
+  try { await expectFailure(() => send(fake), "running", 409) } finally { fake.close() }
+  expect(fake.spawns).toHaveLength(1)
+  await Bun.sleep(10)
+  // The fake's process table still lists the exited child, so the teardown may stop that child
+  // (pid 100, this launch's own spawn) — but nothing else, and never the pre-existing pid 42.
+  expect(fake.stoppedRows.map(row => row.pid)).toEqual([100])
+  expect(fake.stoppedRows.some(row => row.pid === 42)).toBe(false)
+})
+
+test("launched app that exits immediately without a running instance fails with a dedicated message", async () => {
+  const fake = fixture({ previous: false, reattach: false, unreachable: true, exited: true })
+  try { await expectFailure(() => send(fake), "launch") } finally { fake.close() }
+})
+
+test("a spawn failure surfaces the underlying reason instead of a generic error", async () => {
+  const fake = fixture({ previous: false, reattach: false, unreachable: true, spawnError: "spawn ChatGPT.exe ENOENT" })
+  let error
+  try {
+    try { await send(fake) } catch (caught) { error = caught }
+    expect(error?.message).toContain("failed to start the ChatGPT desktop app")
+    expect(error?.message).toContain("spawn ChatGPT.exe ENOENT")
+  } finally { fake.close() }
+})
+
+test("waiting for the launched app's debug port is bounded and reports the debug error on timeout", async () => {
+  const fake = fixture({ previous: false, reattach: false, unreachable: true })
+  try { await expectFailure(() => send(fake), "debug") } finally { fake.close() }
+})
+
+test("a slow handoff alongside a pre-existing instance reports the running error on timeout, not the debug error", async () => {
+  const fake = fixture({ previous: true, reattach: false, unreachable: true })
+  try { await expectFailure(() => send(fake), "running", 409) } finally { fake.close() }
+  await Bun.sleep(10)
+  expect(fake.stoppedRows.some(row => row.pid === 42)).toBe(false)
+})
+
+test("sign-in instructions describe the launch behaviour instead of manual debug flags", async () => {
+  const fake = fixture()
+  try {
+    const instructions = (await fake.driver.authorize()).instructions
+    expect(instructions).toContain("launches")
+    expect(instructions).not.toContain("--remote-debugging-port")
   } finally { fake.close() }
 })
 
