@@ -197,7 +197,8 @@ export function makeGrokBotDirect(input, options = {}, dependencies = {}) {
       const echoIndex = ordered.findIndex(row => (row.entryId ?? row.entry_id) === echoId && echoId)
       // A duplicate's baseline may already contain its answer; trust the located echo instead.
       const replay = run.view.duplicate && echoIndex >= 0
-      const candidates = ordered.filter((row, index) => (replay || !run.view.baseline.has(row.entryId ?? row.entry_id ?? String(row.seq))) && (echoIndex < 0 || index > echoIndex))
+      const nextUserIndex = replay ? ordered.findIndex((row, index) => index > echoIndex && transcriptEntry(row)?.role === "user") : -1
+      const candidates = ordered.filter((row, index) => (replay || !run.view.baseline.has(row.entryId ?? row.entry_id ?? String(row.seq))) && (echoIndex < 0 || index > echoIndex) && (nextUserIndex < 0 || index < nextUserIndex))
       const replies = candidates.map(transcriptEntry).filter(row => row?.role === "assistant" && row.text.trim())
       const fingerprint = JSON.stringify(ordered)
       const accepted = SEND_STATUS.accepted.includes(status.status)
