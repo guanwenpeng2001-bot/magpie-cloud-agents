@@ -2,6 +2,11 @@ import { expect, test } from "bun:test"
 import { makeDotsDriver } from "./dots.mjs"
 import { createDotsApp, findChatGptApp, connectCdp, SEND_BUTTON_MATCH, DOTS_APP_ERRORS } from "./dots-app.mjs"
 
+import { readFile } from "node:fs/promises"
+import { spawn, execFile } from "node:child_process"
+import { promisify } from "node:util"
+import { randomUUID } from "node:crypto"
+
 const marker = { type: "oauth", access: "app-local", refresh: "dots-app-cdp", accountId: "dots-app", mechanism: "app-drive" }
 const messages = DOTS_APP_ERRORS
 const DOTS_ROUTE = "app://-/index.html?initialRoute=%2Fdots"
@@ -18,7 +23,7 @@ async function expectFailure(operation, key, status = 502, signIn = "kept") {
 function fixture(settings = {}) {
   const frames = [], spawns = [], timers = new Map(), managedRows = [], stoppedRows = []
   let timestamp = 0, nextTimer = 0, clients = []
-  const state = { sidebar: true, route: DOTS_ROUTE, composer: true, sendButton: true, rows: [], replies: [], ...settings }
+  const state = { previous: true, reattach: true, sidebar: true, route: DOTS_ROUTE, composer: true, sendButton: true, rows: [], replies: [], ...settings }
   const auto = new Set([200, 250])
   const timerApi = {
     now: () => timestamp,
@@ -103,6 +108,47 @@ function fixture(settings = {}) {
 }
 const send = fixture => fixture.driver.create(marker, { prompt: "hello" })
 
+test("real production teardown guard terminates only the identified tagged process under Windows PowerShell", async () => {
+  if (process.platform !== "win32") return
+  const source = await readFile(new URL("./dots-app.mjs", import.meta.url), "utf8")
+  const guard = source.match(/const script = (`[^`]+`)/)[1]
+  const script = new Function(`return ${guard}`)()
+  const projection = source.match(/Select-Object ProcessId,CommandLine,ExecutablePath,([^\n]+?)\) \| ConvertTo-Json/)[1]
+  const tag = `${process.pid}:${randomUUID()}`
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", `--magpie-dots-managed=${tag}`], { stdio: "ignore" })
+  const execute = promisify(execFile)
+  const alive = () => { try { process.kill(child.pid, 0); return true } catch { return false } }
+  async function stop(row) {
+    await new Promise((resolve, reject) => {
+      const command = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 5000, windowsHide: true }, error => error ? reject(error) : resolve())
+      command.stdin.end(JSON.stringify(row))
+    })
+  }
+  try {
+    const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `Get-CimInstance Win32_Process -Filter "ProcessId=${child.pid}" | Select-Object ProcessId,CommandLine,ExecutablePath,${projection} | ConvertTo-Json -Compress`])
+    const observed = JSON.parse(stdout)
+    const row = { pid: observed.ProcessId, executable: observed.ExecutablePath, created: observed.CreationDate, managedTag: tag }
+    for (const changed of [{ created: "0" }, { executable: "C:\\not-the-executable.exe" }, { managedTag: "" }, { managedTag: tag.slice(0, -1) }, { managedTag: `${process.pid}:${randomUUID()}` }]) {
+      await stop({ ...row, ...changed })
+      expect(alive()).toBe(true)
+    }
+    await stop(row)
+    expect(alive()).toBe(false)
+  } finally { if (alive()) child.kill() }
+}, 30000)
+
+test("failed conversation reset releases the slot for a fresh ask", async () => {
+  const fake = fixture()
+  try {
+    const run = await send(fake)
+    await fake.driver.poll(marker, run)
+    fake.state.rows = []
+    expect((await fake.driver.poll(marker, run)).state).toBe("failed")
+    const fresh = await send(fake)
+    expect(fresh.prompt).toBe("hello")
+  } finally { fake.close() }
+})
+
 test("discovery resolves the exe under the app\\ subdirectory and at the install root", async () => {
   const underApp = await findChatGptApp({ appx: async () => ["C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1007.2314.0_x64__2p2nqsd0c76g0"], exists: async path => path === "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1007.2314.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe" })
   expect(underApp).toBe("C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1007.2314.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe")
@@ -132,9 +178,7 @@ test("launch binds debug argv to loopback, clears and types into the Dot surface
   const fake = fixture({ replies: ["收到"] })
   try {
     const run = await send(fake)
-    expect(fake.spawns[0].argv.slice(0, 2)).toEqual([`--remote-debugging-port=${new URL(fake.endpoint).port}`, "--remote-debugging-address=127.0.0.1"])
-    expect(fake.spawns[0].argv[2]).toMatch(/^--magpie-dots-managed=\d+:[0-9a-f-]{36}$/)
-    expect(fake.spawns[0].argv[3]).toMatch(/^--user-data-dir=.+/)
+    expect(fake.spawns).toHaveLength(0)
     const inserted = fake.frames.filter(frame => frame.method === "Input.insertText")
     expect(inserted).toHaveLength(1)
     expect(inserted[0].params.text).toBe(run.prompt)
@@ -250,40 +294,11 @@ test("liveModels reports the Dot from the app shell", async () => {
   finally { fake.close() }
 })
 
-test("sign-in with the app closed launches a tagged managed instance and succeeds", async () => {
-  const fake = fixture()
+for (const previous of [false, true]) test(`no debug endpoint fails fast without launching (running=${previous})`, async () => {
+  const fake = fixture({ previous, reattach: false })
   try {
-    expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" })
-    expect(fake.spawns).toHaveLength(1)
-  } finally { fake.close() }
-  await Bun.sleep(10)
-  expect(fake.stoppedRows).toHaveLength(1)
-  expect(fake.stoppedRows[0].managedTag).toMatch(/^[0-9]+:[0-9a-f-]{36}$/)
-})
-
-test("sign-in with a running untagged app launches its own managed instance instead of failing", async () => {
-  const fake = fixture({ previous: true })
-  try {
-    expect(await (await fake.driver.authorize()).callback()).toEqual({ type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" })
-    expect(fake.spawns).toHaveLength(1)
-    expect(fake.spawns[0].argv[3]).toMatch(/^--user-data-dir=.+/)
-  } finally { fake.close() }
-  await Bun.sleep(10)
-  expect(fake.stoppedRows).toHaveLength(1)
-  expect(fake.stoppedRows.every(row => row.pid !== 42)).toBe(true)
-})
-
-test("a launch that exits while the app is running reports 409 without telling the user to close anything", async () => {
-  const fake = fixture({ previous: true, exited: true, unreachable: true })
-  try { await expectFailure(() => send(fake), "running", 409) } finally { fake.close() }
-})
-
-test("sign-in when the app never opens a debug interface fails and never silently succeeds", async () => {
-  const fake = fixture({ unreachable: true })
-  try {
-    const result = await (await fake.driver.authorize()).callback()
-    expect(result).toEqual({ type: "failed", error: messages.debug })
-    expect(fake.spawns.length).toBeGreaterThan(0)
+    expect((await (await fake.driver.authorize()).callback()).type).toBe("failed")
+    expect(fake.spawns).toHaveLength(0)
   } finally { fake.close() }
 })
 
@@ -306,20 +321,17 @@ test("reattaching to a running app with a debug port never launches or terminate
   expect(fake.stoppedRows).toHaveLength(0)
 })
 
-test("idle teardown stops only the owned managed instance and never while a turn is active", async () => {
-  const fake = fixture({ previous: true, replies: ["answer"] })
+test("idle teardown disconnects without terminating an untagged app", async () => {
+  const fake = fixture({ replies: ["answer"] })
   try {
     const run = await send(fake)
     fake.expireIdle()
     expect(fake.stoppedRows).toHaveLength(0)
-    expect((await fake.driver.poll(marker, run)).state).toBe("running")
-    fake.expireIdle()
-    expect(fake.stoppedRows).toHaveLength(0)
-    expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "answer" })
+    await fake.driver.poll(marker, run)
+    await fake.driver.poll(marker, run)
     fake.expireIdle()
     await Bun.sleep(10)
-    expect(fake.stoppedRows).toHaveLength(1)
-    expect(fake.stoppedRows.every(row => row.pid !== 42)).toBe(true)
+    expect(fake.stoppedRows).toHaveLength(0)
   } finally { fake.close() }
 })
 

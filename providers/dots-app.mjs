@@ -1,17 +1,15 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 import { access } from "node:fs/promises"
-import { spawn, execFile } from "node:child_process"
+import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { win32 } from "node:path"
-import { tmpdir } from "node:os"
-import { createServer } from "node:net"
 import { chatError } from "../lib/errors.mjs"
 import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
 
 export const DOTS_APP_ERRORS = {
   missing: "ChatGPT desktop isn't installed — install the OpenAI ChatGPT app from the Microsoft Store and sign in once, then retry",
   signedOut: "ChatGPT desktop isn't signed in — open it and sign in once; Magpie will drive the Dot after that",
-  running: "Magpie couldn't start its own ChatGPT instance — the launch exited before its debug interface opened; retry the sign-in",
+  running: "ChatGPT has no reachable loopback debug port. App-drive attaches to an already signed-in ChatGPT started with --remote-debugging-port=9333 --remote-debugging-address=127.0.0.1; it cannot enable debugging in a running instance or launch an isolated signed-in copy. Use the bundled-tunnel sign-in, or enable those flags on your next normal app launch.",
   changed: "ChatGPT changed its UI; the dots provider needs an update",
   crashed: "ChatGPT closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
   reset: "The Dot conversation was reset — asking again sends it as a new task",
@@ -24,7 +22,7 @@ const SHELL_PAGE = "app://-/index.html"
 const DOTS_ROUTE = "app://-/index.html?initialRoute=%2Fdots"
 
 async function processes() {
-  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,CreationDate) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
+  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().Ticks.ToString()}}) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
   const rows = JSON.parse(stdout || "[]")
   return (Array.isArray(rows) ? rows : [rows]).map(row => ({ pid: row.ProcessId, executable: row.ExecutablePath, created: row.CreationDate, managedTag: row.CommandLine?.match(/--magpie-dots-managed=([0-9]+:[0-9a-f-]+)/)?.[1], port: Number(row.CommandLine?.match(/--remote-debugging-port[= ](\d+)/)?.[1]) || undefined }))
 }
@@ -32,17 +30,10 @@ function parentAlive(pid) {
   try { process.kill(pid, 0); return true } catch (error) { return error.code !== "ESRCH" }
 }
 async function stopManaged(row) {
-  const script = `$expected = [Console]::In.ReadToEnd() | ConvertFrom-Json; $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"; if ($process -and $process.ExecutablePath -eq $expected.executable -and $process.CreationDate -eq $expected.created -and $process.CommandLine.Contains("--magpie-dots-managed=$($expected.managedTag)")) { Invoke-CimMethod -InputObject $process -MethodName Terminate | Out-Null }`
+  const script = `$expected = [Console]::In.ReadToEnd() | ConvertFrom-Json; $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"; if ($process -and $process.ExecutablePath -eq $expected.executable -and $process.CreationDate.ToUniversalTime().Ticks.ToString() -ceq $expected.created -and $expected.managedTag -cmatch '^[1-9][0-9]*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' -and $process.CommandLine -cmatch ('(?:^|\\s)--magpie-dots-managed=' + [regex]::Escape($expected.managedTag) + '(?=\\s|$)')) { Invoke-CimMethod -InputObject $process -MethodName Terminate | Out-Null }`
   const child = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 5000 })
   child.stdin.end(JSON.stringify(row))
   await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", code => code === 0 ? resolve() : reject(failure("debug"))) })
-}
-async function freePort() {
-  const server = createServer()
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve) })
-  const port = server.address().port
-  await new Promise(resolve => server.close(resolve))
-  return port
 }
 async function readAppxLocations() {
   try {
@@ -138,11 +129,10 @@ const CLEAR_KEYS = [
 ]
 
 export function createDotsApp(options = {}, dependencies = options.dependencies ?? {}) {
-  const deps = { env: process.env, spawn, processes, parentAlive, stopManaged, freePort, exists: path => access(path).then(() => true, () => false), appx: readAppxLocations, fetch: globalThis.fetch, timers: clock, connect: connectCdp, ...dependencies }
+  const deps = { env: process.env, processes, parentAlive, stopManaged, exists: path => access(path).then(() => true, () => false), appx: readAppxLocations, fetch: globalThis.fetch, timers: clock, connect: connectCdp, ...dependencies }
   const timers = deps.timers
   let connection, connecting, owned, idleTimer
   const active = new Map()
-  const launchErrors = new WeakSet()
   const touch = () => { timers.clearTimeout(idleTimer) }
   function release(run) {
     run.signal?.removeEventListener("abort", run.onAbort)
@@ -153,7 +143,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     if (active.size) return
     idleTimer = timers.setTimeout(() => {
       connection?.close(); connection = undefined
-      if (owned) { const child = owned; owned = undefined; if (child.exitCode == null && !launchErrors.has(child)) child.kill() }
+      if (owned) { const child = owned; owned = undefined; if (child.exitCode == null) child.kill() }
     }, (options.keepAliveMinutes ?? 15) * 60000)
     idleTimer?.unref?.()
   }
@@ -209,34 +199,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
       await adopt(previous, attached.port, executable)
       return attached.client
     }
-    const port = await deps.freePort()
-    const managedTag = `${process.pid}:${randomUUID()}`
-    const userDataDir = win32.join(deps.env.LOCALAPPDATA || tmpdir(), "Magpie", "dots-app-managed-profile")
-    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-dots-managed=${managedTag}`, `--user-data-dir=${userDataDir}`], { stdio: "ignore", windowsHide: false })
-    child.once?.("error", () => launchErrors.add(child))
-    // A separate user-data-dir lets a managed instance run beside the user's own app.
-    // Teardown revalidates tag, executable and creation time through the live process
-    // table, so a process without our tag is never terminated.
-    owned = { exitCode: null, kill: () => {
-      void deps.processes().then(rows => {
-        const row = rows.find(current => current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
-        if (row) return deps.stopManaged(row)
-      }).catch(() => {})
-    } }
-    const started = timers.now()
-    let lastError
-    while (timers.now() - started < (options.launchTimeoutMs ?? 20000)) {
-      signal?.throwIfAborted()
-      if (await version(port, signal)) {
-        try { return await attach(port, signal) }
-        catch (error) { lastError = error }
-      }
-      if (launchErrors.has(child)) break
-      await sleep(200, signal, timers)
-    }
-    if (lastError?.status === 401) throw lastError
-    if (previous.length && child.exitCode != null) throw failure("running")
-    throw failure("debug")
+    throw failure("running")
   }
   async function ensure(signal) {
     touch()
@@ -276,7 +239,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     const list = Array.isArray(rows) ? rows : []
     const fresh = list.filter(row => row.id && !run.baseline.has(row.id))
     if (fresh.length) run.sawTurn = true
-    if (run.sawTurn && !fresh.length) return { state: "failed", progress: DOTS_APP_ERRORS.reset }
+    if (run.sawTurn && !fresh.length) { release(run); return { state: "failed", progress: DOTS_APP_ERRORS.reset } }
     const reply = [...fresh].reverse().find(row => !row.self)
     const text = reply ? String(reply.text ?? "") : ""
     if (reply && text.trim() && text === run.lastText && timers.now() - run.lastTextAt >= (options.stableMs ?? 3000)) {
@@ -338,7 +301,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
   return {
     id: "dots", name: "ChatGPT Dot (app-drive)",
     async authorize() {
-      return { url: "", method: "auto", instructions: "Magpie drives the Dot inside the installed ChatGPT desktop app — no MCP connector, no bearer token, no developer mode and no tunnel. Keep ChatGPT signed in; when you chat, Magpie opens (or attaches to) the app over a local-only debug port, opens the Dot surface, types the prompt and reads the reply. No credential leaves this PC. If ChatGPT has no attachable debug port, Magpie starts a separate managed instance with its own profile; that profile may require its own sign-in.", callback: async () => {
+      return { url: "", method: "auto", instructions: `Magpie attaches to the signed-in ChatGPT desktop app over an existing loopback-only debug port. It does not launch another app or copy your profile. No MCP connector, bearer token, developer mode or tunnel is needed when that endpoint is available. If unavailable, choose bundled-tunnel sign-in or use --remote-debugging-port=9333 --remote-debugging-address=127.0.0.1 on your next normal app launch. A hidden renderer works; the process must remain alive. Completion is inferred after ${options.stableMs ?? 3000} ms of unchanged reply text; a longer pause mid-answer can truncate the result. Configure dotsApp.stableMs to increase that interval.`, callback: async () => {
         try { await checkDrivable(); return { type: "success", refresh: "dots-app-cdp", access: "app-local", expires: 0, accountId: "dots-app", mechanism: "app-drive" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
@@ -354,7 +317,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     create, poll, stream,
     cancel(credential, run) { if (active.get("dot") === run) release(run); idle() },
     followUp(credential, run, texts, signal) { return create(credential, { prompt: texts.join("\n"), turnIndex: run.turnIndex + 1, sessionKey: run.sessionKey }, signal) },
-    dispose() { touch(); connection?.close(); connection = undefined; if (owned) { if (owned.exitCode == null && !launchErrors.has(owned)) owned.kill(); owned = undefined } },
+    dispose() { touch(); connection?.close(); connection = undefined; if (owned) { if (owned.exitCode == null) owned.kill(); owned = undefined } },
     checkDrivable,
   }
 }
