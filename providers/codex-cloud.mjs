@@ -22,8 +22,11 @@ const noCloudEnvironmentMessage = refusal => `the codex CLI refused this workspa
 // The CLI's refusal for an environment id that does not exist on this account, measured live
 // (2026-10-14): `codex cloud exec --env <unknown-id>` exits 1 with exactly this sentence once at
 // least one environment exists. Unlike the no-environment refusal it names a stale id, not an
-// empty workspace, but it is the same class of account configuration the client must fix.
-const STALE_ENVIRONMENT = /\benvironment '[^']+' not found\b/i
+// empty workspace, but it is the same class of account configuration the client must fix. The
+// anchor to the CLI's own refusal line is load-bearing: failed task summaries and diff bodies can
+// legitimately contain the phrase "environment 'x' not found", and matching those would misreport
+// a task failure as an account-configuration 400.
+const STALE_ENVIRONMENT = /^\s*error: environment '[^']+' not found\b/im
 const staleEnvironmentMessage = refusal => `the codex CLI rejected this environment: ${refusal.trim()} — the saved or discovered environment id is not valid for this account. Re-login to the codex CLI, or set a valid id via account metadata.env or option codexCloud.env`
 const marker = auth => auth?.type === "oauth" && auth.access === "codex-cli" && auth.refresh === "codex-cli"
 const outputOf = result => [result.stdout, result.stderr].filter(Boolean).join("\n")
@@ -105,7 +108,12 @@ function stateOf(text, prompt = "") {
     for (const echo of echoed) line = line.split(echo).join(" ")
     line = line.trim()
     const bracketed = /^\[([A-Za-z][A-Za-z ]*)\]/.exec(line)
-    if (bracketed) { states.push(bracketStates[bracketed[1].trim().toLowerCase()] ?? "running"); continue }
+    if (bracketed) {
+      const token = bracketed[1].trim().toLowerCase()
+      // Object.hasOwn keeps tokens like [CONSTRUCTOR] from resolving through Object.prototype.
+      states.push(Object.hasOwn(bracketStates, token) ? bracketStates[token] : "running")
+      continue
+    }
     const positioned = /\[([^\]]+)\]\s*$/.exec(line)?.[1] ?? /^(?:status|state)\s*:\s*(.+)$/i.exec(line)?.[1] ?? /^task[_-][\w-]+\s+.+\s{2,}([a-z]+|in progress)$/i.exec(line)?.[1]
     const candidate = positioned ?? line.replace(/^task\s+/i, "")
     const match = /^(complet\w*|succeed\w*|done|finish\w*|fail\w*|error\w*|cancel\w*|expir\w*|running|working|queued|pending|in progress)\b(?=$|[.:,;\s—])/i.exec(candidate)
@@ -125,9 +133,10 @@ function checkExit(result) {
   if (result.code !== 0) {
     // A workspace without a Codex Cloud environment is account configuration the user must change,
     // so it is a 400 client error (normalizeError passes 4xx through to the client), never a
-    // retryable 502.
-    if (NO_CLOUD_ENVIRONMENT.test(text)) throw chatError(400, noCloudEnvironmentMessage(text))
-    if (STALE_ENVIRONMENT.test(text)) throw chatError(400, staleEnvironmentMessage(text))
+    // retryable 502. The refusal kind is carried on the error because the wrapped message no longer
+    // keeps the refusal line at a line start, which the anchored STALE_ENVIRONMENT requires.
+    if (NO_CLOUD_ENVIRONMENT.test(text)) throw Object.assign(chatError(400, noCloudEnvironmentMessage(text)), { refusal: "no-cloud-environment" })
+    if (STALE_ENVIRONMENT.test(text)) throw Object.assign(chatError(400, staleEnvironmentMessage(text)), { refusal: "stale-environment" })
     throw chatError(/\b(rate limit|rate limited|too many requests|429)\b/i.test(text) ? 429 : 502, text || "the codex CLI exited without output")
   }
   return result
@@ -182,7 +191,7 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
       let created
       try { created = checkExit(await execute()) }
       catch (error) {
-        if (fromOption || error.status !== 400 || !(NO_CLOUD_ENVIRONMENT.test(error.message) || STALE_ENVIRONMENT.test(error.message))) throw error
+        if (fromOption || error.status !== 400 || !(error.refusal === "no-cloud-environment" || error.refusal === "stale-environment")) throw error
         const discovered = discoverEnvironment(statePaths).env
         if (!discovered || discovered === env) throw error
         env = discovered

@@ -661,6 +661,8 @@ for (const [state, tokens] of [
   ["expired", ["EXPIRED"]],
   ["running", ["PENDING", "QUEUED", "RUNNING", "WORKING", "STARTING", "IN PROGRESS", "MYSTERY"]],
 ]) for (const token of tokens) test(`leading bracket token [${token}] means ${state}`, () => expect(_internal.stateOf(`[${token}] Pong\ncodex-usage-float  •  1m ago\nno diff`)).toBe(state))
+// Object.prototype property names must resolve through the unknown-token default, not the prototype chain.
+for (const token of ["CONSTRUCTOR", "TOSTRING", "VALUEOF", "HASOWNPROPERTY"]) test(`bracket token [${token}] falls through to running, never an Object.prototype member`, () => expect(_internal.stateOf(`[${token}] Pong\ncodex-usage-float  •  1m ago\nno diff`)).toBe("running"))
 
 test("an exit-1 [ERROR] status is a terminal failed poll, not a throw", async () => {
   const script = scripted([reply(liveCaptures.error, 1)])
@@ -711,6 +713,22 @@ test("a stale discovered id equal to the refused id never retries", async () => 
   const script = scripted([reply(environmentRefusal, 1)])
   await expect(_internal.makeDriver({}, script.cli, [stateFile]).create({}, { prompt: "hi" })).rejects.toMatchObject({ status: 400 })
   expect(script.calls).toHaveLength(1)
+})
+test("a failed task summary mentioning the phrase is a task failure, not a stale-environment refusal", async () => {
+  const script = scripted([reply("[ERROR] Pong\nfixed the crash where environment 'prod' not found was thrown\nno diff", 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).resolves.toMatchObject({ state: "failed" })
+})
+test("a task-'not found' message that also carries the phrase still takes the failed shortcut", async () => {
+  const script = scripted([reply("no such task; environment 'prod' not found in registry", 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).resolves.toMatchObject({ state: "failed" })
+})
+test("a diff failure whose body mentions the phrase still throws instead of a stale-environment 400", async () => {
+  const script = scripted([reply("Status: succeeded"), reply('diff --git a/x b/x\n+ throw new Error("environment \'prod\' not found")', 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).rejects.toMatchObject({ status: 502, message: expect.stringContaining("environment 'prod' not found") })
+})
+test("the genuine stale-environment refusal in status output still classifies as a 400", async () => {
+  const script = scripted([reply(environmentRefusal, 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).rejects.toMatchObject({ status: 400, message: expect.stringContaining("not valid for this account") })
 })
 test("a bare 32-hex environment id is discovered and used as-is", async () => {
   const bare = "6acf7082b20881919e1bffba47fc8d83"
