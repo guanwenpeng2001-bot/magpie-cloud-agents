@@ -121,6 +121,11 @@ function checkExit(result) {
 function codexStatePaths() {
   return [...new Set([process.env.CODEX_HOME, join(homedir(), ".codex")].filter(Boolean).map(home => resolve(home, ".codex-global-state.json")))]
 }
+function canonicalEnvironment(id) {
+  if (!id.startsWith("ccarenv_b64_")) return id
+  const decoded = Buffer.from(id.slice("ccarenv_b64_".length), "base64url").toString("utf8")
+  return /^ccarenv_[A-Za-z0-9_-]+$/.test(decoded) ? decoded : id
+}
 function discoverEnvironment(paths) {
   const searched = []
   for (const path of paths) {
@@ -132,7 +137,7 @@ function discoverEnvironment(paths) {
       if (!Array.isArray(thread?.environments)) continue
       for (const environment of thread.environments) {
         const id = environment?.environmentId
-        if (typeof id === "string" && /^(?:env_|ccarenv_)[A-Za-z0-9_-]+$/.test(id)) return { env: id, searched }
+        if (typeof id === "string" && /^(?:env_|ccarenv_)[A-Za-z0-9_-]+$/.test(id)) return { env: canonicalEnvironment(id), searched }
       }
     }
     searched.push(`${path} (no cloud task environment)`)
@@ -142,7 +147,7 @@ function discoverEnvironment(paths) {
 function resolveEnvironment(metadataEnv, options, paths) {
   for (const value of [metadataEnv, options.codexCloud?.env]) if (value != null && typeof value !== "string") throw chatError(400, "metadata.env and codexCloud.env must be strings")
   const explicit = metadataEnv?.trim() || options.codexCloud?.env?.trim()
-  if (explicit) return explicit
+  if (explicit) return canonicalEnvironment(explicit)
   const discovered = discoverEnvironment(paths)
   if (discovered.env) return discovered.env
   throw chatError(400, `Codex Cloud could not discover an environment id. Searched: ${discovered.searched.join("; ")}. Open a Codex cloud task to populate the local cache, or set account metadata.env or option codexCloud.env.`)
@@ -152,11 +157,21 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
   return {
     id: ID, name: NAME, staticModels: MODELS,
     async create(credential, { prompt }, signal) {
-      const env = resolveEnvironment(credential.metadata?.env, options, statePaths)
+      let env = resolveEnvironment(credential.metadata?.env, options, statePaths)
+      const fromOption = !credential.metadata?.env?.trim() && !!options.codexCloud?.env?.trim()
       const attempts = options.codexCloud?.attempts ?? 1
       if (!Number.isInteger(attempts) || attempts < 1) throw chatError(400, "codexCloud.attempts must be a positive integer")
       const run = { children: new Set(), prompt }
-      const created = checkExit(await cli(["cloud", "exec", "--env", env, "--attempts", String(attempts), "--", prompt], { signal, children: run.children }))
+      const execute = () => cli(["cloud", "exec", "--env", env, "--attempts", String(attempts), "--", prompt], { signal, children: run.children })
+      let created
+      try { created = checkExit(await execute()) }
+      catch (error) {
+        if (fromOption || error.status !== 400 || !NO_CLOUD_ENVIRONMENT.test(error.message)) throw error
+        const discovered = discoverEnvironment(statePaths).env
+        if (!discovered || discovered === env) throw error
+        env = discovered
+        created = checkExit(await execute())
+      }
       let task = taskOf(created.stdout)
       if (!task) {
         run.inferred = true
@@ -231,7 +246,11 @@ export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now,
             url: "", instructions: "Reuses the codex CLI's own login and discovers the environment from local Codex state unless explicitly configured. Only the resolved environment id is stored; Codex state is never changed.\n\nProvider notes: " + STATUS_NOTES, method: "auto",
             async callback() {
               let env
-              try { env = resolveEnvironment(inputs?.env, options, statePaths); await verify() }
+              try {
+                env = resolveEnvironment(inputs?.env, options, statePaths)
+                await verify()
+                checkExit(await cli(["cloud", "list", "--env", env, "--limit", "1"]))
+              }
               catch (error) { return { type: "failed", error: error.message } }
               return { type: "success", refresh: "codex-cli", access: "codex-cli", expires: 0, accountId: "env:" + env, env }
             },

@@ -30,6 +30,13 @@ const request = (messages = [{ role: "user", content: "fix it" }], stream = fals
 const endpoint = "https://codex-cloud.cloud-agents.invalid/v1/chat/completions"
 const fakeSpawn = (row, extra = {}) => _internal.spawnCodex([fixture, "login", "status"], { env: { PATH: directory, FAKE_REPLY: JSON.stringify(row), ...extra } })
 
+test("sign-in refuses an unavailable environment before saving credentials", async () => {
+  const script = scripted([reply("Logged in"), reply("", 1, workspaceRefusal)])
+  const result = await makeCodexCloud({}, script).auth.methods[0].authorize({ env: "stale" }).callback()
+  expect(result).toEqual({ type: "failed", error: `the codex CLI refused this workspace: ${workspaceRefusal.trim()} — your account has no Codex Cloud environment. Create one in your OpenAI Codex Cloud settings, or point the plugin at an existing environment with account metadata.env or option codexCloud.env` })
+  expect(script.calls[1].args).toEqual(["cloud", "list", "--env", "stale", "--limit", "1"])
+})
+
 test("loader rejects oauth rows without the codex-cli marker", async () => {
   expect(await makeCodexCloud().auth.loader(async () => ({ type: "oauth", env: "env_fake" }))).toEqual({})
 })
@@ -91,6 +98,72 @@ const cloudState = JSON.stringify({
 })
 writeFileSync(stateFile, cloudState)
 
+test("wrapped cached environment ids reach the CLI in canonical form", async () => {
+  const canonical = "ccarenv_6abbe3611390819195c4b7833a95c978"
+  const wrapped = "ccarenv_b64_" + Buffer.from(canonical).toString("base64url")
+  const script = scripted([reply("task_abc123")])
+  await _internal.makeDriver({}, script.cli, []).create({ metadata: { env: wrapped } }, { prompt: "hi" })
+  expect(script.calls[0].args[3]).toBe(canonical)
+})
+
+test("sign-in probes a wrapped local cache id as canonical and leaves both forms unchanged on disk", async () => {
+  const canonical = "ccarenv_6abbe3611390819195c4b7833a95c978"
+  const wrapped = "ccarenv_b64_" + Buffer.from(canonical).toString("base64url")
+  const path = join(directory, "wrapped-cache.json")
+  const contents = JSON.stringify({ "electron-persisted-atom-state": { "cloud-aeon-sidebar-cache-v1": { threads: [{ environments: [{ environmentId: wrapped }, { environmentId: canonical }] }] } } })
+  writeFileSync(path, contents)
+  const script = scripted([reply("Logged in"), reply("")])
+  const result = await makeCodexCloud({}, { ...script, statePaths: [path] }).auth.methods[0].authorize().callback()
+  expect(result).toMatchObject({ type: "success", env: canonical, accountId: "env:" + canonical })
+  expect(script.calls[1].args).toEqual(["cloud", "list", "--env", canonical, "--limit", "1"])
+  expect(readFileSync(path, "utf8")).toBe(contents)
+})
+
+test("create rediscovers a refused saved environment and retries once", async () => {
+  const script = scripted([reply(workspaceRefusal, 1), reply("task_abc123")])
+  const run = await _internal.makeDriver({}, script.cli, [stateFile]).create({ metadata: { env: "stale" } }, { prompt: "hi" })
+  expect(run.ref).toBe("task_abc123")
+  expect(script.calls.map(call => call.args[3])).toEqual(["stale", "ccarenv_b64_fixture"])
+})
+
+for (const source of ["option", "same", "missing", "equivalent"]) test(`refused environment does not retry for ${source}`, async () => {
+  const canonical = "ccarenv_unchanged"
+  const wrapped = "ccarenv_b64_" + Buffer.from(canonical).toString("base64url")
+  const path = join(directory, `no-retry-${source}.json`)
+  writeFileSync(path, JSON.stringify({ "electron-persisted-atom-state": { "cloud-aeon-sidebar-cache-v1": { threads: [{ environments: [{ environmentId: source === "equivalent" ? wrapped : "env_cached" }] }] } } }))
+  const script = scripted([reply(workspaceRefusal, 1)])
+  const options = source === "option" ? { codexCloud: { env: "explicit" } } : {}
+  const credential = source === "option" ? {} : { metadata: { env: source === "equivalent" ? canonical : "env_cached" } }
+  await expect(_internal.makeDriver(options, script.cli, source === "missing" ? [] : [path]).create(credential, { prompt: "hi" })).rejects.toMatchObject({ status: 400, message: expect.stringContaining(workspaceRefusal.trim()) })
+  expect(script.calls).toHaveLength(1)
+})
+
+test("cached environment is rediscovered after refusal and fallback list uses the new id", async () => {
+  const path = join(directory, "changing-cache.json")
+  const state = env => JSON.stringify({ "electron-persisted-atom-state": { "cloud-aeon-sidebar-cache-v1": { threads: [{ environments: [{ environmentId: env }] }] } } })
+  writeFileSync(path, state("env_old"))
+  const script = scripted([reply(workspaceRefusal, 1), reply("submitted"), reply("task_abc123")])
+  const cli = async (...args) => {
+    const result = await script.cli(...args)
+    writeFileSync(path, state("env_new"))
+    return result
+  }
+  expect((await _internal.makeDriver({}, cli, [path]).create({}, { prompt: "hi" })).ref).toBe("task_abc123")
+  expect(script.calls.map(call => call.args[3])).toEqual(["env_old", "env_new", "env_new"])
+})
+
+test("rediscovery retry remains bounded when the new environment is also refused", async () => {
+  const script = scripted([reply(workspaceRefusal, 1), reply(workspaceRefusal, 1)])
+  await expect(_internal.makeDriver({}, script.cli, [stateFile]).create({ metadata: { env: "stale" } }, { prompt: "hi" })).rejects.toMatchObject({ status: 400 })
+  expect(script.calls).toHaveLength(2)
+})
+
+for (const row of [reply("Not logged in", 1), reply("vendor unavailable", 1)]) test(`saved environment does not recover unrelated refusal: ${row.stdout}`, async () => {
+  const script = scripted([row])
+  await expect(_internal.makeDriver({}, script.cli, [stateFile]).create({ metadata: { env: "stale" } }, { prompt: "hi" })).rejects.toMatchObject({ status: row.stdout === "Not logged in" ? 401 : 502 })
+  expect(script.calls).toHaveLength(1)
+})
+
 test("create discovers a cloud environment from Codex state without changing the file", async () => {
   const script = scripted([reply("task_abc123")])
   await _internal.makeDriver({}, script.cli, [stateFile]).create({}, { prompt: "hi" })
@@ -113,7 +186,7 @@ test("missing environment names every searched path and configuration location w
   expect(script.calls).toHaveLength(0)
 })
 test("sign-in discovers an environment and skips the environment prompt", async () => {
-  const method = makeCodexCloud({}, { ...scripted([reply("Logged in")]), statePaths: [stateFile] }).auth.methods[0]
+  const method = makeCodexCloud({}, { ...scripted([reply("Logged in"), reply("")]), statePaths: [stateFile] }).auth.methods[0]
   expect(method.prompts).toEqual([])
   expect(await method.authorize().callback()).toMatchObject({ type: "success", env: "ccarenv_b64_fixture" })
 })
@@ -129,7 +202,7 @@ test("discovery skips corrupt state and never selects a remote-control environme
   expect(readFileSync(corrupt, "utf8")).toBe("{")
 })
 test("sign-in with configured environment skips the prompt and discovery", async () => {
-  const method = makeCodexCloud({ codexCloud: { env: "configured" } }, { ...scripted([reply("Logged in")]), statePaths: [stateFile] }).auth.methods[0]
+  const method = makeCodexCloud({ codexCloud: { env: "configured" } }, { ...scripted([reply("Logged in"), reply("")]), statePaths: [stateFile] }).auth.methods[0]
   expect(method.prompts).toEqual([])
   expect(await method.authorize().callback()).toMatchObject({ type: "success", env: "configured" })
 })
@@ -172,7 +245,7 @@ for (const text of ["not logged in", "logged out", "not logged in but formerly l
 // (measured on codex 0.x, 2026-10-12: stdout "", stderr "Logged in using ChatGPT\n", status 0).
 // A check that reads only stdout therefore rejects a genuinely signed-in CLI.
 test("sign-in accepts a confirmation the CLI wrote to stderr", async () => {
-  const plugin = makeCodexCloud({}, scripted([reply("", 0, "Logged in using ChatGPT\n")]))
+  const plugin = makeCodexCloud({}, scripted([reply("", 0, "Logged in using ChatGPT\n"), reply("")]))
   expect(await plugin.auth.methods[0].authorize({ env: "fake" }).callback()).toEqual({ type: "success", refresh: "codex-cli", access: "codex-cli", expires: 0, accountId: "env:fake", env: "fake" })
 })
 test("sign-in rejects logged-out wording the CLI wrote to stderr", async () => {
@@ -180,7 +253,7 @@ test("sign-in rejects logged-out wording the CLI wrote to stderr", async () => {
   expect(await plugin.auth.methods[0].authorize({ env: "fake" }).callback()).toMatchObject({ type: "failed", error: expect.stringContaining("codex login") })
 })
 test("oauth sign-in stores only markers and a distinct environment account id", async () => {
-  const script = scripted([reply("Logged in using ChatGPT")])
+  const script = scripted([reply("Logged in using ChatGPT"), reply("")])
   const method = makeCodexCloud({}, { ...script, statePaths: [join(directory, "missing.json")] }).auth.methods[0]
   expect(method.type).toBe("oauth")
   expect(method.prompts[0].validate(" ")).toBeUndefined()
@@ -270,7 +343,7 @@ test("a workspace without a cloud environment is a 400 configuration error namin
 })
 test("loader reports a missing cloud environment as a 400 the client must act on", async () => {
   const script = scripted([reply("Logged in"), reply(workspaceRefusal, 1)])
-  const loader = await makeCodexCloud({ codexCloud: { env: "fake" } }, script).auth.loader(async () => auth)
+  const loader = await makeCodexCloud({ codexCloud: { env: "fake" } }, { ...script, statePaths: [] }).auth.loader(async () => auth)
   const response = await loader.fetch(endpoint, request())
   expect(response.status).toBe(400)
   expect(response.headers.get("X-Magpie-Sign-In")).toBe("kept")
