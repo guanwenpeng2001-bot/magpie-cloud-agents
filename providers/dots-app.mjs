@@ -166,6 +166,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     } catch { signal?.throwIfAborted(); return false }
   }
   async function attach(port, signal, bootMs = 0) {
+    bootMs = Number.isFinite(bootMs) && bootMs >= 0 ? bootMs : 15000
     const deadline = timers.now() + bootMs
     for (;;) {
       signal?.throwIfAborted()

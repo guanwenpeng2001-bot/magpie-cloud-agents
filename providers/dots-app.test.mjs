@@ -349,6 +349,40 @@ for (const appBootMs of [undefined, 750]) {
   })
 }
 
+test.each(["30s", NaN, Infinity, -Infinity, {}, -1, null, 0])("cold launch bounds malformed or zero appBootMs %p", async appBootMs => {
+  const fake = fixture({ previous: false })
+  const timers = fake.dependencies.timers
+  const driver = createDotsApp({ appBootMs }, { ...fake.dependencies,
+    timers: { ...timers, setTimeout(callback, delay) {
+      if (!Number.isFinite(delay) || delay < 0 || timers.now() > 15000) throw new Error("invalid or unbounded boot wait")
+      return timers.setTimeout(callback, delay)
+    } },
+    connect: async () => ({ open: true, evaluate: async () => false, close() {} }),
+  })
+  try {
+    await expectFailure(() => driver.checkDrivable(), "signedOut", 401, "expired")
+    expect(timers.now()).toBe(appBootMs === 0 ? 0 : 15000)
+  } finally { driver.dispose(); fake.close() }
+})
+
+test("attach closes each unsuccessful candidate before opening another and at the deadline", async () => {
+  const fake = fixture({ previous: false, decoys: true })
+  const events = []
+  const driver = createDotsApp({ appBootMs: 250 }, { ...fake.dependencies,
+    connect: async url => {
+      events.push(["open", url])
+      return { open: true, evaluate: async () => false, close() { events.push(["close", url]) } }
+    },
+  })
+  try {
+    await expectFailure(() => driver.checkDrivable(), "signedOut", 401, "expired")
+    const opened = events.filter(([event]) => event === "open").map(([, url]) => url)
+    expect(opened).toHaveLength(6)
+    expect(events).toEqual(opened.flatMap(url => [["open", url], ["close", url]]))
+    expect(fake.dependencies.timers.now()).toBe(250)
+  } finally { driver.dispose(); fake.close() }
+})
+
 for (const previous of [false, true]) {
   test(`an already-live shell adds no delay on ${previous ? "reattach" : "launch"}`, async () => {
     const fake = fixture({ previous })
