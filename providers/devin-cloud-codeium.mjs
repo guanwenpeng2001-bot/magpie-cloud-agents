@@ -96,10 +96,14 @@ async function* frames(body) {
   }
 }
 
-function requestBody(key, prompt, model) {
+function clientMetadata(key) {
   const version = "3000.11.3"
-  const metadata = new Protobuf().bytes(1, "devin-cli").bytes(2, version).bytes(3, key).bytes(4, "en")
+  return new Protobuf().bytes(1, "devin-cli").bytes(2, version).bytes(3, key).bytes(4, "en")
     .bytes(5, process.platform === "win32" ? "windows" : process.platform).bytes(7, version).bytes(12, "chisel").bytes(28, "chisel")
+}
+
+function requestBody(key, prompt, model) {
+  const metadata = clientMetadata(key)
   const message = new Protobuf().bytes(1, randomUUID()).varint(2, 1).bytes(3, prompt)
   const parameters = new Protobuf().varint(1, 1).varint(2, 128000).varint(3, 400).double(5, 1).varint(7, 40).double(8, 0.95)
   return frame(new Protobuf().bytes(1, metadata).bytes(3, message).varint(7, 5).bytes(8, parameters).bytes(21, model).done())
@@ -108,6 +112,7 @@ function requestBody(key, prompt, model) {
 function failure(status, text) {
   let code, message = text
   try { const parsed = JSON.parse(text); const error = parsed.error ?? parsed; code = error.code; message = error.message || code || text } catch {}
+  if (code === "permission_denied") return chatError(403, "the Devin account isn't entitled to this model — Devin serves only the account's entitled models (listed via the provider); the key itself is valid")
   const mapped = code === "unauthenticated" || status === 403 ? 401
     : code === "resource_exhausted" ? 429 : code === "invalid_argument" ? 400
     : code === "unavailable" ? 503 : code ? 502 : status
@@ -132,8 +137,33 @@ async function* replies(body) {
 
 export function makeCodeiumChat(options = {}) {
   const server = (options.apiBase?.["devin-cloud-codeium"] ?? SERVER).replace(/\/+$/, "")
+  const transport = (...args) => (options.fetch ?? globalThis.fetch)(...args)
+  const modelCache = new Map()
   return {
-    models() { return { "swe-2": { name: "SWE-2", tool_call: false, reasoning: false } } },
+    async models(credential) {
+      const cached = modelCache.get(credential.key)
+      if (cached?.expires > Date.now()) return cached.models
+      try {
+        const response = await transport(server + "/exa.api_server_pb.ApiServerService/GetCliModelConfigs", {
+          method: "POST", headers: { Authorization: `Basic ${credential.key}`, "Content-Type": "application/proto" },
+          body: new Protobuf().bytes(1, clientMetadata(credential.key)).done(), signal: AbortSignal.timeout(15000),
+        })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        const models = {}
+        for (const config of fields(new Uint8Array(await response.arrayBuffer()))) {
+          if (config.field !== 1 || !config.bytes || decoder.decode(config.bytes).includes("Upgrade to Pro")) continue
+          const entries = fields(config.bytes)
+          const uid = entries.find(entry => entry.field === 22 && entry.bytes)?.bytes
+          const label = entries.find(entry => entry.field === 1 && entry.bytes)?.bytes
+          if (uid?.length) models[decoder.decode(uid)] = { name: label?.length ? decoder.decode(label) : decoder.decode(uid), tool_call: false, reasoning: false }
+        }
+        modelCache.set(credential.key, { models, expires: Date.now() + 5 * 60000 })
+        return models
+      } catch {
+        modelCache.delete(credential.key)
+        return { "swe-2": { name: "SWE-2", tool_call: false, reasoning: false } }
+      }
+    },
     async complete(credential, input, init = {}) {
       const controller = new AbortController()
       const caller = init.signal ?? (input instanceof Request ? input.signal : undefined)
@@ -149,8 +179,10 @@ export function makeCodeiumChat(options = {}) {
           chat = JSON.parse(typeof raw === "string" ? raw : decoder.decode(raw))
           if (!chat || !Array.isArray(chat.messages) || chat.messages.some(message => !message || typeof message.role !== "string")) throw new Error("invalid messages")
         } catch { throw chatError(400, "a request that isn't JSON or has no valid messages array") }
-        const model = !chat.model || ["devin-session", "swe-2"].includes(chat.model) ? "swe-2-high" : chat.model
-        const response = await fetch(server + CHAT_RPC, {
+        const cached = modelCache.get(credential.key)
+        const defaultModel = cached?.expires > Date.now() ? Object.keys(cached.models)[0] : undefined
+        const model = !chat.model || ["devin-session", "swe-2"].includes(chat.model) ? defaultModel ?? "swe-2-high" : chat.model
+        const response = await transport(server + CHAT_RPC, {
           method: "POST", headers: { Authorization: `Basic ${credential.key}`, "Content-Type": "application/connect+proto", "Connect-Protocol-Version": "1" },
           body: requestBody(credential.key, foldPrompt(chat.messages, options), model), signal,
         })

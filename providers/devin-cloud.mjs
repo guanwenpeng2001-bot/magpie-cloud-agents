@@ -144,9 +144,10 @@ export function makeDevinCloud(options = {}) {
     },
     provider: { id: ID, async models(provider, { auth } = {}) {
       try {
-        if (credentialOf(auth)?.mechanism === "codeium") {
+        const credential = credentialOf(auth)
+        if (credential?.mechanism === "codeium") {
           const { "devin-session": session, ...custom } = provider.models ?? {}
-          return { ...(await codeiumChat()).models(), ...custom }
+          return { ...await (await codeiumChat()).models(credential), ...custom }
         }
       } catch {}
       return provider.models
