@@ -1,5 +1,5 @@
 import { expect, test, afterAll } from "bun:test"
-import { mkdtempSync, writeFileSync, copyFileSync, rmSync, readFileSync } from "node:fs"
+import { mkdtempSync, writeFileSync, copyFileSync, rmSync, readFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { makeCodexCloud, _internal } from "./codex-cloud.mjs"
@@ -640,4 +640,90 @@ test("wrong path and invalid JSON are 404 and 400",async () => {
   const loader = await makeCodexCloud({}, scripted([reply("Logged in")])).auth.loader(async () => auth)
   expect((await loader.fetch(endpoint + "/wrong", request())).status).toBe(404)
   expect((await loader.fetch(endpoint, { body: "not json" })).status).toBe(400)
+})
+
+// Verbatim live captures from codex CLI 0.162.1 (2026-10-14): `codex cloud status <ref>` prints the
+// bracketed status first, then an indented metadata line, then a diff hint.
+const liveCaptures = {
+  pending: "[PENDING] Pong\ncodex-usage-float  •  17s ago\nno diff",
+  ready: "[READY] Pong\ncodex-usage-float  •  1m ago\nno diff",
+  error: "[ERROR] Pong\ncodex-usage-float  •  5m ago\nno diff",
+}
+test("leading bracket status tokens parse the live CLI capture shape", () => {
+  expect(_internal.stateOf(liveCaptures.pending)).toBe("running")
+  expect(_internal.stateOf(liveCaptures.ready)).toBe("succeeded")
+  expect(_internal.stateOf(liveCaptures.error)).toBe("failed")
+  expect(_internal.stateOf("[FROBNICATED] Pong\ncodex-usage-float  •  1m ago\nno diff")).toBe("running")
+})
+for (const [state, tokens] of [
+  ["succeeded", ["READY", "DONE", "COMPLETED", "SUCCEEDED", "FINISHED"]],
+  ["failed", ["ERROR", "FAILED", "CANCELLED"]],
+  ["expired", ["EXPIRED"]],
+  ["running", ["PENDING", "QUEUED", "RUNNING", "WORKING", "STARTING", "IN PROGRESS", "MYSTERY"]],
+]) for (const token of tokens) test(`leading bracket token [${token}] means ${state}`, () => expect(_internal.stateOf(`[${token}] Pong\ncodex-usage-float  •  1m ago\nno diff`)).toBe(state))
+
+test("an exit-1 [ERROR] status is a terminal failed poll, not a throw", async () => {
+  const script = scripted([reply(liveCaptures.error, 1)])
+  expect(await _internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).toMatchObject({ state: "failed" })
+})
+test("exit-1 logged-out status output still throws 401", async () => {
+  const script = scripted([reply("Not logged in", 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).rejects.toMatchObject({ status: 401 })
+})
+test("a READY task whose diff reports no diff available returns the summary instead of throwing", async () => {
+  const script = scripted([reply(liveCaptures.ready), reply("Error: No diff available for task task_e_abc123; it may still be running.", 1)])
+  const result = await _internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })
+  expect(result.state).toBe("succeeded")
+  expect(result.text).toContain("Pong")
+  expect(script.calls).toHaveLength(2)
+})
+test("a genuine diff failure on a succeeded task still throws", async () => {
+  const script = scripted([reply("Status: succeeded"), reply("diff exploded", 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).rejects.toMatchObject({ status: 502, message: "diff exploded" })
+})
+test("spawned CLI children run in a neutral non-git directory, not the plugin's cwd", async () => {
+  const log = join(directory, "cwd.json")
+  const cwdFixture = join(directory, "cwd-fixture.mjs")
+  writeFileSync(cwdFixture, `await Bun.write(process.env.CWD_LOG, process.cwd()); process.exit(0)`)
+  await _internal.spawnCodex([cwdFixture], { env: { PATH: directory, CWD_LOG: log } })
+  const spawned = readFileSync(log, "utf8")
+  expect(spawned).not.toBe(process.cwd())
+  expect(existsSync(join(spawned, ".git"))).toBe(false)
+})
+const environmentRefusal = "Error: environment 'ccarenv_6abbe3611390819195c4b7833a95c978' not found; run `codex cloud` to list available environments\n"
+test("an unknown environment id is a 400 naming stale-environment remediation", async () => {
+  const script = scripted([reply(environmentRefusal, 1)])
+  let error
+  try { await _internal.makeDriver({ codexCloud: { env: "gone" } }, script.cli).create({}, { prompt: "hi" }) } catch (caught) { error = caught }
+  expect(error?.status).toBe(400)
+  expect(error?.message).toContain("not valid for this account")
+  expect(error?.message).toContain("metadata.env")
+  expect(error?.message).toContain("codexCloud.env")
+  expect(script.calls).toHaveLength(1)
+})
+test("a stale saved environment id re-discovers once and retries with the discovered id", async () => {
+  const script = scripted([reply(environmentRefusal, 1), reply("task_abc123")])
+  const run = await _internal.makeDriver({}, script.cli, [stateFile]).create({ metadata: { env: "stale" } }, { prompt: "hi" })
+  expect(run.ref).toBe("task_abc123")
+  expect(script.calls.map(call => call.args[3])).toEqual(["stale", "ccarenv_b64_fixture"])
+})
+test("a stale discovered id equal to the refused id never retries", async () => {
+  const script = scripted([reply(environmentRefusal, 1)])
+  await expect(_internal.makeDriver({}, script.cli, [stateFile]).create({}, { prompt: "hi" })).rejects.toMatchObject({ status: 400 })
+  expect(script.calls).toHaveLength(1)
+})
+test("a bare 32-hex environment id is discovered and used as-is", async () => {
+  const bare = "6acf7082b20881919e1bffba47fc8d83"
+  const path = join(directory, "bare-hex.json")
+  writeFileSync(path, JSON.stringify({ "electron-persisted-atom-state": { "cloud-aeon-sidebar-cache-v1": { threads: [{ environments: [{ environmentId: bare }] }] } } }))
+  const script = scripted([reply("task_abc123")])
+  await _internal.makeDriver({}, script.cli, [path]).create({}, { prompt: "hi" })
+  expect(script.calls[0].args[3]).toBe(bare)
+})
+test("a ccarenv_b64_ payload decoding to a bare 32-hex id canonicalizes to the bare id", async () => {
+  const bare = "6acf7082b20881919e1bffba47fc8d83"
+  const wrapped = "ccarenv_b64_" + Buffer.from(bare).toString("base64url")
+  const script = scripted([reply("task_abc123")])
+  await _internal.makeDriver({}, script.cli, []).create({ metadata: { env: wrapped } }, { prompt: "hi" })
+  expect(script.calls[0].args[3]).toBe(bare)
 })

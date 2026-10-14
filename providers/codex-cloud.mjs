@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, errorResponse } from "../lib/errors.mjs"
@@ -19,6 +19,12 @@ const MISSING = "the codex CLI wasn't found on PATH — install the `codex` CLI 
 // configuration refusal measured; other configuration refusals may exist and stay unclassified.
 const NO_CLOUD_ENVIRONMENT = /\bno cloud environments are available for this workspace\b/i
 const noCloudEnvironmentMessage = refusal => `the codex CLI refused this workspace: ${refusal.trim()} — your account has no Codex Cloud environment. Create one in your OpenAI Codex Cloud settings, or point the plugin at an existing environment with account metadata.env or option codexCloud.env`
+// The CLI's refusal for an environment id that does not exist on this account, measured live
+// (2026-10-14): `codex cloud exec --env <unknown-id>` exits 1 with exactly this sentence once at
+// least one environment exists. Unlike the no-environment refusal it names a stale id, not an
+// empty workspace, but it is the same class of account configuration the client must fix.
+const STALE_ENVIRONMENT = /\benvironment '[^']+' not found\b/i
+const staleEnvironmentMessage = refusal => `the codex CLI rejected this environment: ${refusal.trim()} — the saved or discovered environment id is not valid for this account. Re-login to the codex CLI, or set a valid id via account metadata.env or option codexCloud.env`
 const marker = auth => auth?.type === "oauth" && auth.access === "codex-cli" && auth.refresh === "codex-cli"
 const outputOf = result => [result.stdout, result.stderr].filter(Boolean).join("\n")
 const loggedOut = text => /\b(not logged in|logged out)\b/i.test(text)
@@ -29,7 +35,7 @@ const trimBytes = (text, maximum) => {
   return bytes.toString("utf8", 0, end)
 }
 
-function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, children } = {}) {
+function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, children, cwd = tmpdir() } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return }
     let child, timer, stopped, settled = false
@@ -45,7 +51,9 @@ function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, childr
     }
     const stop = error => { stopped = error; child?.kill() }
     const aborted = () => stop(signal.reason)
-    try { child = spawn("codex", args, { env, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }) }
+    // The CLI infers the cloud task's git branch from its own cwd; a git checkout here would
+    // override the vendor's repo default branch, so children run in a neutral non-git directory.
+    try { child = spawn("codex", args, { env, cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }) }
     catch (error) { finish(error.code === "ENOENT" ? chatError(401, MISSING, "kept") : error); return }
     children?.add(child)
     child.stdout.setEncoding("utf8")
@@ -86,12 +94,18 @@ function continues(rest) {
     return false
   })
 }
+// A leading bracket token is the real CLI's authoritative status rendering (measured live,
+// 2026-10-14: `[PENDING] Pong`, `[READY] Pong`, `[ERROR] Pong`, each followed by metadata lines);
+// it decides the line's state outright, and an unrecognized token stays nonterminal.
+const bracketStates = { ready: "succeeded", done: "succeeded", completed: "succeeded", succeeded: "succeeded", finished: "succeeded", error: "failed", failed: "failed", cancelled: "failed", canceled: "failed", expired: "expired", pending: "running", queued: "running", running: "running", working: "running", starting: "running", "in progress": "running" }
 function stateOf(text, prompt = "") {
   const states = []
   const echoed = new Set(prompt.split(/\r?\n/).map(line => line.trim()).filter(Boolean))
   for (let line of text.split(/\r?\n/)) {
     for (const echo of echoed) line = line.split(echo).join(" ")
     line = line.trim()
+    const bracketed = /^\[([A-Za-z][A-Za-z ]*)\]/.exec(line)
+    if (bracketed) { states.push(bracketStates[bracketed[1].trim().toLowerCase()] ?? "running"); continue }
     const positioned = /\[([^\]]+)\]\s*$/.exec(line)?.[1] ?? /^(?:status|state)\s*:\s*(.+)$/i.exec(line)?.[1] ?? /^task[_-][\w-]+\s+.+\s{2,}([a-z]+|in progress)$/i.exec(line)?.[1]
     const candidate = positioned ?? line.replace(/^task\s+/i, "")
     const match = /^(complet\w*|succeed\w*|done|finish\w*|fail\w*|error\w*|cancel\w*|expir\w*|running|working|queued|pending|in progress)\b(?=$|[.:,;\s—])/i.exec(candidate)
@@ -113,6 +127,7 @@ function checkExit(result) {
     // so it is a 400 client error (normalizeError passes 4xx through to the client), never a
     // retryable 502.
     if (NO_CLOUD_ENVIRONMENT.test(text)) throw chatError(400, noCloudEnvironmentMessage(text))
+    if (STALE_ENVIRONMENT.test(text)) throw chatError(400, staleEnvironmentMessage(text))
     throw chatError(/\b(rate limit|rate limited|too many requests|429)\b/i.test(text) ? 429 : 502, text || "the codex CLI exited without output")
   }
   return result
@@ -124,7 +139,8 @@ function codexStatePaths() {
 function canonicalEnvironment(id) {
   if (!id.startsWith("ccarenv_b64_")) return id
   const decoded = Buffer.from(id.slice("ccarenv_b64_".length), "base64url").toString("utf8")
-  return /^ccarenv_[A-Za-z0-9_-]+$/.test(decoded) ? decoded : id
+  if (/^ccarenv_[A-Za-z0-9_-]+$/.test(decoded)) return decoded
+  return /^[0-9a-f]{32}$/i.test(decoded) ? decoded : id
 }
 function discoverEnvironment(paths) {
   const searched = []
@@ -137,7 +153,7 @@ function discoverEnvironment(paths) {
       if (!Array.isArray(thread?.environments)) continue
       for (const environment of thread.environments) {
         const id = environment?.environmentId
-        if (typeof id === "string" && /^(?:env_|ccarenv_)[A-Za-z0-9_-]+$/.test(id)) return { env: canonicalEnvironment(id), searched }
+        if (typeof id === "string" && (/^(?:env_|ccarenv_)[A-Za-z0-9_-]+$/.test(id) || /^[0-9a-f]{32}$/i.test(id))) return { env: canonicalEnvironment(id), searched }
       }
     }
     searched.push(`${path} (no cloud task environment)`)
@@ -166,7 +182,7 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
       let created
       try { created = checkExit(await execute()) }
       catch (error) {
-        if (fromOption || error.status !== 400 || !NO_CLOUD_ENVIRONMENT.test(error.message)) throw error
+        if (fromOption || error.status !== 400 || !(NO_CLOUD_ENVIRONMENT.test(error.message) || STALE_ENVIRONMENT.test(error.message))) throw error
         const discovered = discoverEnvironment(statePaths).env
         if (!discovered || discovered === env) throw error
         env = discovered
@@ -184,7 +200,13 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
     async poll(credential, run, signal) {
       const result = await cli(["cloud", "status", run.ref], { signal, children: run.children })
       const progress = outputOf(result)
-      if (result.code !== 0 && /not found|no such task/i.test(progress)) return { state: "failed", progress }
+      // The real CLI exits 1 for a failed task while still printing a parseable status line, so a
+      // leading [ERROR] token is terminal even on non-zero exit; classified refusals keep flowing
+      // to checkExit.
+      if (result.code !== 0 && !loggedOut(progress) && !NO_CLOUD_ENVIRONMENT.test(progress) && !STALE_ENVIRONMENT.test(progress)) {
+        if (/not found|no such task/i.test(progress)) return { state: "failed", progress }
+        if (stateOf(result.stdout, run.prompt) === "failed") return { state: "failed", progress }
+      }
       checkExit(result)
       const state = stateOf(result.stdout, run.prompt)
       if (state !== "succeeded") return { state, progress }
@@ -192,7 +214,10 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
       try { diff = checkExit(await cli(["cloud", "diff", run.ref], { signal, children: run.children, timeoutMs: 3000 })).stdout }
       catch (error) {
         if (!signal?.aborted && error.code === "CODEX_CLI_TIMEOUT") return { state: "running", progress: progress + "\nDiff retrieval timed out; waiting to retry the same task" }
-        throw error
+        // The CLI exits 1 with this sentence for a completed task that produced no diff; that is a
+        // successful turn, so the summary alone is the answer rather than an error.
+        if (/no diff available/i.test(error.message)) diff = ""
+        else throw error
       }
       const text = (run.inferred ? "WARNING: Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.\n\n" : "") + (Buffer.byteLength(progress) <= 2048 ? progress + "\n\n" : "") + trimBytes(diff, 102400) + (Buffer.byteLength(diff) > 102400 ? "\n[diff truncated at 100 KiB]" : "")
       return { state, text: text.trim(), progress }
