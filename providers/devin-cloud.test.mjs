@@ -364,7 +364,7 @@ test("a devin-path account whose key becomes cog_ returns 401 expired before any
 })
 
 test("a Codeium account is offered the Connect model list, an apk_ account the session floor", async () => {
-  const { plugin } = await setup()
+  const { plugin } = await setup(undefined, { fetch: async () => new Response(null, { status: 503 }) })
   const config = { provider: { "devin-cloud": { models: {} } } }
   await plugin.config(config)
   const floor = await plugin.provider.models(config.provider["devin-cloud"])
@@ -515,4 +515,92 @@ test.each([false, true])("Codeium deadline after first text is 504 with stream=%
       expect((await response.json()).error.message).toBe("Codeium request timed out")
     }
   } finally { AbortSignal.timeout = originalTimeout; globalThis.fetch = originalFetch }
+})
+
+function protoString(field, value) {
+  const bytes = Buffer.from(value), tag = field * 8 + 2
+  return Buffer.concat([Buffer.from(tag < 128 ? [tag, bytes.length] : [(tag & 127) | 128, tag >> 7, bytes.length]), bytes])
+}
+const modelFixture = () => Buffer.concat([
+  protoString(1, Buffer.concat([protoString(1, "SWE Slow"), protoString(22, "swe-1-6-slow")])),
+  protoString(1, Buffer.concat([protoString(1, "SWE High"), protoString(22, "swe-2-high"), protoString(30, "#Upgrade to Pro to access this model")])),
+])
+const connectOK = () => new Response(Uint8Array.from([0, 0, 0, 0, 4, 26, 2, 79, 75, 2, 0, 0, 0, 2, 123, 125]))
+
+test("Codeium live model discovery filters upgrades and caches per credential", async () => {
+  const calls = []
+  const plugin = makeDevinCloud({ fetch: async (url, init) => {
+    calls.push({ url, init })
+    return new Response(modelFixture())
+  } })
+  const provider = { models: { "devin-session": {}, custom: { name: "Custom" } } }
+  const listed = await plugin.provider.models(provider, { auth: codeiumAuth() })
+  expect(Object.keys(listed)).toEqual(["swe-1-6-slow", "custom"])
+  expect(listed["swe-1-6-slow"]).toEqual({ name: "SWE Slow", tool_call: false, reasoning: false })
+  await plugin.provider.models(provider, { auth: codeiumAuth() })
+  expect(calls).toHaveLength(1)
+  expect(calls[0].url).toEndWith("/GetCliModelConfigs")
+  expect(calls[0].init.headers["Content-Type"]).toBe("application/proto")
+  expect(Buffer.from(calls[0].init.body).toString()).toContain(codeiumAuth().key)
+  await plugin.provider.models(provider, { auth: { type: "api", key: "cog_other" } })
+  expect(calls).toHaveLength(2)
+})
+
+test.each(["http", "network", "malformed"])("Codeium model discovery falls back on %s failure", async kind => {
+  const plugin = makeDevinCloud({ fetch: async () => {
+    if (kind === "network") throw new Error("offline")
+    return kind === "http" ? new Response(null, { status: 503 }) : new Response(Uint8Array.of(255))
+  } })
+  expect(await plugin.provider.models({ models: {} }, { auth: codeiumAuth() })).toEqual({ "swe-2": { name: "SWE-2", tool_call: false, reasoning: false } })
+})
+
+test.each(["", "swe-2", "devin-session", "explicit-model"])("Codeium resolves known model alias %s", async model => {
+  let sent
+  const plugin = makeDevinCloud({ fetch: async (url, init) => {
+    if (url.endsWith("/GetCliModelConfigs")) return new Response(modelFixture())
+    sent = Buffer.from(init.body).toString()
+    return connectOK()
+  } })
+  await plugin.provider.models({ models: {} }, { auth: codeiumAuth() })
+  const loader = await plugin.auth.loader(codeiumAuth)
+  expect((await request(loader, { model })).status).toBe(200)
+  expect(sent).toContain(model === "explicit-model" ? model : "swe-1-6-slow")
+  expect(sent).not.toContain("swe-2-high")
+})
+
+test("Codeium permission_denied trailer is 403 entitlement with sign-in kept", async () => {
+  const plugin = makeDevinCloud({ fetch: async () => {
+    const payload = Buffer.from(JSON.stringify({ error: { code: "permission_denied", message: "an internal error occurred" } }))
+    const frame = Buffer.alloc(5 + payload.length)
+    frame[0] = 2; frame.writeUInt32BE(payload.length, 1); payload.copy(frame, 5)
+    return new Response(frame)
+  } })
+  const response = await request(await plugin.auth.loader(codeiumAuth), { model: "swe-2-high" })
+  expect(response.status).toBe(403)
+  expect(response.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  expect((await response.json()).error.message).toContain("isn't entitled")
+})
+
+test("Codeium cache expiry refreshes discovery and never reuses another account's default", async () => {
+  const originalNow = Date.now
+  let now = originalNow(), discoveries = 0, sent
+  Date.now = () => now
+  const plugin = makeDevinCloud({ fetch: async (url, init) => {
+    if (url.endsWith("/GetCliModelConfigs")) { discoveries++; return new Response(modelFixture()) }
+    sent = Buffer.from(init.body).toString()
+    return connectOK()
+  } })
+  try {
+    await plugin.provider.models({ models: {} }, { auth: codeiumAuth() })
+    const other = await plugin.auth.loader(() => ({ type: "api", key: "cog_other" }))
+    await request(other)
+    expect(sent).toContain("swe-2-high")
+    now += 5 * 60000
+    await request(await plugin.auth.loader(codeiumAuth))
+    expect(sent).toContain("swe-2-high")
+    await plugin.provider.models({ models: {} }, { auth: codeiumAuth() })
+    expect(discoveries).toBe(2)
+    await request(await plugin.auth.loader(codeiumAuth))
+    expect(sent).toContain("swe-1-6-slow")
+  } finally { Date.now = originalNow }
 })
