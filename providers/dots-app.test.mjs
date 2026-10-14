@@ -316,6 +316,50 @@ test("no reachable debug port launches the installed app with debug flags and no
   expect(fake.stoppedRows[0].managedTag).toBe(tag)
 })
 
+for (const entry of ["checkDrivable", "liveModels", "create"]) {
+  test(`cold launch waits for the shell before ${entry}`, async () => {
+    const fake = fixture({ previous: false, decoys: true })
+    const driver = createDotsApp({}, { ...fake.dependencies, connect: async url => ({
+      open: true,
+      async evaluate(expression) {
+        if (expression.includes("新聊天")) return url.endsWith("/shell") && fake.dependencies.timers.now() >= 1000
+        if (expression.includes("location.href")) return { composer: true }
+        if (expression.includes("message-row")) return []
+        return true
+      },
+      async call() {}, close() {},
+    }) })
+    try {
+      const result = entry === "create" ? await driver.create(marker, { prompt: "hello" }) : await driver[entry](marker)
+      expect(fake.dependencies.timers.now()).toBe(1000)
+      expect(fake.spawns).toHaveLength(1)
+      if (entry === "liveModels") expect(result).toHaveProperty("dot.name", "ChatGPT Dot")
+      if (entry === "create") expect(result.prompt).toBe("hello")
+    } finally { driver.dispose(); fake.close() }
+  })
+}
+
+for (const appBootMs of [undefined, 750]) {
+  test(`cold launch preserves signedOut after the ${appBootMs ?? "default"} boot window`, async () => {
+    const fake = fixture({ previous: false, sidebar: false, driverOptions: { appBootMs } })
+    try {
+      await expectFailure(() => fake.driver.checkDrivable(), "signedOut", 401, "expired")
+      expect(fake.dependencies.timers.now()).toBe(appBootMs ?? 15000)
+    } finally { fake.close() }
+  })
+}
+
+for (const previous of [false, true]) {
+  test(`an already-live shell adds no delay on ${previous ? "reattach" : "launch"}`, async () => {
+    const fake = fixture({ previous })
+    try {
+      await fake.driver.checkDrivable()
+      expect(fake.dependencies.timers.now()).toBe(0)
+      expect(fake.spawns).toHaveLength(previous ? 0 : 1)
+    } finally { fake.close() }
+  })
+}
+
 test("a launched instance that later exits on its own is not force-stopped", async () => {
   const fake = fixture({ previous: false, reattach: false, replies: ["回答"] })
   try {

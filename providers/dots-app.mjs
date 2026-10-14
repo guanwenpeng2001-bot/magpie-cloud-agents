@@ -165,22 +165,28 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
       return Boolean((await response.json())["Browser"])
     } catch { signal?.throwIfAborted(); return false }
   }
-  async function attach(port, signal) {
-    const response = await fetchWithTimeout(`http://127.0.0.1:${port}/json/list`, { signal, redirect: "error" }, { fetch: deps.fetch, timeoutMs: 2000 })
-    const list = await response.json()
-    const pages = (Array.isArray(list) ? list : []).filter(target => target.type === "page" && /^app:\/\/-/.test(target.url ?? "") && target.webSocketDebuggerUrl)
-    pages.sort((a, b) => Number(b.url.startsWith(SHELL_PAGE)) - Number(a.url.startsWith(SHELL_PAGE)))
-    let lastError
-    for (const page of pages) {
-      const endpoint = new URL(page.webSocketDebuggerUrl)
-      if (endpoint.hostname !== "127.0.0.1" || Number(endpoint.port) !== port) continue
-      const client = await deps.connect(endpoint.href, { timers, WebSocket: deps.WebSocket }, signal)
-      try {
-        if (await client.evaluate(shellProbe, signal)) return client
-      } catch (error) { lastError = error; if (!client.open) throw error }
-      client.close()
+  async function attach(port, signal, bootMs = 0) {
+    const deadline = timers.now() + bootMs
+    for (;;) {
+      signal?.throwIfAborted()
+      const response = await fetchWithTimeout(`http://127.0.0.1:${port}/json/list`, { signal, redirect: "error" }, { fetch: deps.fetch, timeoutMs: 2000 })
+      const list = await response.json()
+      const pages = (Array.isArray(list) ? list : []).filter(target => target.type === "page" && /^app:\/\/-/.test(target.url ?? "") && target.webSocketDebuggerUrl)
+      pages.sort((a, b) => Number(b.url.startsWith(SHELL_PAGE)) - Number(a.url.startsWith(SHELL_PAGE)))
+      let lastError
+      for (const page of pages) {
+        const endpoint = new URL(page.webSocketDebuggerUrl)
+        if (endpoint.hostname !== "127.0.0.1" || Number(endpoint.port) !== port) continue
+        const client = await deps.connect(endpoint.href, { timers, WebSocket: deps.WebSocket }, signal)
+        try {
+          if (await client.evaluate(shellProbe, signal)) return client
+        } catch (error) { lastError = error; if (!client.open) throw error }
+        client.close()
+      }
+      const remaining = deadline - timers.now()
+      if (remaining <= 0) throw lastError ?? failure("signedOut")
+      await sleep(Math.min(250, remaining), signal, timers)
     }
-    throw lastError ?? failure("signedOut")
   }
   async function runningProcesses() {
     try { return await deps.processes() } catch { throw failure("debug") }
@@ -227,7 +233,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     const started = timers.now()
     while (timers.now() - started < (options.launchTimeoutMs ?? 10000)) {
       signal?.throwIfAborted()
-      if (await version(port, signal)) return { port, client: await attach(port, signal) }
+      if (await version(port, signal)) return { port, client: await attach(port, signal, options.appBootMs ?? 15000) }
       if (spawnErrors.size) throw launchFailed([...spawnErrors][0].message)
       if (child.exitCode != null) break
       await sleep(200, signal, timers)
