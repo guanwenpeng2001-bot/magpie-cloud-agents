@@ -23,34 +23,34 @@ function validateOptions(options) {
     if (!["http:", "https:"].includes(parsed.protocol)) invalid(path, "an absolute HTTP(S) URL")
   }
   object(options, "options")
-  if (options.progress !== undefined && typeof options.progress !== "boolean") invalid("progress", "a boolean")
-  if (options.maxRunMinutes !== undefined) number(options.maxRunMinutes, "maxRunMinutes")
-  if (options.maxPromptBytes !== undefined) number(options.maxPromptBytes, "maxPromptBytes", false, true)
+  if (options.progress != null && typeof options.progress !== "boolean") invalid("progress", "a boolean")
+  if (options.maxRunMinutes != null) number(options.maxRunMinutes, "maxRunMinutes")
+  if (options.maxPromptBytes != null) number(options.maxPromptBytes, "maxPromptBytes", false, true)
   for (const name of ["apiBase", "codexCloud", "codexAgents", "cursorCloud", "devinCloud", "dots", "dotsApp", "grokBot"]) {
-    if (options[name] !== undefined) object(options[name], name)
+    if (options[name] != null) object(options[name], name)
   }
   for (const [provider, base] of Object.entries(options.apiBase ?? {})) url(base, `apiBase.${provider}`)
-  if (options.codexCloud?.env !== undefined) text(options.codexCloud.env, "codexCloud.env")
-  if (options.codexCloud?.attempts !== undefined) number(options.codexCloud.attempts, "codexCloud.attempts", false, true)
-  if (options.devinCloud?.maxAcuLimit !== undefined) number(options.devinCloud.maxAcuLimit, "devinCloud.maxAcuLimit", true)
-  if (options.codexAgents?.environment !== undefined) {
+  if (options.codexCloud?.env != null && options.codexCloud.env !== "") text(options.codexCloud.env, "codexCloud.env")
+  if (options.codexCloud?.attempts != null) number(options.codexCloud.attempts, "codexCloud.attempts", false, true)
+  if (options.devinCloud?.maxAcuLimit != null) number(options.devinCloud.maxAcuLimit, "devinCloud.maxAcuLimit", true)
+  if (options.codexAgents?.environment != null) {
     object(options.codexAgents.environment, "codexAgents.environment")
     text(options.codexAgents.environment.type, "codexAgents.environment.type")
   }
   for (const name of ["dotsApp", "grokBot"]) {
     const settings = options[name] ?? {}
     for (const key of ["keepAliveMinutes", "launchTimeoutMs", ...(name === "dotsApp" ? ["appBootMs", "surfaceTimeoutMs", "stableMs", "streamIntervalMs"] : [])]) {
-      if (settings[key] !== undefined) number(settings[key], `${name}.${key}`)
+      if (settings[key] != null) number(settings[key], `${name}.${key}`, key !== "streamIntervalMs")
     }
-    if (settings.reattachPorts !== undefined && (!Array.isArray(settings.reattachPorts) || settings.reattachPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535))) invalid(`${name}.reattachPorts`, "an array of ports from 1 to 65535")
+    if (settings.reattachPorts != null && (!Array.isArray(settings.reattachPorts) || settings.reattachPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535))) invalid(`${name}.reattachPorts`, "an array of ports from 1 to 65535")
   }
-  if (options.grokBot?.ghostMode !== undefined && typeof options.grokBot.ghostMode !== "boolean") invalid("grokBot.ghostMode", "a boolean")
+  if (options.grokBot?.ghostMode != null && typeof options.grokBot.ghostMode !== "boolean") invalid("grokBot.ghostMode", "a boolean")
   const dots = options.dots ?? options
   const prefix = options.dots ? "dots." : ""
-  if (dots.taskTtlMinutes !== undefined) number(dots.taskTtlMinutes, `${prefix}taskTtlMinutes`)
-  if (options.cursorCloud?.repos !== undefined && !Array.isArray(options.cursorCloud.repos)) invalid("cursorCloud.repos", "an array")
-  if (dots.tunnelCommand !== undefined && (!Array.isArray(dots.tunnelCommand) || !dots.tunnelCommand.length || dots.tunnelCommand.some(part => typeof part !== "string" || !part))) invalid(`${prefix}tunnelCommand`, "a non-empty argv array of strings")
-  if (dots.publicUrl !== undefined) {
+  if (dots.taskTtlMinutes != null) number(dots.taskTtlMinutes, `${prefix}taskTtlMinutes`)
+  if (options.cursorCloud?.repos != null && !Array.isArray(options.cursorCloud.repos)) invalid("cursorCloud.repos", "an array")
+  if (dots.tunnelCommand != null && (!Array.isArray(dots.tunnelCommand) || !dots.tunnelCommand.length || dots.tunnelCommand.some(part => typeof part !== "string" || !part))) invalid(`${prefix}tunnelCommand`, "a non-empty argv array of strings")
+  if (dots.publicUrl != null) {
     url(dots.publicUrl, `${prefix}publicUrl`)
     const parsed = new URL(dots.publicUrl)
     if (parsed.protocol !== "https:" || parsed.origin !== dots.publicUrl) invalid(`${prefix}publicUrl`, "an HTTPS origin without a path")
