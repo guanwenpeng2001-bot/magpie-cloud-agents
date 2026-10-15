@@ -1,4 +1,5 @@
 import { test, expect, afterEach } from "bun:test"
+import { gzipSync } from "node:zlib"
 import { makeDevinCloud, makeDevinDriver } from "./devin-cloud.mjs"
 import { FollowupRejected } from "../lib/errors.mjs"
 import { emulate } from "../lib/emulate.mjs"
@@ -71,7 +72,7 @@ test.each([undefined, 0, 12])("create fields and optional ACU ceiling %s", async
   const promptMessages = [{ role: "user", content: "x".repeat(100) }]
   await request(loader, { messages: promptMessages }, { headers: { [SESSION_HEADER]: "conversation" } })
   const prompt = foldPrompt(promptMessages)
-  expect(server.requests[0].body).toEqual({ prompt, title: "magpie: " + prompt.slice(0, 60), tags: ["magpie"], ...(maxAcuLimit ? { max_acu_limit: maxAcuLimit } : {}) })
+  expect(server.requests[0].body).toEqual({ prompt, title: "magpie session", tags: ["magpie"], ...(maxAcuLimit ? { max_acu_limit: maxAcuLimit } : {}) })
   expect(authorized).toBe(true)
   expect(privateHeader).toBe(false)
 })
@@ -172,7 +173,7 @@ test("static model, auth methods, config preservation and scoped session header"
   expect(plugin.auth.methods[1].label).toContain("cog_")
   expect(plugin.auth.methods[1].label).toContain("Codeium")
   expect(plugin.auth.maxConcurrency).toBe(4)
-  expect(driver.cancel).toBeUndefined()
+  expect(typeof driver.cancel).toBe("function")
   expect(driver.stream).toBeUndefined()
   expect(plugin.auth.usage).toBeUndefined()
   const output = { headers: {} }
@@ -260,15 +261,20 @@ test("bad JSON and wrong path return 400 and 404 kept without network", async ()
   expect(server.requests).toHaveLength(0)
 })
 
-test("abort closes stream without deleting the cloud session", async () => {
-  const { loader, server } = await setup(polling({ status_enum: "working" }))
+test("abort closes stream and terminates the cloud session", async () => {
+  let terminated
+  const cancellation = new Promise(resolve => { terminated = resolve })
+  const { loader, server } = await setup(context => {
+    if (context.request.method === "DELETE") { terminated(); return Response.json({ detail: "terminated" }) }
+    return polling({ status_enum: "working" })(context)
+  })
   const controller = new AbortController()
   const response = await request(loader, { stream: true }, { signal: controller.signal })
   const reading = response.text()
   controller.abort()
   await reading
-  expect(server.requests.every(row => row.method !== "DELETE")).toBe(true)
-  expect(server.sessions.size).toBe(1)
+  await Promise.race([cancellation, new Promise((_, reject) => setTimeout(() => reject(new Error("missing remote cancellation")), 100))])
+  expect(server.requests.filter(row => row.method === "DELETE")).toEqual([{ method: "DELETE", path: "/devin/v1/sessions/devin-1", body: undefined }])
 })
 
 test("poll-side server failure returns run-failed 502 kept with URL", async () => {
@@ -525,6 +531,48 @@ const modelFixture = () => Buffer.concat([
   protoString(1, Buffer.concat([protoString(1, "SWE Slow"), protoString(22, "swe-1-6-slow")])),
   protoString(1, Buffer.concat([protoString(1, "SWE High"), protoString(22, "swe-2-high"), protoString(30, "#Upgrade to Pro to access this model")])),
 ])
+test("session title excludes system text and supports an explicit driver title", async () => {
+  const { loader, server, driver } = await setup()
+  await request(loader, { messages: [{ role: "system", content: "PRIVATE INSTRUCTIONS" }, ...messages] })
+  expect(server.requests[0].body.title).toBe("magpie session")
+  await driver.create(auth(), { prompt: "PRIVATE INSTRUCTIONS", title: "User task" })
+  expect(server.requests.at(-1).body.title).toBe("User task")
+})
+
+test("session headers initialize an absent headers object", async () => {
+  const output = {}
+  await makeDevinCloud()["chat.headers"]({ model: { providerID: "devin-cloud" }, sessionID: "session" }, output)
+  expect(output.headers).toEqual({ [SESSION_HEADER]: "session" })
+})
+
+test.each([false, true])("Codeium accepts byte-fragmented frames with compression=%s", async compressed => {
+  const message = Buffer.concat([protoString(3, "fragmented answer")])
+  const payload = compressed ? gzipSync(message) : message
+  const frame = Buffer.alloc(5 + payload.length)
+  frame[0] = compressed ? 1 : 0; frame.writeUInt32BE(payload.length, 1); payload.copy(frame, 5)
+  const bytes = Buffer.concat([frame, Buffer.from([2, 0, 0, 0, 2, 123, 125])])
+  const plugin = makeDevinCloud({ fetch: async () => {
+    let offset = 0
+    return new Response(new ReadableStream({ pull(controller) {
+      if (offset === bytes.length) { controller.close(); return }
+      controller.enqueue(bytes.subarray(offset, ++offset))
+    } }))
+  } })
+  const response = await request(await plugin.auth.loader(codeiumAuth))
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toBe("fragmented answer")
+})
+
+test("Codeium rejects gzip output over the frame limit", async () => {
+  const compressed = gzipSync(Buffer.alloc(64 * 1024 * 1024 + 1))
+  const frame = Buffer.alloc(5 + compressed.length)
+  frame[0] = 1; frame.writeUInt32BE(compressed.length, 1); compressed.copy(frame, 5)
+  const plugin = makeDevinCloud({ fetch: async () => new Response(frame) })
+  const response = await request(await plugin.auth.loader(codeiumAuth))
+  expect(response.status).toBe(502)
+  expect((await response.json()).error.message).toMatch(/larger than|too large|size|length/i)
+})
+
 const connectOK = () => new Response(Uint8Array.from([0, 0, 0, 0, 4, 26, 2, 79, 75, 2, 0, 0, 0, 2, 123, 125]))
 
 test("Codeium live model discovery filters upgrades and caches per credential", async () => {

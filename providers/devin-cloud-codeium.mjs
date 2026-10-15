@@ -70,25 +70,36 @@ function frame(message) {
 async function* frames(body) {
   if (!body) throw new Error("empty Connect response")
   const reader = body.getReader()
-  let buffer = new Uint8Array()
+  const header = new Uint8Array(5)
+  let headerOffset = 0, payload, payloadOffset = 0
   try {
     for (;;) {
-      while (buffer.length >= 5) {
-        const length = new DataView(buffer.buffer, buffer.byteOffset).getUint32(1)
-        if (length > 64 * 1024 * 1024) throw new Error("invalid Connect frame length")
-        if (buffer.length < length + 5) break
-        const flags = buffer[0]
-        let data = buffer.slice(5, length + 5)
-        buffer = buffer.slice(length + 5)
-        if (flags & 1) data = new Uint8Array(gunzipSync(data))
-        yield { end: !!(flags & 2), data }
-      }
       const next = await reader.read()
       if (next.done) {
-        if (buffer.length) throw new Error("unexpected EOF")
+        if (headerOffset || payload) throw new Error("unexpected EOF")
         return
       }
-      buffer = new Uint8Array(Buffer.concat([buffer, next.value]))
+      let offset = 0
+      while (offset < next.value.length) {
+        if (!payload) {
+          const count = Math.min(5 - headerOffset, next.value.length - offset)
+          header.set(next.value.subarray(offset, offset + count), headerOffset)
+          headerOffset += count; offset += count
+          if (headerOffset < 5) continue
+          const length = new DataView(header.buffer).getUint32(1)
+          if (length > 64 * 1024 * 1024) throw new Error("invalid Connect frame length")
+          payload = new Uint8Array(length)
+          payloadOffset = 0
+        }
+        const count = Math.min(payload.length - payloadOffset, next.value.length - offset)
+        payload.set(next.value.subarray(offset, offset + count), payloadOffset)
+        payloadOffset += count; offset += count
+        if (payloadOffset < payload.length) continue
+        const flags = header[0]
+        const data = flags & 1 ? new Uint8Array(gunzipSync(payload, { maxOutputLength: 64 * 1024 * 1024 })) : payload
+        payload = undefined; headerOffset = 0
+        yield { end: !!(flags & 2), data }
+      }
     }
   } finally {
     await reader.cancel().catch(() => {})
