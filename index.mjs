@@ -30,7 +30,7 @@ function validateOptions(options) {
     if (options[name] != null) object(options[name], name)
   }
   for (const [provider, base] of Object.entries(options.apiBase ?? {})) url(base, `apiBase.${provider}`)
-  if (options.codexCloud?.env != null && options.codexCloud.env !== "") text(options.codexCloud.env, "codexCloud.env")
+  if (options.codexCloud?.env != null && typeof options.codexCloud.env !== "string") invalid("codexCloud.env", "a string")
   if (options.codexCloud?.attempts != null) number(options.codexCloud.attempts, "codexCloud.attempts", false, true)
   if (options.devinCloud?.maxAcuLimit != null) number(options.devinCloud.maxAcuLimit, "devinCloud.maxAcuLimit", true)
   if (options.codexAgents?.environment != null) {
@@ -49,8 +49,8 @@ function validateOptions(options) {
   const prefix = options.dots ? "dots." : ""
   if (dots.taskTtlMinutes != null) number(dots.taskTtlMinutes, `${prefix}taskTtlMinutes`)
   if (options.cursorCloud?.repos != null && !Array.isArray(options.cursorCloud.repos)) invalid("cursorCloud.repos", "an array")
-  if (dots.tunnelCommand != null && (!Array.isArray(dots.tunnelCommand) || !dots.tunnelCommand.length || dots.tunnelCommand.some(part => typeof part !== "string" || !part))) invalid(`${prefix}tunnelCommand`, "a non-empty argv array of strings")
-  if (dots.publicUrl != null) {
+  if (dots.tunnelCommand && (!Array.isArray(dots.tunnelCommand) || !dots.tunnelCommand.length || dots.tunnelCommand.some(part => typeof part !== "string" || !part))) invalid(`${prefix}tunnelCommand`, "a non-empty argv array of strings")
+  if (dots.publicUrl) {
     url(dots.publicUrl, `${prefix}publicUrl`)
     const parsed = new URL(dots.publicUrl)
     if (parsed.protocol !== "https:" || parsed.origin !== dots.publicUrl) invalid(`${prefix}publicUrl`, "an HTTPS origin without a path")
