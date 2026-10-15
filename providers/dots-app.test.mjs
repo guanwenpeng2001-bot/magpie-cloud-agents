@@ -44,7 +44,11 @@ function fixture(settings = {}) {
         const shell = (socket.data?.path ?? "").endsWith("/shell")
         let value
         let error
-        if (expression.includes("data-app-shell-header-slot")) value = state.sidebar && shell
+        if (expression.includes("data-app-shell-header-slot")) {
+          const selectors = new Set(shell ? (state.sidebar ? ["[data-app-shell-header-slot]"] : []) : ['div.ProseMirror[contenteditable="true"]'])
+          const document = { querySelector: selector => selector.split(",").some(part => selectors.has(part.trim())) ? {} : null }
+          value = new Function("document", `return ${expression}`)(document)
+        }
         else if (expression.includes("location.assign")) { state.route = DOTS_ROUTE; state.composer = true }
         else if (expression.includes("location.href")) value = { href: state.route, composer: state.composer }
         else if (expression.includes("message-row")) value = state.rows
@@ -92,7 +96,8 @@ function fixture(settings = {}) {
       const ws = `ws://127.0.0.1:${server.port}/devtools/page/`
       return Response.json([
         ...(state.decoys ? [
-          { type: "page", url: "app://-/index.html", webSocketDebuggerUrl: ws + "avatar-overlay" },
+          { type: "page", url: "app://-/index.html?initialRoute=%2Fspace%2Flocal-page-test%3Fwindow%3Dpage%26prewarm%3D1", webSocketDebuggerUrl: ws + "prewarm" },
+          { type: "page", url: "app://-/index.html?initialRoute=%2Favatar-overlay", webSocketDebuggerUrl: ws + "avatar-overlay" },
           { type: "page", url: "app://-/detached-window.html", webSocketDebuggerUrl: ws + "detached" },
         ] : []),
         { type: "page", url: "app://-/index.html", webSocketDebuggerUrl: ws + "shell" },
@@ -103,6 +108,7 @@ function fixture(settings = {}) {
   const driver = createDotsApp({ keepAliveMinutes: 0.01, launchTimeoutMs: 1200, stableMs: 0, ...(settings.driverOptions ?? {}) }, dependencies)
   return { state, frames, spawns, dependencies, driver, endpoint: `ws://127.0.0.1:${server.port}/devtools/page/shell`, managedRows, stoppedRows,
     expireIdle() { for (const [timer, job] of [...timers]) if (job.delay === 600) { timers.delete(timer); job.callback() } },
+    disconnect() { for (const client of clients) client.close(); clients = [] },
     close() { driver.dispose(); server.stop(true) },
   }
 }
@@ -198,6 +204,15 @@ test("launch binds debug argv to loopback, clears and types into the Dot surface
   } finally { fake.close() }
 })
 
+test("navigates to Dots even when another shell route has a composer", async () => {
+  const fake = fixture({ route: "app://-/index.html", composer: true })
+  try {
+    await send(fake)
+    expect(fake.frames.some(frame => frame.params.expression?.includes("location.assign"))).toBe(true)
+    expect(fake.state.route).toBe(DOTS_ROUTE)
+  } finally { fake.close() }
+})
+
 test("navigates to the Dot surface when the shell is on another route", async () => {
   const fake = fixture({ route: "app://-/index.html", composer: false })
   try {
@@ -214,6 +229,22 @@ test("attach skips the avatar-overlay and detached-window pages and only drives 
     const driven = fake.frames.filter(frame => frame.params.expression?.includes("composer.focus()") || frame.params.expression?.includes("button.bg-composer-primary"))
     expect(driven.length).toBeGreaterThan(0)
     expect(driven.every(frame => frame.path.endsWith("/shell"))).toBe(true)
+  } finally { fake.close() }
+})
+
+test("reconnection rejects auxiliary renderers with editable ProseMirror", async () => {
+  const fake = fixture({ previous: false })
+  try {
+    const run = await send(fake)
+    fake.state.decoys = true
+    fake.state.previous = true
+    fake.disconnect()
+    await Bun.sleep(5)
+    const start = fake.frames.length
+    expect((await fake.driver.poll(marker, run)).state).toBe("running")
+    const frames = fake.frames.slice(start)
+    expect(frames.filter(frame => frame.params.expression?.includes("data-app-shell-header-slot")).map(frame => frame.path.split("/").at(-1))).toEqual(["prewarm", "avatar-overlay", "shell"])
+    expect(frames.filter(frame => frame.params.expression?.includes("message-row")).every(frame => frame.path.endsWith("/shell"))).toBe(true)
   } finally { fake.close() }
 })
 
@@ -384,7 +415,7 @@ test("attach closes each unsuccessful candidate before opening another and at th
   try {
     await expectFailure(() => driver.checkDrivable(), "signedOut", 401, "expired")
     const opened = events.filter(([event]) => event === "open").map(([, url]) => url)
-    expect(opened).toHaveLength(6)
+    expect(opened).toHaveLength(8)
     expect(events).toEqual(opened.flatMap(url => [["open", url], ["close", url]]))
     expect(fake.dependencies.timers.now()).toBe(250)
   } finally { driver.dispose(); fake.close() }

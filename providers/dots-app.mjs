@@ -46,7 +46,7 @@ export async function findChatGptApp({ env = process.env, exists = path => acces
 export const connectCdp = (url, options, signal) => connectAppCdp(url, { ...options, failure }, signal)
 
 // Hidden Dot renderers support CDP input without bringing the window to the foreground.
-export const shellProbe = `(() => !!document.querySelector('[data-app-shell-header-slot], .messages-scroll, div.ProseMirror[contenteditable="true"]'))()`
+export const shellProbe = `(() => !!document.querySelector('[data-app-shell-header-slot], .messages-scroll'))()`
 const surfaceProbe = `(() => ({ href: location.href, composer: !!document.querySelector('div.ProseMirror[contenteditable="true"]') }))()`
 const composerProbe = `(() => !!document.querySelector('div.ProseMirror[contenteditable="true"]'))()`
 const focusProbe = `(() => { const composer = document.querySelector('div.ProseMirror[contenteditable="true"]'); if (!composer) return false; composer.focus(); return true; })()`
@@ -88,8 +88,9 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
   }
   async function openSurface(client, signal) {
     const state = await client.evaluate(surfaceProbe, signal)
-    if (state?.composer) return
-    if (!state || !String(state.href ?? "").startsWith(DOTS_ROUTE)) await client.evaluate(`location.assign(${JSON.stringify(DOTS_ROUTE)})`, signal)
+    const onDotsRoute = state && String(state.href ?? "").startsWith(DOTS_ROUTE)
+    if (onDotsRoute && state.composer) return
+    if (!onDotsRoute) await client.evaluate(`location.assign(${JSON.stringify(DOTS_ROUTE)})`, signal)
     const started = timers.now()
     while (timers.now() - started < (options.surfaceTimeoutMs ?? 15000)) {
       signal?.throwIfAborted()
