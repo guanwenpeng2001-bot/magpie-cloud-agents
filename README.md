@@ -57,7 +57,7 @@ A session-affinity header `x-magpie-cloud-agents-session` ties follow-up turns t
 
 ## Options
 
-Set package options with `magpie plugin options <spec> '<json>'`. Every entry function validates the shared options before calling its provider factory. **One invalid known configuration value rejects the entire spec: all six providers fail to load**, even when the invalid option belongs to just one provider. Errors identify the option path. Unknown option keys are still ignored, so a typo can silently leave the default in effect.
+Set package options with `magpie plugin options <spec> '<json>'`. Every entry function validates the shared options before calling its provider factory. **One invalid known configuration value rejects the entire spec: all six providers fail to load**, even when the invalid option belongs to just one provider. Errors identify the option path. Unrecognized ordinary option properties are ignored, so a typo can silently leave the default in effect. However, every non-null entry under `apiBase` is validated as an absolute HTTP(S) URL even if its provider key is unknown; an invalid value there also rejects the entire spec and prevents all six providers from loading.
 
 Validation follows each provider's unset/default semantics: for example, `codexCloud.env` accepts `null`, an empty string or whitespace to allow discovery; `apiBase.<provider>` accepts `null` as unset but rejects an empty string; `dots.publicUrl` and `dots.tunnelCommand` accept `null` or `""` as unset, but reject whitespace-only strings. Empty strings are not a universal way to clear numeric or URL options.
 
@@ -306,7 +306,7 @@ magpie plugin list
 
 ### 选项
 
-通过 `magpie plugin options <spec> '<json>'` 设置包选项。每个入口函数都会先校验共享选项，再调用 provider 工厂。**一个已知配置项的值无效，就会拒绝整个 spec，导致全部六个 provider 加载失败**，即使该选项只属于其中一个 provider。错误会指出选项路径。未知选项键仍被忽略，拼写错误可能让默认值继续生效。
+通过 `magpie plugin options <spec> '<json>'` 设置包选项。每个入口函数都会先校验共享选项，再调用 provider 工厂。**一个已知配置项的值无效，就会拒绝整个 spec，导致全部六个 provider 加载失败**，即使该选项只属于其中一个 provider。错误会指出选项路径。普通的未知选项属性会被忽略，拼写错误可能让默认值继续生效。但 `apiBase` 下每个非 null 条目都会接受绝对 HTTP(S) URL 校验，即使其 provider 键不被识别；其中的无效值同样会拒绝整个 spec，导致全部六个 provider 加载失败。
 
 入口校验遵循各 provider 的 unset/默认值语义：例如 `codexCloud.env` 接受 `null`、空串或纯空白字符串以允许发现环境；`apiBase.<provider>` 接受 `null` 作为未设置，但拒绝空串；`dots.publicUrl` 与 `dots.tunnelCommand` 接受 `null` 或 `""` 作为未设置，但拒绝纯空白字符串。不能把空串当作清空所有数值或 URL 选项的通用方式。
 
