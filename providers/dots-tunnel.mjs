@@ -176,6 +176,7 @@ export class DotsTunnel {
           this.publicUrl = url
           this.rotated = Boolean(this.previousUrl && this.previousUrl !== url)
           this.previousUrl = url
+          this.failures = 0
           this.setState("ready")
           for (const waiter of this.waiters) waiter(url)
           finish()
@@ -231,9 +232,12 @@ export class DotsTunnel {
     const child = this.child
     this.child = null; this.publicUrl = null
     if (child && child.exitCode === null) {
-      const exited = new Promise(resolve => child.once("exit", resolve))
-      child.kill()
-      await exited
+      await new Promise(resolve => {
+        const done = () => { this.timers.clearTimeout(timeout); child.removeListener("exit", done); resolve() }
+        const timeout = this.timers.setTimeout(done, 1000)
+        child.once("exit", done)
+        try { if (!child.kill()) done() } catch { done() }
+      })
     }
     this.setState("stopped")
   }
