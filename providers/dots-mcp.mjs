@@ -175,15 +175,16 @@ export function startMcp({ token, queue, port = 0, hostname = "127.0.0.1", trans
   const server = Bun.serve({ hostname: "127.0.0.1", port, maxRequestBodySize: NATIVE_BODY_LIMIT, idleTimeout: 30, async fetch(request, listener) {
     const path = new URL(request.url).pathname
     if (path !== "/mcp" && !/^\/mcp\/[^/]+$/.test(path)) return respond(404, { error: { code: "not_found" } })
-    const address = listener.requestIP(request)?.address ?? "127.0.0.1"
-    const time = now()
-    for (const [key, value] of rates) if (time >= value.until) rates.delete(key)
-    const rate = rates.get(address) ?? { count: 0, until: time + 60000 }
-    rates.set(address, rate)
-    if (++rate.count > ratePerMinute) return respond(429, { error: { code: "rate_limited" } }, { "retry-after": "60" })
     let presented
     try { presented = path === "/mcp" ? /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "")?.[1] : decodeURIComponent(path.slice(5)) } catch {}
     if (!equalSecret(presented, token)) return respond(401, { error: { code: "unauthorized", message: "Authentication required" } }, { "www-authenticate": "Bearer" })
+    const address = listener.requestIP(request)?.address ?? "127.0.0.1"
+    const principal = JSON.stringify([token, address])
+    const time = now()
+    for (const [key, value] of rates) if (time >= value.until) rates.delete(key)
+    const rate = rates.get(principal) ?? { count: 0, until: time + 60000 }
+    rates.set(principal, rate)
+    if (++rate.count > ratePerMinute) return respond(429, { error: { code: "rate_limited" } }, { "retry-after": "60" })
     if (request.method !== "POST") return respond(405, { error: { code: "method_not_allowed" } })
     if (request.headers.has("origin")) return respond(403, { error: { code: "origin_rejected" } })
     if (request.headers.get("content-type")?.split(";")[0].toLowerCase() !== "application/json") return respond(415, { error: { code: "unsupported_media_type" } })

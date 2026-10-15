@@ -73,9 +73,10 @@ test("MCP rejects invalid tool arguments, origin and over-limit bodies", () => w
   expect((await fetch(server.url, { method: "POST", headers, body: "x".repeat(262145) })).status).toBe(413)
 }))
 
-test("MCP rate cap returns 429 and retry-after", () => withMcp(async ({ server }) => {
+test("MCP rate cap returns 429 and retry-after", () => withMcp(async ({ server, headers }) => {
   expect((await fetch(server.url)).status).toBe(401)
-  const limited = await fetch(server.url)
+  expect((await fetch(server.url, { method: "POST", headers, body: "{}" })).status).toBe(200)
+  const limited = await fetch(server.url, { method: "POST", headers, body: "{}" })
   expect(limited.status).toBe(429)
   expect(limited.headers.get("retry-after")).toBe("60")
 }, { ratePerMinute: 1 }))
