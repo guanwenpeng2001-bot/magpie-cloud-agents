@@ -1,11 +1,11 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 import { access } from "node:fs/promises"
-import { spawn, execFile } from "node:child_process"
+import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import { createServer } from "node:net"
 import { win32 } from "node:path"
 import { chatError } from "../lib/errors.mjs"
-import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
+import { sleep } from "../lib/http.mjs"
+import { createCdpApp, connectCdp as connectAppCdp } from "../lib/cdp-app.mjs"
 
 export const DOTS_APP_ERRORS = {
   missing: "ChatGPT desktop isn't installed — install the OpenAI ChatGPT app from the Microsoft Store and sign in once, then retry",
@@ -24,28 +24,6 @@ const execute = promisify(execFile)
 const SHELL_PAGE = "app://-/index.html"
 const DOTS_ROUTE = "app://-/index.html?initialRoute=%2Fdots"
 
-async function freePort() {
-  const server = createServer()
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve) })
-  const port = server.address().port
-  await new Promise(resolve => server.close(resolve))
-  return port
-}
-
-async function processes() {
-  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().Ticks.ToString()}}) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
-  const rows = JSON.parse(stdout || "[]")
-  return (Array.isArray(rows) ? rows : [rows]).map(row => ({ pid: row.ProcessId, executable: row.ExecutablePath, created: row.CreationDate, managedTag: row.CommandLine?.match(/--magpie-dots-managed=([0-9]+:[0-9a-f-]+)/)?.[1], port: Number(row.CommandLine?.match(/--remote-debugging-port[= ](\d+)/)?.[1]) || undefined }))
-}
-function parentAlive(pid) {
-  try { process.kill(pid, 0); return true } catch (error) { return error.code !== "ESRCH" }
-}
-async function stopManaged(row) {
-  const script = `$expected = [Console]::In.ReadToEnd() | ConvertFrom-Json; $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"; if ($process -and $process.ExecutablePath -eq $expected.executable -and $process.CreationDate.ToUniversalTime().Ticks.ToString() -ceq $expected.created -and $expected.managedTag -cmatch '^[1-9][0-9]*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' -and $process.CommandLine -cmatch ('(?:^|\\s)--magpie-dots-managed=' + [regex]::Escape($expected.managedTag) + '(?=\\s|$)')) { Invoke-CimMethod -InputObject $process -MethodName Terminate | Out-Null }`
-  const child = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 5000 })
-  child.stdin.end(JSON.stringify(row))
-  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", code => code === 0 ? resolve() : reject(failure("debug"))) })
-}
 async function readAppxLocations() {
   try {
     const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-AppxPackage -Name OpenAI.Codex | Select-Object -ExpandProperty InstallLocation) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 10000 })
@@ -65,63 +43,17 @@ export async function findChatGptApp({ env = process.env, exists = path => acces
   throw failure("missing")
 }
 
-export async function connectCdp(url, { WebSocket: Socket = globalThis.WebSocket, timers = clock, timeoutMs = 10000 } = {}, signal) {
-  const address = new URL(url)
-  if (address.protocol !== "ws:" || address.hostname !== "127.0.0.1" || address.username || address.password) throw failure("debug")
-  const socket = new Socket(url)
-  let sequence = 0
-  const pending = new Map()
-  const disconnected = () => { for (const job of pending.values()) job.reject(failure("crashed")); pending.clear() }
-  socket.addEventListener("close", disconnected)
-  socket.addEventListener("error", disconnected)
-  socket.addEventListener("message", event => {
-    let frame
-    try { frame = JSON.parse(String(event.data)) } catch { return }
-    const job = pending.get(frame.id)
-    if (!job) return
-    pending.delete(frame.id)
-    if (frame.error || frame.result?.exceptionDetails) {
-      const description = frame.error?.message ?? frame.result.exceptionDetails.exception?.description ?? frame.result.exceptionDetails.text
-      job.reject(Object.assign(new Error(String(description)), { bridge: true }))
-    } else job.resolve(frame.result)
-  })
-  try {
-    await withTimeout(() => new Promise((resolve, reject) => {
-      socket.addEventListener("open", resolve, { once: true })
-      socket.addEventListener("error", () => reject(failure("debug")), { once: true })
-      socket.addEventListener("close", () => reject(failure("debug")), { once: true })
-    }), signal, timeoutMs, timers)
-  } catch (error) { socket.close(); throw error }
-  async function call(method, params, callSignal) {
-    const id = ++sequence
-    try {
-      return await withTimeout(() => new Promise((resolve, reject) => {
-        if (socket.readyState !== 1) return reject(failure("crashed"))
-        pending.set(id, { resolve, reject })
-        socket.send(JSON.stringify({ id, method, params }))
-      }), callSignal, timeoutMs, timers)
-    } finally { pending.delete(id) }
-  }
-  return {
-    get open() { return socket.readyState === 1 },
-    call,
-    async evaluate(expression, callSignal) { return (await call("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, callSignal))?.result?.value },
-    close() { disconnected(); socket.close() },
-  }
-}
+export const connectCdp = (url, options, signal) => connectAppCdp(url, { ...options, failure }, signal)
 
 // Hidden Dot renderers support CDP input without bringing the window to the foreground.
-const shellProbe = `(() => { const text = document.body?.innerText ?? ""; return text.includes("新聊天") || text.includes("插件"); })()`
+export const shellProbe = `(() => !!document.querySelector('[data-app-shell-header-slot], .messages-scroll, div.ProseMirror[contenteditable="true"]'))()`
 const surfaceProbe = `(() => ({ href: location.href, composer: !!document.querySelector('div.ProseMirror[contenteditable="true"]') }))()`
 const composerProbe = `(() => !!document.querySelector('div.ProseMirror[contenteditable="true"]'))()`
 const focusProbe = `(() => { const composer = document.querySelector('div.ProseMirror[contenteditable="true"]'); if (!composer) return false; composer.focus(); return true; })()`
 const transcriptRead = `(() => [...document.querySelectorAll('.messages-scroll article.message-row')].map(row => ({ id: row.dataset.messageId || "", self: /(^|\\s)self/.test(row.className || ""), text: ((row.querySelector('.message-text, .message-body') || row).innerText || "") })))()`
-// The send control is an icon button with no inner text; its accessible name carries 发送.
-// Exported so tests evaluate the exact predicate string the page runs.
 export const SEND_BUTTON_MATCH = `((candidate, box) => {
   const area = candidate.getBoundingClientRect();
-  const name = (candidate.getAttribute("aria-label") || candidate.innerText || candidate.textContent || "").trim();
-  return name === "发送" && area.left > box.left && Math.abs((area.top + area.height / 2) - (box.top + box.height / 2)) < 80;
+  return candidate.matches("button.bg-composer-primary") && !candidate.disabled && candidate.getAttribute("aria-disabled") !== "true" && area.width > 0 && area.height > 0 && area.left > box.left && Math.abs((area.top + area.height / 2) - (box.top + box.height / 2)) < 80;
 })`
 const sendProbe = `(() => {
   const composer = document.querySelector('div.ProseMirror[contenteditable="true"]');
@@ -140,138 +72,19 @@ const CLEAR_KEYS = [
 ]
 
 export function createDotsApp(options = {}, dependencies = options.dependencies ?? {}) {
-  const deps = { env: process.env, processes, parentAlive, stopManaged, exists: path => access(path).then(() => true, () => false), appx: readAppxLocations, fetch: globalThis.fetch, timers: clock, connect: connectCdp, spawn, freePort, ...dependencies }
-  const timers = deps.timers
-  let connection, connecting, owned, idleTimer
   const active = new Map()
-  const touch = () => { timers.clearTimeout(idleTimer) }
+  const app = createCdpApp({
+    failure, find: findChatGptApp, processName: "ChatGPT.exe", flag: "magpie-dots-managed",
+    version: value => Boolean(value.Browser),
+    pages: list => list.filter(target => target.type === "page" && /^app:\/\/-/.test(target.url ?? "") && target.webSocketDebuggerUrl).sort((a, b) => Number(b.url.startsWith(SHELL_PAGE)) - Number(a.url.startsWith(SHELL_PAGE))),
+    probe: shellProbe, boot: true, authorizeLaunch: true,
+    launchError: ({ spawnError, child, previous }) => spawnError ? launchFailed(spawnError.message) : failure(previous.length ? "running" : child.exitCode != null ? "launch" : "debug"),
+  }, options, dependencies, active)
+  const { touch, idle, ensure, checkDrivable } = app
+  const timers = app.deps.timers
   function release(run) {
     run.signal?.removeEventListener("abort", run.onAbort)
     if (active.get("dot") === run) active.delete("dot")
-  }
-  function idle() {
-    touch()
-    if (active.size) return
-    idleTimer = timers.setTimeout(() => {
-      connection?.close(); connection = undefined
-      if (owned) { const child = owned; owned = undefined; if (child.exitCode == null) child.kill() }
-    }, (options.keepAliveMinutes ?? 15) * 60000)
-    idleTimer?.unref?.()
-  }
-  async function version(port, signal) {
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return false
-    try {
-      const response = await fetchWithTimeout(`http://127.0.0.1:${port}/json/version`, { signal, redirect: "error" }, { fetch: deps.fetch, timeoutMs: 800 })
-      return Boolean((await response.json())["Browser"])
-    } catch { signal?.throwIfAborted(); return false }
-  }
-  async function attach(port, signal, bootMs = 0) {
-    bootMs = Number.isFinite(bootMs) && bootMs >= 0 ? bootMs : 15000
-    const deadline = timers.now() + bootMs
-    for (;;) {
-      signal?.throwIfAborted()
-      const response = await fetchWithTimeout(`http://127.0.0.1:${port}/json/list`, { signal, redirect: "error" }, { fetch: deps.fetch, timeoutMs: 2000 })
-      const list = await response.json()
-      const pages = (Array.isArray(list) ? list : []).filter(target => target.type === "page" && /^app:\/\/-/.test(target.url ?? "") && target.webSocketDebuggerUrl)
-      pages.sort((a, b) => Number(b.url.startsWith(SHELL_PAGE)) - Number(a.url.startsWith(SHELL_PAGE)))
-      let lastError
-      for (const page of pages) {
-        const endpoint = new URL(page.webSocketDebuggerUrl)
-        if (endpoint.hostname !== "127.0.0.1" || Number(endpoint.port) !== port) continue
-        const client = await deps.connect(endpoint.href, { timers, WebSocket: deps.WebSocket }, signal)
-        try {
-          if (await client.evaluate(shellProbe, signal)) return client
-        } catch (error) { lastError = error; if (!client.open) throw error }
-        client.close()
-      }
-      const remaining = deadline - timers.now()
-      if (remaining <= 0) throw lastError ?? failure("signedOut")
-      await sleep(Math.min(250, remaining), signal, timers)
-    }
-  }
-  async function runningProcesses() {
-    try { return await deps.processes() } catch { throw failure("debug") }
-  }
-  async function reattach(previous, signal) {
-    let lastError
-    for (const port of [...new Set([...(options.reattachPorts ?? []), ...previous.map(row => row.port)])]) {
-      if (!await version(port, signal)) continue
-      try { return { port, client: await attach(port, signal) } }
-      catch (error) { lastError = error }
-    }
-    if (lastError) throw lastError
-  }
-  async function adopt(previous, port, executable) {
-    const row = previous.find(row => row.port === port && row.created && row.executable?.toLowerCase() === executable.toLowerCase() && /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.managedTag ?? ""))
-    if (row && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) owned = { exitCode: null, kill: () => {
-      void deps.processes().then(rows => {
-        if (rows.some(current => current.pid === row.pid && current.created === row.created && current.executable === row.executable && current.managedTag === row.managedTag) && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) return deps.stopManaged(row)
-      }).catch(() => {})
-    } }
-  }
-  async function launch(executable, previous, signal) {
-    // No --user-data-dir on purpose: the ChatGPT app cannot be signed in on a fresh profile,
-    // so a separate profile would produce a signed-OUT instance. The app's own profile is the
-    // only signed-in one, and is required for the Dot to be usable.
-    const port = await deps.freePort()
-    const managedTag = `${process.pid}:${randomUUID()}`
-    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-dots-managed=${managedTag}`], { stdio: "ignore", windowsHide: false })
-    const spawnErrors = new Set()
-    child.once?.("error", error => spawnErrors.add(error))
-    owned = { exitCode: null, kill: () => {
-      // Identity is pinned to the child this instance spawned, as adopt() does: the pid comes
-      // from the spawn return, the creation stamp is read back for that pid, and the same pid +
-      // tag + executable + stamp must still be listed on a fresh read before stopManaged runs.
-      void deps.processes().then(rows => {
-        const stamp = rows.find(current => current.pid === child.pid && current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
-        if (!stamp) return
-        return deps.processes().then(latest => {
-          const row = latest.find(current => current.pid === stamp.pid && current.created === stamp.created && current.executable === stamp.executable && current.managedTag === stamp.managedTag)
-          if (row) return deps.stopManaged(row)
-        })
-      }).catch(() => {})
-    } }
-    const started = timers.now()
-    while (timers.now() - started < (options.launchTimeoutMs ?? 10000)) {
-      signal?.throwIfAborted()
-      if (await version(port, signal)) return { port, client: await attach(port, signal, options.appBootMs ?? 15000) }
-      if (spawnErrors.size) throw launchFailed([...spawnErrors][0].message)
-      if (child.exitCode != null) break
-      await sleep(200, signal, timers)
-    }
-    if (child.exitCode != null) {
-      // A single-instance app hands the second launch off to the existing instance and ignores
-      // the debug flags, so an exit alongside a pre-existing instance means the user's ChatGPT
-      // is running normally without a port; never escalate to killing it.
-      if (previous.length) throw failure("running")
-      throw failure("launch")
-    }
-    // Same handoff discrimination as the exit branch above: at the bound, a pre-existing
-    // instance is the likeliest cause of a slow handoff, so point the user at quitting
-    // ChatGPT rather than at a security tool.
-    if (previous.length) throw failure("running")
-    throw failure("debug")
-  }
-  async function start(signal) {
-    const executable = await findChatGptApp(deps)
-    const previous = await runningProcesses()
-    const attached = await reattach(previous, signal)
-    if (attached) {
-      await adopt(previous, attached.port, executable)
-      return attached.client
-    }
-    return (await launch(executable, previous, signal)).client
-  }
-  async function ensure(signal) {
-    touch()
-    if (connection?.open) return connection
-    if (!connecting) connecting = start(signal).then(value => connection = value).catch(error => { signal?.throwIfAborted(); if (error.status) throw error; throw failure("debug") }).finally(() => { connecting = undefined; idle() })
-    return connecting
-  }
-  async function checkDrivable() {
-    await findChatGptApp(deps)
-    if (connection?.open) return
-    await ensure()
   }
   async function openSurface(client, signal) {
     const state = await client.evaluate(surfaceProbe, signal)
@@ -286,14 +99,14 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     throw failure("changed")
   }
   async function readTurn(run, signal) {
-    let client = connection
+    let client = app.connection
     let rows
     try {
       if (!client?.open) throw failure("crashed")
       rows = await client.evaluate(transcriptRead, signal)
     } catch (error) {
       if (signal?.aborted || error.status === 401) throw error
-      connection?.close(); connection = undefined
+      app.disconnect()
       try { client = await ensure(signal); rows = await client.evaluate(transcriptRead, signal) }
       catch { throw failure("crashed") }
     }
@@ -378,7 +191,7 @@ export function createDotsApp(options = {}, dependencies = options.dependencies 
     create, poll, stream,
     cancel(credential, run) { if (active.get("dot") === run) release(run); idle() },
     followUp(credential, run, texts, signal) { return create(credential, { prompt: texts.join("\n"), turnIndex: run.turnIndex + 1, sessionKey: run.sessionKey }, signal) },
-    dispose() { touch(); connection?.close(); connection = undefined; if (owned) { if (owned.exitCode == null) owned.kill(); owned = undefined } },
+    dispose: app.dispose,
     checkDrivable,
   }
 }

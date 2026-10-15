@@ -1,8 +1,7 @@
 import { expect, test } from "bun:test"
 import { makeDotsDriver } from "./dots.mjs"
-import { createDotsApp, findChatGptApp, connectCdp, SEND_BUTTON_MATCH, DOTS_APP_ERRORS } from "./dots-app.mjs"
+import { createDotsApp, findChatGptApp, connectCdp, SEND_BUTTON_MATCH, DOTS_APP_ERRORS, shellProbe } from "./dots-app.mjs"
 
-import { readFile } from "node:fs/promises"
 import { spawn, execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { randomUUID } from "node:crypto"
@@ -45,13 +44,13 @@ function fixture(settings = {}) {
         const shell = (socket.data?.path ?? "").endsWith("/shell")
         let value
         let error
-        if (expression.includes("新聊天")) value = state.sidebar && shell
+        if (expression.includes("data-app-shell-header-slot")) value = state.sidebar && shell
         else if (expression.includes("location.assign")) { state.route = DOTS_ROUTE; state.composer = true }
         else if (expression.includes("location.href")) value = { href: state.route, composer: state.composer }
         else if (expression.includes("message-row")) value = state.rows
-        else if (expression.includes("发送")) {
+        else if (expression.includes("button.bg-composer-primary")) {
           let clicked = false
-          const button = { getAttribute: () => "发送", innerText: "", textContent: "", getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }), click() { clicked = true } }
+          const button = { matches: selector => selector === "button.bg-composer-primary", getAttribute: () => null, innerText: "", textContent: "", getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }), click() { clicked = true } }
           const document = {
             querySelector: () => ({ getBoundingClientRect: () => ({ left: 482, top: 760, width: 600, height: 36 }) }),
             querySelectorAll: () => state.sendButton && shell ? [button] : [],
@@ -111,10 +110,9 @@ const send = fixture => fixture.driver.create(marker, { prompt: "hello" })
 
 test("real production teardown guard terminates only the identified tagged process under Windows PowerShell", async () => {
   if (process.platform !== "win32") return
-  const source = await readFile(new URL("./dots-app.mjs", import.meta.url), "utf8")
-  const guard = source.match(/const script = (`[^`]+`)/)[1]
-  const script = new Function(`return ${guard}`)()
-  const projection = source.match(/Select-Object ProcessId,CommandLine,ExecutablePath,([^\n]+?)\) \| ConvertTo-Json/)[1]
+  const { PROCESS_PROJECTION, stopScript } = await import("../lib/cdp-app.mjs")
+  const script = stopScript("magpie-dots-managed")
+  const projection = PROCESS_PROJECTION.replace("Select-Object ProcessId,CommandLine,ExecutablePath,", "")
   const tag = `${process.pid}:${randomUUID()}`
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", `--magpie-dots-managed=${tag}`], { stdio: "ignore" })
   const execute = promisify(execFile)
@@ -160,14 +158,23 @@ test("discovery resolves the exe under the app\\ subdirectory and at the install
 
 test("CDP client rejects remote websocket endpoints", async () => { await expect(connectCdp("ws://example.invalid:9333/devtools/page/1")).rejects.toThrow(messages.debug) })
 
-test("send control is matched by accessible name without inner text, and geometry still applies", () => {
+test("shell detection uses application structure without reading translated text", () => {
+  const probe = document => new Function("document", `return ${shellProbe}`)(document)
+  for (const present of [true, false]) {
+    expect(probe({ get body() { throw new Error("text must not be read") }, querySelector(selector) { expect(selector).toContain("data-app-shell-header-slot"); return present ? {} : null } })).toBe(present)
+  }
+})
+
+test("send control uses structure regardless of translated label", () => {
   const match = (0, eval)(SEND_BUTTON_MATCH)
   const box = { left: 482, top: 760, width: 600, height: 36 }
-  const iconButton = { getAttribute: () => "发送", innerText: "", textContent: "", getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }) }
-  expect(match(iconButton, box)).toBe(true)
-  expect(match({ ...iconButton, getAttribute: () => "复制" }, box)).toBe(false)
-  expect(match({ ...iconButton, getBoundingClientRect: () => ({ left: 10, top: 764, width: 28, height: 28 }) }, box)).toBe(false)
-  expect(match({ getAttribute: () => "", innerText: "发送", textContent: "发送", getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }) }, box)).toBe(true)
+  for (const label of ["Send", "发送", "Envoyer", "送信"]) {
+    const button = { matches: selector => selector === "button.bg-composer-primary", disabled: false, getAttribute: name => name === "aria-label" ? label : null, getBoundingClientRect: () => ({ left: 1141, top: 764, width: 28, height: 28 }) }
+    expect(match(button, box)).toBe(true)
+    expect(match({ ...button, disabled: true }, box)).toBe(false)
+    expect(match({ ...button, matches: () => false }, box)).toBe(false)
+    expect(match({ ...button, getBoundingClientRect: () => ({ left: 10, top: 764, width: 28, height: 28 }) }, box)).toBe(false)
+  }
 })
 
 test("a surface with no send control fails with the changed-UI error", async () => {
@@ -185,7 +192,7 @@ test("launch binds debug argv to loopback, clears and types into the Dot surface
     expect(inserted[0].params.text).toBe(run.prompt)
     expect(fake.frames.filter(frame => frame.method === "Input.dispatchKeyEvent").map(frame => frame.params.windowsVirtualKeyCode)).toEqual([65, 65, 8, 8])
     expect(fake.state.sendClicks).toBe(1)
-    expect(fake.frames.filter(frame => frame.params.expression?.includes("发送"))).toHaveLength(1)
+    expect(fake.frames.filter(frame => frame.params.expression?.includes("button.bg-composer-primary"))).toHaveLength(1)
     expect((await fake.driver.poll(marker, run)).state).toBe("running")
     expect(await fake.driver.poll(marker, run)).toEqual({ state: "succeeded", text: "收到" })
   } finally { fake.close() }
@@ -204,7 +211,7 @@ test("attach skips the avatar-overlay and detached-window pages and only drives 
   const fake = fixture({ decoys: true, replies: ["answer"] })
   try {
     await send(fake)
-    const driven = fake.frames.filter(frame => frame.params.expression?.includes("composer.focus()") || frame.params.expression?.includes("发送"))
+    const driven = fake.frames.filter(frame => frame.params.expression?.includes("composer.focus()") || frame.params.expression?.includes("button.bg-composer-primary"))
     expect(driven.length).toBeGreaterThan(0)
     expect(driven.every(frame => frame.path.endsWith("/shell"))).toBe(true)
   } finally { fake.close() }
@@ -259,7 +266,7 @@ test("second concurrent turn on the same Dot is refused, not interleaved", async
     expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1)
     expect(results.find(result => result.status === "rejected").reason.status).toBe(409)
     expect(fake.state.sendClicks).toBe(1)
-    expect(fake.frames.filter(frame => frame.params.expression?.includes("发送"))).toHaveLength(1)
+    expect(fake.frames.filter(frame => frame.params.expression?.includes("button.bg-composer-primary"))).toHaveLength(1)
   } finally { fake.close() }
 })
 
@@ -322,7 +329,7 @@ for (const entry of ["checkDrivable", "liveModels", "create"]) {
     const driver = createDotsApp({}, { ...fake.dependencies, connect: async url => ({
       open: true,
       async evaluate(expression) {
-        if (expression.includes("新聊天")) return url.endsWith("/shell") && fake.dependencies.timers.now() >= 1000
+        if (expression.includes("data-app-shell-header-slot")) return url.endsWith("/shell") && fake.dependencies.timers.now() >= 1000
         if (expression.includes("location.href")) return { composer: true }
         if (expression.includes("message-row")) return []
         return true

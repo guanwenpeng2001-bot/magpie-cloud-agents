@@ -69,16 +69,18 @@ Entry functions pass the package's options through to each provider factory (`ma
 | `cursorCloud.repos` | — | Repositories sent with agent creation |
 | `devinCloud.maxAcuLimit` | — | `max_acu_limit` sent with session creation; `0` or omitted leaves Devin's default |
 | `codexAgents.environment` | `{ type: "openai_hosted" }` | `environment` object sent with session creation |
-| `dotsApp.keepAliveMinutes` | `15` | Idle minutes before disconnecting CDP (also stops an adopted orphan managed instance) |
+| `dotsApp.keepAliveMinutes` | `1` | Idle minutes before disconnecting CDP (also stops an adopted orphan managed instance) |
 | `dotsApp.reattachPorts` | `[]` | Additional loopback debug ports to try before ports discovered from app processes |
 | `dotsApp.stableMs` | `3000` | Unchanged-reply interval before app-drive infers completion |
 | `dotsApp.streamIntervalMs` | `250` | Interval between app-drive transcript reads during streaming |
 | `dotsApp.surfaceTimeoutMs` | `15000` | Wait limit for the Dot composer to become available |
 | `dots.taskTtlMinutes` | `30` | How long an unclaimed Dots task stays queued |
 | `dots.tunnelCommand` / `dots.publicUrl` | — | Use your own named tunnel command / fixed public URL instead of a quick tunnel |
-| `grokBot.keepAliveMinutes` | `15` | Idle minutes before Magpie closes an app instance it launched itself |
+| `grokBot.keepAliveMinutes` | `1` | Idle minutes before Magpie closes an app instance it launched itself |
 | `grokBot.launchTimeoutMs` | `10000` | How long app launch may take |
 | `grokBot.ghostMode` | `true` | `x-ghost-mode: true` header on direct-protocol requests |
+
+CDP debug ports have no authentication: while a port is open, any local process can control the signed-in app, read its content, and submit requests as you. Loopback binding prevents remote access but does not isolate other local programs. Both app drivers disconnect after one idle minute by default; configure `dotsApp.keepAliveMinutes` or `grokBot.keepAliveMinutes` to change this interval. Active turns prevent idle cleanup. Normal host shutdown disposes connections and stops only identity-verified managed processes; forced termination cannot run cleanup. Attaching to an app you started never closes that app or its debug port, so quit that app yourself when debugging is no longer needed.
 
 Every provider runs at `maxConcurrency: 4`.
 
@@ -310,16 +312,18 @@ magpie plugin list
 | `cursorCloud.repos` | — | 创建 agent 时携带的仓库 |
 | `devinCloud.maxAcuLimit` | — | 创建会话时发送的 `max_acu_limit`；`0` 或缺省沿用 Devin 默认 |
 | `codexAgents.environment` | `{ type: "openai_hosted" }` | 创建会话时发送的 `environment` 对象 |
-| `dotsApp.keepAliveMinutes` | `15` | 空闲多少分钟后断开 CDP（也会停止接管的孤立托管实例） |
+| `dotsApp.keepAliveMinutes` | `1` | 空闲多少分钟后断开 CDP（也会停止接管的孤立托管实例） |
 | `dotsApp.reattachPorts` | `[]` | 在应用进程发现的端口之前尝试的额外环回调试端口 |
 | `dotsApp.stableMs` | `3000` | app-drive 推断完成前要求答复文本保持不变的时长 |
 | `dotsApp.streamIntervalMs` | `250` | app-drive 流式输出期间读取对话记录的间隔 |
 | `dotsApp.surfaceTimeoutMs` | `15000` | 等待 Dot 输入框可用的时限 |
 | `dots.taskTtlMinutes` | `30` | 未被认领的 Dots 任务在队列中保留的时长 |
 | `dots.tunnelCommand` / `dots.publicUrl` | — | 改用自己的命名隧道命令 / 固定公网 URL，替代快速隧道 |
-| `grokBot.keepAliveMinutes` | `15` | Magpie 自行启动的应用实例在空闲多少分钟后被关闭 |
+| `grokBot.keepAliveMinutes` | `1` | Magpie 自行启动的应用实例在空闲多少分钟后被关闭 |
 | `grokBot.launchTimeoutMs` | `10000` | 应用启动的最长等待 |
 | `grokBot.ghostMode` | `true` | 直连协议请求携带 `x-ghost-mode: true` 头 |
+
+CDP 调试端口没有身份认证：端口开放期间，本机任何进程都能操控已登录应用、读取内容并以你的身份提交请求。环回绑定能阻止远程访问，但不能隔离本机其他程序。两种应用驱动默认在空闲一分钟后断开，可用 `dotsApp.keepAliveMinutes` 或 `grokBot.keepAliveMinutes` 调整；活动中的轮次不会触发空闲回收。宿主正常退出会清理连接，并仅停止经过身份核验的托管进程；强制终止无法执行清理。连接用户自行启动的应用时不会关闭该应用或其调试端口，不再需要调试时请自行退出应用。
 
 所有 provider 均以 `maxConcurrency: 4` 运行。
 

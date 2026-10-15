@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test"
 import { execFile, spawn } from "node:child_process"
 import { promisify } from "node:util"
-import { readFile } from "node:fs/promises"
 import { makeGrokBotDriver } from "./grok-bot.mjs"
 import { createGrokBotCdp, findGrokBot, connectCdp } from "./grok-bot-cdp.mjs"
 import { errorResponse } from "../lib/errors.mjs"
@@ -9,9 +8,9 @@ import { SESSION_HEADER } from "../lib/sessions.mjs"
 
 test.skipIf(process.platform !== "win32")("real PowerShell teardown preserves exact process identity through JSON", async () => {
   const execute = promisify(execFile)
-  const source = await readFile(new URL("./grok-bot-cdp.mjs", import.meta.url), "utf8")
-  const enumeration = JSON.parse(source.match(/await execute\("powershell.exe", \["-NoProfile", "-NonInteractive", "-Command", ("(?:\\.|[^"\\])*")/)[1])
-  const stopScript = source.match(/const script = `([^`]+)`/)[1].replace(/\\\\/g, "\\")
+  const { PROCESS_PROJECTION, stopScript: buildStopScript } = await import("../lib/cdp-app.mjs")
+  const enumeration = `@(Get-CimInstance Win32_Process -Filter "Name='Grok Bot.exe'" | ${PROCESS_PROJECTION}) | ConvertTo-Json -Compress`
+  const stopScript = buildStopScript("magpie-grok-managed")
   const tag = "999999:12345678-1234-4234-8234-123456789abc"
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", `--magpie-grok-managed=${tag}`], { stdio: "ignore" })
   const exited = new Promise(resolve => child.once("exit", resolve))
@@ -123,7 +122,7 @@ function fixture(settings = {}) {
       })),
     ],
     freePort: async () => server.port,
-    spawn(exe, argv, options) { const child = { exitCode: state.exited ? 0 : null, kill() { kills++ }, once() {} }; spawns.push({ exe, argv, options }); return child },
+    spawn(exe, argv, options) { const child = { pid: 100 + spawns.length, exitCode: state.exited ? 0 : null, kill() { kills++ }, once() {} }; spawns.push({ exe, argv, options }); return child },
     stopManaged: async row => { stops.push(row) },
     fetch: async url => {
       if (state.unreachable) throw new Error("unreachable")
@@ -351,24 +350,23 @@ test("review F9 missing verify and dispose rejects direct seam", async () => {
 })
 
 test("managed stop revalidates tag, executable and creation time and refuses a mismatch", async () => {
-  const executable = "C:\\Programs\\Grok Bot\\Grok Bot.exe"
   for (const [mutate, expected] of [
     [() => {}, 1],
     [row => { delete row.managedTag }, 0],
-    [row => { row.executable = "C:\\Users\\me\\AppData\\Local\\Programs\\Grok Bot\\Grok Bot.exe" }, 0],
-    [row => { row.created = undefined }, 0],
+    [row => { row.executable = "C:\\different.exe" }, 0],
+    [row => { row.created = "reused" }, 0],
+    [row => { row.pid = 777 }, 0],
   ]) {
-    const row = { pid: 4242, executable, created: "t0", managedTag: "" }
-    const stops = []
-    const fake = fixture({ unreachable: true, exited: true })
-    const driver = createGrokBotCdp({}, { ...fake.dependencies, processes: async () => [row], stopManaged: async value => { stops.push(value) } })
+    const fake = fixture()
+    let changed = false
+    const enumerate = fake.dependencies.processes
+    const driver = createGrokBotCdp({}, { ...fake.dependencies, processes: async () => (await enumerate()).map(row => { if (changed) mutate(row); return row }) })
     try {
-      await expectFailure(() => driver.create(marker, { model: "bot-id", prompt: "hello" }), "running", 409)
-      row.managedTag = fake.spawns[0].argv[2].split("=")[1]
-      mutate(row)
-      driver.dispose(); await Bun.sleep(5)
-      expect(stops).toHaveLength(expected)
-      if (expected) expect(stops[0]).toMatchObject({ pid: 4242, executable, created: "t0", managedTag: row.managedTag })
+      await driver.liveModels(marker)
+      changed = true
+      await driver.dispose()
+      expect(fake.stops).toHaveLength(expected)
+      if (expected) expect(fake.stops[0].pid).toBe(100)
     } finally { driver.dispose(); fake.close() }
   }
 })
@@ -412,6 +410,20 @@ test("review F2 implemented gate distinguishes missing installation from scaffol
   const output = await new Response(gate.stdout).text(); const errors = await new Response(gate.stderr).text()
   expect({ code: await gate.exited, errors }).toEqual({ code: 0, errors: "" })
   expect(output).toContain("implemented: grok-bot; scaffold: 5")
+})
+
+test("launched process identity is pinned before PID reuse", async () => {
+  const fake = fixture()
+  let replaced = false
+  const enumerate = fake.dependencies.processes
+  const driver = createGrokBotCdp({}, { ...fake.dependencies, processes: async () => (await enumerate()).map(row => ({ ...row, created: replaced ? "reused" : row.created })) })
+  try {
+    await driver.liveModels(marker)
+    replaced = true
+    await driver.dispose()
+    await Bun.sleep(5)
+    expect(fake.stops).toHaveLength(0)
+  } finally { driver.dispose(); fake.close() }
 })
 
 test("CDP client rejects remote websocket endpoints", async () => { await expect(connectCdp("ws://example.invalid:9333/devtools/page/1")).rejects.toThrow(messages.debug) })
