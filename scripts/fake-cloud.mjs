@@ -26,16 +26,19 @@ export function startFakeCloud({ port = 0, scenario } = {}) {
       if (vendor === "openai") {
         if (path === "/v1/agents/sessions" && request.method === "POST") {
           const id = `session_${++sequence}`
-          sessions.set(id, { id, text: "Synthetic OpenAI answer" })
+          sessions.set(id, { id, turnId: "turn_synthetic", text: "Synthetic OpenAI answer" })
           return json({ id, status: "active" })
         }
-        const match = /^\/v1\/agents\/sessions\/([^/]+)(?:\/(events|items|turns))?$/.exec(path)
+        const match = /^\/v1\/agents\/sessions\/([^/]+)(?:\/(events|turns)(?:\/([^/]+)\/(items))?)?$/.exec(path)
         const session = match && sessions.get(match[1])
         if (session) {
+          if (match[4]) {
+            if (match[2] !== "turns" || match[3] !== session.turnId) return new Response("unknown synthetic turn", { status: 404 })
+            return json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: session.text }] }] })
+          }
           if (match[2] === "events" && request.method === "POST") return json({ data: body.events })
-          if (match[2] === "events") return events([["agent.session.turn.completed", { type: "agent.session.turn.completed", session_id: session.id }]])
-          if (match[2] === "items") return json({ data: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: session.text }] }] })
-          if (match[2] === "turns") return json({ data: [{ id: "turn_synthetic", status: "completed" }] })
+          if (match[2] === "events") return events([["agent.session.turn.completed", { type: "agent.session.turn.completed", session_id: session.id, turn_id: session.turnId }]])
+          if (match[2] === "turns") return json({ data: [{ id: session.turnId, status: "completed" }] })
           return json(session)
         }
       }
@@ -97,7 +100,8 @@ export async function selfTest() {
   try {
     const openai = await post("/openai/v1/agents/sessions", { agent: { model: "gpt-6-astra" }, input: [{ role: "user", content: [{ type: "input_text", text: "Synthetic request" }] }] })
     assert.match(await (await fetch(`${server.url}/openai/v1/agents/sessions/${openai.id}/events`)).text(), /agent.session.turn.completed/)
-    assert.match((await get(`/openai/v1/agents/sessions/${openai.id}/items`)).data[0].content[0].text, /OpenAI answer/)
+    const turn = (await get(`/openai/v1/agents/sessions/${openai.id}/turns`)).data[0]
+    assert.match((await get(`/openai/v1/agents/sessions/${openai.id}/turns/${turn.id}/items`)).data[0].content[0].text, /OpenAI answer/)
     const cursor = await post("/cursor/v1/agents", { prompt: { text: "Synthetic request" }, model: { id: "composer-2" } })
     assert.match((await get(`/cursor/v1/agents/${cursor.agent.id}/runs/${cursor.run.id}`)).result, /Cursor answer/)
     const devin = await post("/devin/v1/sessions", { prompt: "Synthetic request" })
