@@ -1,12 +1,9 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 import { access } from "node:fs/promises"
-import { spawn, execFile } from "node:child_process"
-import { promisify } from "node:util"
 import { win32 } from "node:path"
 import { tmpdir } from "node:os"
-import { createServer } from "node:net"
 import { chatError } from "../lib/errors.mjs"
-import { clock, fetchWithTimeout, sleep, withTimeout } from "../lib/http.mjs"
+import { createCdpApp, connectCdp as connectAppCdp } from "../lib/cdp-app.mjs"
 
 export const CDP_ERRORS = {
   missing: "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry",
@@ -18,30 +15,6 @@ export const CDP_ERRORS = {
   debug: "Grok Bot didn't open its debug interface — another security tool may be blocking it",
 }
 const failure = key => chatError(key === "signedOut" ? 401 : key === "running" ? 409 : 502, CDP_ERRORS[key])
-const execute = promisify(execFile)
-
-async function processes() {
-  const { stdout } = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='Grok Bot.exe'\" | Select-Object ProcessId,CommandLine,ExecutablePath,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().Ticks.ToString()}}) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 5000 })
-  const rows = JSON.parse(stdout || "[]")
-  return (Array.isArray(rows) ? rows : [rows]).map(row => ({ pid: row.ProcessId, executable: row.ExecutablePath, created: row.CreationDate, managedTag: row.CommandLine?.match(/--magpie-grok-managed=([0-9]+:[0-9a-f-]+)/)?.[1], port: Number(row.CommandLine?.match(/--remote-debugging-port[= ](\d+)/)?.[1]) || undefined }))
-}
-function parentAlive(pid) {
-  try { process.kill(pid, 0); return true } catch (error) { return error.code !== "ESRCH" }
-}
-async function stopManaged(row) {
-  const script = `$expected = [Console]::In.ReadToEnd() | ConvertFrom-Json; $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"; if ($process -and $process.ExecutablePath -eq $expected.executable -and $process.CreationDate.ToUniversalTime().Ticks.ToString() -ceq $expected.created -and $expected.managedTag -cmatch '^[1-9][0-9]*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' -and $process.CommandLine -cmatch ('(?:^|\\s)--magpie-grok-managed=' + [regex]::Escape($expected.managedTag) + '(?=\\s|$)')) { Invoke-CimMethod -InputObject $process -MethodName Terminate | Out-Null }`
-  const child = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 5000 })
-  child.stdin.end(JSON.stringify(row))
-  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", code => code === 0 ? resolve() : reject(failure("debug"))) })
-}
-async function freePort() {
-  const server = createServer()
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve) })
-  const port = server.address().port
-  await new Promise(resolve => server.close(resolve))
-  return port
-}
-
 export async function findGrokBot({ env = process.env, exists = path => access(path).then(() => true, () => false) } = {}) {
   const roots = [env.ProgramFiles && win32.join(env.ProgramFiles, "Grok Bot"), env.LOCALAPPDATA && win32.join(env.LOCALAPPDATA, "Programs", "Grok Bot"), ...(env.PATH ?? env.Path ?? "").split(";").filter(Boolean)]
   for (const root of roots.filter(Boolean)) {
@@ -51,50 +24,7 @@ export async function findGrokBot({ env = process.env, exists = path => access(p
   throw failure("missing")
 }
 
-export async function connectCdp(url, { WebSocket: Socket = globalThis.WebSocket, timers = clock, timeoutMs = 10000 } = {}, signal) {
-  const address = new URL(url)
-  if (address.protocol !== "ws:" || address.hostname !== "127.0.0.1" || address.username || address.password) throw failure("debug")
-  const socket = new Socket(url)
-  let sequence = 0
-  const pending = new Map()
-  const disconnected = () => { for (const job of pending.values()) job.reject(failure("crashed")); pending.clear() }
-  socket.addEventListener("close", disconnected)
-  socket.addEventListener("error", disconnected)
-  socket.addEventListener("message", event => {
-    let frame
-    try { frame = JSON.parse(String(event.data)) } catch { return }
-    const job = pending.get(frame.id)
-    if (!job) return
-    pending.delete(frame.id)
-    if (frame.error || frame.result?.exceptionDetails) {
-      const description = frame.error?.message ?? frame.result.exceptionDetails.exception?.description ?? frame.result.exceptionDetails.text
-      job.reject(Object.assign(new Error(String(description)), { bridge: true }))
-    } else job.resolve(frame.result)
-  })
-  try {
-    await withTimeout(() => new Promise((resolve, reject) => {
-      socket.addEventListener("open", resolve, { once: true })
-      socket.addEventListener("error", () => reject(failure("debug")), { once: true })
-      socket.addEventListener("close", () => reject(failure("debug")), { once: true })
-    }), signal, timeoutMs, timers)
-  } catch (error) { socket.close(); throw error }
-  async function call(method, params, callSignal) {
-    const id = ++sequence
-    try {
-      return await withTimeout(() => new Promise((resolve, reject) => {
-        if (socket.readyState !== 1) return reject(failure("crashed"))
-        pending.set(id, { resolve, reject })
-        socket.send(JSON.stringify({ id, method, params }))
-      }), callSignal, timeoutMs, timers)
-    } finally { pending.delete(id) }
-  }
-  return {
-    get open() { return socket.readyState === 1 },
-    call,
-    async evaluate(expression, callSignal) { return (await call("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, callSignal))?.result?.value },
-    close() { disconnected(); socket.close() },
-  }
-}
+export const connectCdp = (url, options, signal) => connectAppCdp(url, { ...options, failure }, signal)
 
 const botList = value => {
   const list = Array.isArray(value) ? value : value?.agents ?? value?.agentIds ?? value?.pinnedAgents ?? []
@@ -128,96 +58,18 @@ const domTail = `(() => {
 })()`
 
 export function createGrokBotCdp(options = {}, dependencies = options.dependencies ?? {}) {
-  const deps = { env: process.env, spawn, processes, parentAlive, stopManaged, freePort, fetch: globalThis.fetch, timers: clock, connect: connectCdp, ...dependencies }
-  const timers = deps.timers
-  let connection, connecting, owned, idleTimer
   const active = new Map()
-  const launchErrors = new WeakSet()
-  const touch = () => { timers.clearTimeout(idleTimer) }
+  const app = createCdpApp({
+    failure, find: findGrokBot, processName: "Grok Bot.exe", flag: "magpie-grok-managed",
+    version: value => /GrokBot\//.test(value["User-Agent"] ?? ""),
+    pages: list => list.filter(target => target.type === "page" && /^file:\/\//.test(target.url ?? "") && /\/dist\/renderer\//.test(target.url ?? "") && /app\.asar/.test(target.url ?? "")),
+    args: deps => ["--user-data-dir=" + win32.join(deps.env.LOCALAPPDATA || tmpdir(), "Magpie", "grok-bot-managed-profile")],
+    launchError: ({ child, previous }) => failure(previous.length && child.exitCode != null ? "running" : "debug"),
+  }, options, dependencies, active)
+  const { touch, idle, ensure, checkDrivable } = app
   function release(run) {
     run.signal?.removeEventListener("abort", run.onAbort)
     if (active.get(run.bot.id) === run) active.delete(run.bot.id)
-  }
-  function idle() {
-    touch()
-    if (active.size) return
-    idleTimer = timers.setTimeout(() => {
-      connection?.close(); connection = undefined
-      if (owned) { const child = owned; owned = undefined; if (child.exitCode == null && !launchErrors.has(child)) child.kill() }
-    }, (options.keepAliveMinutes ?? 15) * 60000)
-    idleTimer?.unref?.()
-  }
-  async function version(port, signal) {
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return false
-    try {
-      const response = await fetchWithTimeout(`http://127.0.0.1:${port}/json/version`, { signal, redirect: "error" }, { fetch: deps.fetch, timeoutMs: 800 })
-      return /GrokBot\//.test((await response.json())["User-Agent"] ?? "")
-    } catch { signal?.throwIfAborted(); return false }
-  }
-  async function attach(port, signal) {
-    const response = await fetchWithTimeout(`http://127.0.0.1:${port}/json/list`, { signal, redirect: "error" }, { fetch: deps.fetch, timeoutMs: 2000 })
-    const list = await response.json()
-    const page = Array.isArray(list) && list.find(target => target.type === "page" && /^file:\/\//.test(target.url ?? "") && /\/dist\/renderer\//.test(target.url ?? "") && /app\.asar/.test(target.url ?? ""))
-    if (!page) throw failure("debug")
-    const endpoint = new URL(page.webSocketDebuggerUrl)
-    if (endpoint.hostname !== "127.0.0.1" || Number(endpoint.port) !== port) throw failure("debug")
-    return deps.connect(endpoint.href, { timers, WebSocket: deps.WebSocket }, signal)
-  }
-  async function runningProcesses() {
-    try { return await deps.processes() } catch { throw failure("debug") }
-  }
-  async function reattach(previous, signal) {
-    for (const port of [...new Set([...(options.reattachPorts ?? []), ...previous.map(row => row.port)])]) {
-      if (await version(port, signal)) return { port, client: await attach(port, signal) }
-    }
-  }
-  async function checkDrivable() {
-    await findGrokBot(deps)
-    if (connection?.open) return
-    const previous = await runningProcesses()
-    const attached = await reattach(previous)
-    if (attached) attached.client.close()
-  }
-  async function start(signal) {
-    const executable = await findGrokBot(deps)
-    const previous = await runningProcesses()
-    const attached = await reattach(previous, signal)
-    if (attached) {
-      const { port, client } = attached
-      const row = previous.find(row => row.port === port && row.created && row.executable?.toLowerCase() === executable.toLowerCase() && /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.managedTag ?? ""))
-      if (row && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) owned = { exitCode: null, kill: () => {
-        void deps.processes().then(rows => {
-          if (rows.some(current => current.pid === row.pid && current.created === row.created && current.executable === row.executable && current.managedTag === row.managedTag) && !deps.parentAlive(Number(row.managedTag.split(":")[0]))) return deps.stopManaged(row)
-        }).catch(() => {})
-      } }
-      return client
-    }
-    const port = await deps.freePort()
-    const managedTag = `${process.pid}:${randomUUID()}`
-    const userDataDir = win32.join(deps.env.LOCALAPPDATA || tmpdir(), "Magpie", "grok-bot-managed-profile")
-    const child = deps.spawn(executable, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", `--magpie-grok-managed=${managedTag}`, `--user-data-dir=${userDataDir}`], { stdio: "ignore", windowsHide: false })
-    child.once?.("error", () => launchErrors.add(child))
-    owned = { exitCode: null, kill: () => {
-      void deps.processes().then(rows => {
-        const row = rows.find(current => current.managedTag === managedTag && current.executable?.toLowerCase() === executable.toLowerCase() && current.created)
-        if (row) return deps.stopManaged(row)
-      }).catch(() => {})
-    } }
-    const started = timers.now()
-    while (timers.now() - started < (options.launchTimeoutMs ?? 10000)) {
-      signal?.throwIfAborted()
-      if (await version(port, signal)) return attach(port, signal)
-      if (launchErrors.has(child)) break
-      await sleep(200, signal, timers)
-    }
-    if (previous.length && child.exitCode != null) throw failure("running")
-    throw failure("debug")
-  }
-  async function ensure(signal) {
-    touch()
-    if (connection?.open) return connection
-    if (!connecting) connecting = start(signal).then(value => connection = value).catch(error => { signal?.throwIfAborted(); if (error.status) throw error; throw failure("debug") }).finally(() => { connecting = undefined; idle() })
-    return connecting
   }
   async function signedIn(client, signal) {
     try { if (!await client.evaluate(probe, signal)) throw failure("signedOut") }
@@ -292,7 +144,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
   }
   async function poll(credential, run, signal) {
     touch()
-    let client = connection
+    let client = app.connection
     try {
       let entries
       try {
@@ -301,7 +153,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
         entries = await tail(client, run.bot.id, signal)
       } catch (error) {
         if (error.status === 401 || error.bridge || error.message === CDP_ERRORS.changed || signal?.aborted) throw error
-        connection?.close(); connection = undefined
+        app.disconnect()
         try { client = await ensure(signal); await signedIn(client, signal); entries = await tail(client, run.bot.id, signal) }
         catch (recovery) { if (recovery.status === 401 || recovery.message === CDP_ERRORS.changed || signal?.aborted) throw recovery; throw failure("crashed") }
       }
@@ -344,6 +196,6 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     create, poll,
     cancel(credential, run) { if (active.get(run.bot.id) === run) release(run); idle() },
     followUp(credential, run, texts, signal) { return create(credential, { model: run.bot.id, prompt: texts.join("\n"), turnIndex: run.turnIndex + 1, sessionKey: run.sessionKey }, signal) },
-    dispose() { touch(); connection?.close(); connection = undefined; if (owned) { if (owned.exitCode == null && !launchErrors.has(owned)) owned.kill(); owned = undefined } },
+    dispose: app.dispose,
   }
 }
