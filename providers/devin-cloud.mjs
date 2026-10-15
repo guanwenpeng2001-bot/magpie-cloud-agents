@@ -42,10 +42,10 @@ export function makeDevinDriver(options = {}) {
     if (signal) rejectedRuns.set(signal, run.url || run.ref)
     throw new FollowupRejected(message)
   }
-  async function call(credential, path, signal, body) {
+  async function call(credential, path, signal, body, method = body === undefined ? "GET" : "POST") {
     try {
       const response = await fetchWithTimeout(base + "/v1/sessions" + path, {
-        method: body === undefined ? "GET" : "POST",
+        method,
         headers: { Authorization: `Bearer ${credential.key}`, "Content-Type": "application/json" },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal,
       })
@@ -72,14 +72,17 @@ export function makeDevinDriver(options = {}) {
   }
   return {
     id: ID, name: NAME, staticModels: MODELS,
-    async create(credential, { prompt }, signal) {
-      const body = { prompt, title: "magpie: " + prompt.slice(0, 60), tags: ["magpie"] }
+    async create(credential, { prompt, title = "magpie session" }, signal) {
+      const body = { prompt, title: title.slice(0, 60), tags: ["magpie"] }
       if (options.devinCloud?.maxAcuLimit != null && options.devinCloud.maxAcuLimit !== 0) body.max_acu_limit = options.devinCloud.maxAcuLimit
       const session = await call(credential, "", signal, body)
       if (typeof session?.session_id !== "string" || !session.session_id) throw chatError(502, "Devin create returned no session id")
       const previous = signal && rejectedRuns.get(signal)
       if (signal) rejectedRuns.delete(signal)
       return { ref: session.session_id, url: session.url, ...(previous ? { announcement: `Devin follow-up moved from ${previous} to ${session.url || session.session_id}` } : {}) }
+    },
+    async cancel(credential, run) {
+      await call(credential, "/" + encodeURIComponent(run.ref), AbortSignal.timeout(5000), undefined, "DELETE")
     },
     async followUp(credential, run, texts, signal) {
       let response
@@ -155,7 +158,7 @@ export function makeDevinCloud(options = {}) {
     async "chat.headers"(input, output) {
       if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
       const session = sessionOf(input)
-      if (session) output.headers[SESSION_HEADER] = session
+      if (session) (output.headers ??= {})[SESSION_HEADER] = session
     },
   }
 }
