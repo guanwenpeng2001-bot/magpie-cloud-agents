@@ -57,7 +57,13 @@ A session-affinity header `x-magpie-cloud-agents-session` ties follow-up turns t
 
 ## Options
 
-Entry functions pass the package's options through to each provider factory (`magpie plugin options <spec> '<json>'`). No provider validates unknown option keys, so a mistyped `dotsApp` key is silently ignored:
+Set package options with `magpie plugin options <spec> '<json>'`. Every entry function validates the shared options before calling its provider factory. **One invalid known configuration value rejects the entire spec: all six providers fail to load**, even when the invalid option belongs to just one provider. Errors identify the option path. Unknown option keys are still ignored, so a typo can silently leave the default in effect.
+
+Validation follows each provider's unset/default semantics: for example, `codexCloud.env` accepts `null`, an empty string or whitespace to allow discovery; `apiBase.<provider>` accepts `null` as unset but rejects an empty string; `dots.publicUrl` and `dots.tunnelCommand` accept `null` or `""` as unset, but reject whitespace-only strings. Empty strings are not a universal way to clear numeric or URL options.
+
+**Startup diagnostics (opt-in).** Set `MAGPIE_CLOUD_AGENTS_DEBUG=1` in the plugin host's environment (`true`, `yes` and `on` also work, case-insensitively). These diagnostics are silent by default; when enabled they write only provider ids and fixed `startup` / `startup failed` events to stderr. They omit configuration values, credentials, prompts and exception text rather than attempting to redact arbitrary error strings; this guarantee applies to these startup diagnostics, not all vendor output.
+
+Available options:
 
 | Option | Default | Effect |
 |---|---|---|
@@ -92,11 +98,11 @@ The `codex` CLI labels this feature experimental, and so does this package. **Bi
 
 **Sign in.** `magpie plugin login codex-cloud` reuses the CLI's own login and discovers the environment id from local Codex state when none is explicitly configured. The environment-id field is optional and is omitted when a configured value or local discovery is available; if discovery is unavailable, supply the id from Codex web (Environments) or set `codexCloud.env`. Explicit account/input `env` takes precedence over `codexCloud.env`, then local discovery. Only the resolved id is stored; Codex state is never changed. The callback runs `codex login status` to prove the CLI is signed in; a logged-out CLI fails with an instruction to run `codex login`.
 
-**Per turn.** The driver spawns `codex cloud exec --env <env> --attempts <n> -- <prompt>` (CLI calls time out after 30 seconds; the diff fetch after 3, and a timed-out diff leaves the turn running to retry the same task), parses the task reference from the output, and falls back to the environment's newest task when parsing fails — in that case the reply carries the warning `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.` Polling runs `codex cloud status`; a successful state fetches `codex cloud diff` (truncated at 100 KiB). An identical resend reuses the same task; a resend after a failed or expired verdict starts a new one.
+**Per turn.** The driver spawns `codex cloud exec --env <env> --attempts <n> -- -` with the folded prompt piped to stdin, not placed in argv (CLI calls time out after 30 seconds; the diff fetch after 3, and a timed-out diff leaves the turn running to retry the same task), parses the task reference from the output, and falls back to the environment's newest task when parsing fails — in that case the reply carries the warning `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.` Polling runs `codex cloud status`; a successful state fetches `codex cloud diff` (truncated at 100 KiB). An identical resend reuses the same task; a resend after a failed or expired verdict starts a new one.
 
 **Status interpretation is heuristic and experimental.** It was tested only on constructed examples. Continuations with no marker or with a marker outside the recognized set — `work continues on the parser`, `the worker proceeds to packaging`, `the agent keeps indexing the tree`, `the migration is underway` — can be mistaken for completion and return an unfinished diff, so verify task completion independently before using a returned diff. Conversely, completed summaries can remain attached and time out without a diff: subject gerunds (`testing is complete`, `indexing is finished`, `testing passed`), predicate adjectives (`the file is missing`, `one test is failing`), sequencing, modal and intent summaries (`now the tests pass`, `the tests will pass on retry`, `nothing left to be verified`). Bare `Error` diagnostics also remain running.
 
-**Known failure behaviour.** A missing CLI returns the install instruction; a logged-out CLI returns the sign-in instruction (both 401). A non-zero CLI exit maps to 502 carrying the CLI's own output (429 on rate-limit wording). On a machine whose `codex` resolves to an npm `.cmd` shim, every request fails on the folded prompt's newline — use a real binary.
+**Known failure behaviour.** A missing CLI returns the install instruction; a logged-out CLI returns the sign-in instruction (both 401). Recognized environment-configuration refusals return 400; recognized running or failed task statuses are handled as task states even on non-zero exit. Other non-zero exits map to 502 carrying the CLI's output, or 429 when retained output contains rate-limit wording. CLI 429 errors carry no parsed Retry-After, so they surface immediately without automatic retry; resending after a polling 429 can create a new billable task. The shared polling loop retries a 429 only when it has a parseable Retry-After, which HTTP-based providers can supply. On Windows, PATH resolution uses `codex.exe` when found in a directory; for a `codex.cmd` with the standard adjacent `node_modules/@openai/codex/bin/codex.js`, it invokes that JavaScript entry with the current runtime and `shell: false`, bypassing the shim. Custom shim layouts without that entry are not guaranteed to work.
 
 ### codex-agents — Codex Agents API
 
@@ -124,7 +130,7 @@ The `codex` CLI labels this feature experimental, and so does this package. **Bi
 
 **Sign in.** `magpie plugin login devin-cloud` offers two methods: `devin` accepts a Devin platform API key (`apk_…`, including `apk_user_…` from app.devin.ai → Settings → API) and uses `https://api.devin.ai`; `codeium` accepts a Codeium / Cognition credential (`cog_…`) and uses Codeium Connect chat. The credential prefix must match the selected method, and the saved credential selects the route per turn. Legacy `devin-session-token$…` tokens are not supported. The ACU billing and session behaviour described here apply to the `devin` method.
 
-**Behaviour.** Sessions are created with the title `magpie: ` plus the first 60 characters of the prompt and tagged `magpie`. A finished session returns the last non-user message, or the structured output, or an explicit no-reply sentence; a blocked session appends `Devin is waiting for input — continue at <url>`, and a pull request link is appended when the session produced one. A follow-up to a suspended session is rejected and re-created fresh, with a `Devin follow-up moved from <old> to <new>` announcement. Expired sessions map to the expired state; 401/403 mark the sign-in expired.
+**Behaviour.** Chat-created sessions use the fixed title `magpie session` and the tag `magpie`; the title is not derived from the prompt. The driver accepts an explicit `title` truncated to 60 characters, but the chat adapter does not supply one. A finished session returns the last non-user message, or the structured output, or an explicit no-reply sentence; a blocked session appends `Devin is waiting for input — continue at <url>`, and a pull request link is appended when the session produced one. A follow-up to a suspended session is rejected and re-created fresh, with a `Devin follow-up moved from <old> to <new>` announcement. Expired sessions map to the expired state; 401/403 mark the sign-in expired.
 
 ### dots — ChatGPT Dot (the heaviest provider)
 
@@ -134,7 +140,7 @@ Dots offers two sign-in methods through `magpie plugin login dots`; app-drive is
 
 **Method 2: bundled tunnel.** The remaining setup, limits and troubleshooting below apply to this method. It exposes a local MCP listener to the public internet through a bundled Cloudflare quick tunnel: the Dot, running on OpenAI's network, calls this PC to pick up tasks. No OpenAI credential is involved — the plugin never touches your ChatGPT login.
 
-**What runs on this machine.** A loopback-only MCP server (bound to `127.0.0.1`, never `0.0.0.0`) speaks JSON-RPC over `POST /mcp` and publishes exactly four tools: `list_tasks`, `claim_task`, `complete_task`, `release_task`. It mints a 192-bit bearer token shown to you exactly once, answers 401 to unauthenticated calls and 404 to every non-MCP route, caps bodies at 256 KiB, rate-limits per IP, and times requests out after 30 seconds. Outbound webhook delivery verifies the callback URL (HTTPS, public address, no redirects) before a subscription is stored. The bundled `cloudflared` quick tunnel (version-pinned 2026.10.0, SHA-256 verified against Cloudflare's published digest) forwards a public `*.trycloudflare.com` URL to that loopback port; on first sign-in the binary is downloaded from Cloudflare's GitHub releases into the plugin state directory (`~/.config/magpie/cloud-agents/dots/`, or `XDG_CONFIG_HOME`).
+**What runs on this machine.** A loopback-only MCP server (bound to `127.0.0.1`, never `0.0.0.0`) speaks JSON-RPC over `POST /mcp` and publishes exactly four tools: `list_tasks`, `claim_task`, `complete_task`, `release_task`. It mints a 192-bit bearer token shown to you exactly once, answers 401 to unauthenticated calls and 404 to every non-MCP route, caps bodies at 256 KiB, rate-limits only authenticated requests by token plus socket peer IP (120 per minute; forwarded IP headers are ignored, so tunnel traffic can share the loopback peer bucket), and times requests out after 30 seconds. Outbound webhook delivery verifies the callback URL (HTTPS, public address, no redirects) before a subscription is stored. The bundled `cloudflared` quick tunnel (version-pinned 2026.10.0, SHA-256 verified against Cloudflare's published digest) forwards a public `*.trycloudflare.com` URL to that loopback port; on first sign-in the binary is downloaded from Cloudflare's GitHub releases into the plugin state directory (`~/.config/magpie/cloud-agents/dots/`, or `XDG_CONFIG_HOME`).
 
 **Security surface.** While Dots sign-in is active, this PC runs a public URL (`*.trycloudflare.com`) that forwards to a single local endpoint. The endpoint answers only the Dot's task-queue protocol and only with the secret token the setup shows you. Remove the sign-in (`magpie plugin logout dots`) to tear it down. Cloudflare's quick-tunnel terms apply to that URL.
 
@@ -183,7 +189,7 @@ When no debug-enabled window is available, Magpie opens a tagged managed window 
 
 **The send path is designed and identified but deliberately not exercised.** The automation surfaces the send route uses were recovered from the app bundle, but no authorized test send was ever performed against a real account. This README states exactly that rather than implying a submitted turn is known to dispatch; the first real send is the test.
 
-**Mechanism 2: direct Connect protocol.** Reads the installed app's sealed sign-in from its profile and speaks the app's own protocol to its backend, with redirects refused and the host pinned. It is the more fragile of the two: the protocol tables were recovered from the app bundle, not documented, and can break on an app update. The credential is unwrapped in memory only, under your explicit authorization, and never written to disk — keys and tokens are never saved or logged; buffers are cleared after use. Under that authorization, one read-only bot listing succeeded against the live service; send, cancel and transcript-entry response shapes remain unverified, and the first real send is their test. The same completion caveat applies: a paused bot's partial answer may be delivered as final when the transcript stops growing.
+**Mechanism 2: direct Connect protocol.** **Account risk: this mode (`grok-bot-direct` / token path) uses the app's web-session credential to access undocumented interfaces. It may violate the vendor's Terms of Service and lead to account suspension or a ban. Prefer the default CDP app-drive mode (`grok-bot`).** Reads the installed app's sealed sign-in from its profile and speaks the app's own protocol to its backend, with redirects refused and the host pinned. It is the more fragile of the two: the protocol tables were recovered from the app bundle, not documented, and can break on an app update. Under your explicit authorization, the plugin unwraps the credential in memory and does not persist the decrypted token to disk. It clears the mutable unwrapped key buffers after decryption, but caches the token buffer for reuse until refresh or disposal, when that buffer is zeroed. Authorization headers also create JavaScript string copies that cannot be reliably zeroed; this is not a guarantee that all secret copies are erased from memory. Shared session maps remove references on expiry or eviction rather than overwriting their stored values. Under that authorization, one read-only bot listing succeeded against the live service; send, cancel and transcript-entry response shapes remain unverified, and the first real send is their test. The same completion caveat applies: a paused bot's partial answer may be delivered as final when the transcript stops growing.
 
 ## Verify without credentials
 
@@ -196,7 +202,7 @@ bun test
 
 `scripts/check.mjs` loads `index.mjs` exactly as the host does and checks the shape of every provider: exports, auth hooks, sign-in methods, config output, static models and the `tool_call: false` declaration — all six providers. `--stubs` additionally installs sentinels over `child_process`, `fetch` and `WebSocket`, drives every provider's loader with incomplete and synthetic credentials, and walks each OAuth authorize/callback, asserting that no provider reaches outside the process and that `grok-bot` fails closed when the app is absent.
 
-Shared-runtime tests are included: `bun test` runs co-located `*.test.mjs` suites across `lib/` and `providers/` (11 files) covering the request-emulation core, transcript folding, session maps, and each provider's driver, queue, tunnel, CDP, direct and token paths.
+Shared-runtime tests are included: `bun test` discovers co-located `*.test.mjs` suites across `lib/`, `providers/` and `scripts/`, covering package checks and fixtures as well as the request-emulation core, transcript folding, session maps, and each provider's driver, queue, tunnel, CDP, direct and token paths.
 
 `scripts/fake-cloud.mjs` serves loopback-only synthetic happy paths for four vendors (OpenAI, Cursor, Devin, Codex CLI fixtures); `--self-test` asserts those four paths.
 
@@ -239,7 +245,7 @@ Everything below is unverified, stated plainly. None of it was tested, and nothi
 | CDP bot-list bridge return shapes and signed-in probe fields | Synthetic shapes from bundle reading | First live attach |
 | App-update drift (bridges/UI) | Inherent | Time; failures say the provider needs an update |
 | Real vendor compatibility for every provider | No authenticated vendor call completed in this run | First real use of each provider |
-| The `.cmd`-shim case | Not reproducible on this host — its `codex` is a real binary, not an npm shim | A machine whose `codex` is an npm shim, failing every request on the folded prompt's newline |
+| Custom Windows shim layouts without the standard npm JavaScript entry | The resolver supports `codex.exe` and the standard npm layout; other wrappers are not covered | Verify the installed wrapper's resolution and stdin handling on that machine |
 
 ## 中文说明
 
@@ -300,7 +306,13 @@ magpie plugin list
 
 ### 选项
 
-入口函数把包选项透传给各 provider 工厂（`magpie plugin options <spec> '<json>'`）。所有 provider 都不校验未知选项键，因此拼错的 `dotsApp` 键会被静默忽略：
+通过 `magpie plugin options <spec> '<json>'` 设置包选项。每个入口函数都会先校验共享选项，再调用 provider 工厂。**一个已知配置项的值无效，就会拒绝整个 spec，导致全部六个 provider 加载失败**，即使该选项只属于其中一个 provider。错误会指出选项路径。未知选项键仍被忽略，拼写错误可能让默认值继续生效。
+
+入口校验遵循各 provider 的 unset/默认值语义：例如 `codexCloud.env` 接受 `null`、空串或纯空白字符串以允许发现环境；`apiBase.<provider>` 接受 `null` 作为未设置，但拒绝空串；`dots.publicUrl` 与 `dots.tunnelCommand` 接受 `null` 或 `""` 作为未设置，但拒绝纯空白字符串。不能把空串当作清空所有数值或 URL 选项的通用方式。
+
+**启动诊断（显式启用）。** 在插件宿主环境中设置 `MAGPIE_CLOUD_AGENTS_DEBUG=1`（也接受 `true`、`yes`、`on`，不区分大小写）。这些诊断默认静默；启用后仅向 stderr 写入 provider id 和固定的 `startup` / `startup failed` 事件。不输出配置值、凭据、提示词或异常正文，而非尝试遮蔽任意错误字符串；此保证仅适用于这些启动诊断，不覆盖所有厂商输出。
+
+可用选项：
 
 | 选项 | 默认 | 作用 |
 |---|---|---|
@@ -335,11 +347,11 @@ CDP 调试端口没有身份认证：端口开放期间，本机任何进程都�
 
 **登录。** `magpie plugin login codex-cloud` 复用 CLI 自身的登录；未显式配置 environment id 时，从本地 Codex 状态中发现。environment id 输入框是可选的，已有配置值或能从本地发现时不显示；无法发现时，可填写 Codex 网页（Environments）中的 id，或设置 `codexCloud.env`。显式的账号/输入 `env` 优先于 `codexCloud.env`，最后才是本地发现。只保存解析出的 id，绝不修改 Codex 状态。回调会运行 `codex login status` 证明 CLI 已登录；CLI 未登录时失败并提示运行 `codex login`。
 
-**每轮行为。** 驱动器启动 `codex cloud exec --env <env> --attempts <n> -- <prompt>`（CLI 调用 30 秒超时；diff 拉取 3 秒，超时的 diff 会让该轮保持运行以便重试同一任务），从输出解析任务引用；解析失败时回退为该环境的最新任务——此时回复会带上警告 `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.`（任务引用由环境最新任务推断；归属未验证，可能是其他会话的工作）。轮询运行 `codex cloud status`；成功状态会拉取 `codex cloud diff`（100 KiB 处截断）。完全相同的重发会复用同一任务；失败或过期判定后的重发会启动新任务。
+**每轮行为。** 驱动器启动 `codex cloud exec --env <env> --attempts <n> -- -`，将折叠提示词通过管道写入 stdin，而不放入 argv（CLI 调用 30 秒超时；diff 拉取 3 秒，超时的 diff 会让该轮保持运行以便重试同一任务），从输出解析任务引用；解析失败时回退为该环境的最新任务——此时回复会带上警告 `Task reference inferred from the environment's newest task; ownership is unverified and this may be another session's work.`（任务引用由环境最新任务推断；归属未验证，可能是其他会话的工作）。轮询运行 `codex cloud status`；成功状态会拉取 `codex cloud diff`（100 KiB 处截断）。完全相同的重发会复用同一任务；失败或过期判定后的重发会启动新任务。
 
 **状态解读是启发式且实验性的。** 仅在构造样例上测试过。没有标记或标记不在识别集合内的进行时表述——`work continues on the parser`、`the worker proceeds to packaging`、`the agent keeps indexing the tree`、`the migration is underway`——可能被误判为已完成并返回未完成的 diff，因此使用返回的 diff 前请独立确认任务是否完成。反过来，表述已完成的总结也可能一直挂在运行态并超时且拿不到 diff：主语动名词（`testing is complete`、`indexing is finished`、`testing passed`）、表语形容词（`the file is missing`、`one test is failing`），以及顺序、情态与意图类总结（`now the tests pass`、`the tests will pass on retry`、`nothing left to be verified`）。裸 `Error` 诊断同样会保持在运行态。
 
-**已知失败行为。** 找不到 CLI 返回安装指引；CLI 未登录返回登录指引（均为 401）。CLI 非零退出映射为 502 并携带 CLI 自身输出（命中限流措辞时为 429）。在 `codex` 实际是 npm `.cmd` shim 的机器上，每次请求都会因折叠提示词中的换行而失败——请使用真正的二进制。
+**已知失败行为。** 找不到 CLI 返回安装指引；CLI 未登录返回登录指引（均为 401）。识别到环境配置拒绝时返回 400；识别到运行中或失败的任务状态时，即使非零退出也按任务状态处理。其他非零退出映射为 502 并携带 CLI 输出；保留的输出命中限流措辞时为 429。CLI 的 429 错误不带解析后的 Retry-After，因此立即返回、不自动重试；轮询遇到 429 后重发可能创建新的计费任务。共享轮询仅在 429 带有可解析的 Retry-After 时自动重试，HTTP provider 可以提供该值。Windows 按 PATH 逐目录查找，目录中有 `codex.exe` 时直接使用；若发现 `codex.cmd` 及标准相邻路径 `node_modules/@openai/codex/bin/codex.js`，则用当前运行时直接执行该 JavaScript 入口，设置 `shell: false`，绕过 shim。缺少该入口的自定义 shim 布局不保证可用。
 
 #### codex-agents —— Codex Agents API
 
@@ -367,7 +379,7 @@ CDP 调试端口没有身份认证：端口开放期间，本机任何进程都�
 
 **登录。** `magpie plugin login devin-cloud` 提供两种方式：`devin` 接受 Devin 平台 API key（`apk_…`，包括来自 app.devin.ai → Settings → API 的 `apk_user_…`），访问 `https://api.devin.ai`；`codeium` 接受 Codeium / Cognition 凭据（`cog_…`），访问 Codeium Connect chat。凭据前缀必须匹配所选方式，每轮按已保存的凭据选择路由。不支持旧的 `devin-session-token$…` token。本节的 ACU 计费与会话行为说明适用于 `devin` 方式。
 
-**行为。** 会话以 `magpie: ` 加提示词前 60 字符为标题创建，并打上 `magpie` 标签。完成的会话返回最后一条非用户消息，或结构化输出，或明确的未答复说明；blocked 会话追加 `Devin is waiting for input — continue at <url>`；会话产出 PR 时附上链接。对已挂起会话的追加消息会被拒绝并重新创建新会话，并广播 `Devin follow-up moved from <old> to <new>`。过期会话映射为 expired 状态；401/403 将登录标记为过期。
+**行为。** 聊天创建的会话使用固定标题 `magpie session` 和 `magpie` 标签，标题不从提示词派生。驱动器支持显式 `title` 并截断到 60 字符，但聊天适配器不传该字段。完成的会话返回最后一条非用户消息，或结构化输出，或明确的未答复说明；blocked 会话追加 `Devin is waiting for input — continue at <url>`；会话产出 PR 时附上链接。对已挂起会话的追加消息会被拒绝并重新创建新会话，并广播 `Devin follow-up moved from <old> to <new>`。过期会话映射为 expired 状态；401/403 将登录标记为过期。
 
 #### dots —— ChatGPT Dot（最重的 provider）
 
@@ -377,7 +389,7 @@ Dots 通过 `magpie plugin login dots` 提供两种登录方式；app-drive 排�
 
 **方式二：内置隧道。** 下文其余设置、限制与故障排查适用于此方式。它通过内置的 Cloudflare 快速隧道把一个本地 MCP 监听端暴露到公网：运行在 OpenAI 网络上的 Dot 会回调这台电脑来领取任务。不涉及任何 OpenAI 凭据——插件绝不触碰你的 ChatGPT 登录。
 
-**本机上运行什么。** 一个仅绑定 `127.0.0.1`（绝不绑定 `0.0.0.0`）的环回 MCP 服务器，经 `POST /mcp` 说 JSON-RPC，只发布四个工具：`list_tasks`、`claim_task`、`complete_task`、`release_task`。它铸造一个仅向你展示一次的 192 位 bearer token，对未认证调用返回 401、对一切非 MCP 路由返回 404，请求体上限 256 KiB，按 IP 限流，请求 30 秒超时。出站 webhook 在订阅入库前会校验回调地址（HTTPS、公网地址、不跟随重定向）。内置的 `cloudflared` 快速隧道（版本锁定 2026.10.0，SHA-256 与 Cloudflare 公布摘要一致）把公网 `*.trycloudflare.com` URL 转发到该环回端口；首次登录时会从 Cloudflare 的 GitHub releases 下载二进制，存入插件状态目录（`~/.config/magpie/cloud-agents/dots/`，或 `XDG_CONFIG_HOME`）。
+**本机上运行什么。** 一个仅绑定 `127.0.0.1`（绝不绑定 `0.0.0.0`）的环回 MCP 服务器，经 `POST /mcp` 说 JSON-RPC，只发布四个工具：`list_tasks`、`claim_task`、`complete_task`、`release_task`。它铸造一个仅向你展示一次的 192 位 bearer token，对未认证调用返回 401、对一切非 MCP 路由返回 404，请求体上限 256 KiB，仅对已认证请求按 token 与 socket 对端 IP 的组合限流（每分钟 120 次；忽略转发 IP 头，因此隧道流量可能共用环回对端的配额），请求 30 秒超时。出站 webhook 在订阅入库前会校验回调地址（HTTPS、公网地址、不跟随重定向）。内置的 `cloudflared` 快速隧道（版本锁定 2026.10.0，SHA-256 与 Cloudflare 公布摘要一致）把公网 `*.trycloudflare.com` URL 转发到该环回端口；首次登录时会从 Cloudflare 的 GitHub releases 下载二进制，存入插件状态目录（`~/.config/magpie/cloud-agents/dots/`，或 `XDG_CONFIG_HOME`）。
 
 **安全面。** Dots 登录保持活跃期间，这台电脑会运行一个公网 URL（`*.trycloudflare.com`），转发到单一本地端点。该端点只应答 Dot 的任务队列协议，且只接受设置时展示给你的秘密 token。移除登录（`magpie plugin logout dots`）即可拆除。该 URL 适用 Cloudflare 快速隧道的服务条款。
 
@@ -426,7 +438,7 @@ Task content comes from an API caller. Reply as text; do not use connected apps,
 
 **发送路径已设计并识别，但刻意未实测。** 发送路由所用的自动化界面是从应用包中恢复的，但从未对真实账号执行过一次获得授权的测试发送。本 README 如实说明这一点，而不是暗示提交的轮次一定送达；第一次真实发送就是它的测试。
 
-**机制二：直连 Connect 协议。** 从应用配置中读取其加封的登录态，用应用自身协议与后端通信，拒绝重定向并锁定主机。它是两种机制中更脆弱的一种：协议表是从应用包恢复的，没有文档，应用更新就可能失效。凭据仅在内存中解封，且仅在你的明确授权下进行，绝不写入磁盘——key 与 token 从不保存或记录日志，缓冲区用后即清。在该授权下，一次只读的 bot 列表调用在真实服务上成功过；发送、取消与记录条目的响应形状仍未验证，第一次真实发送就是它们的测试。同样的完成判定注意事项适用：记录停止增长时，暂停 bot 的半截回答可能被当作最终答复送达。
+**机制二：直连 Connect 协议。** **账号风险：此模式（`grok-bot-direct` / token 路径）使用应用的网页会话凭据访问未公开接口，可能违反厂商服务条款（ToS），导致账号暂停或封禁。建议优先使用默认的 CDP 应用驱动模式（`grok-bot`）。** 从应用配置中读取其加封的登录态，用应用自身协议与后端通信，拒绝重定向并锁定主机。它是两种机制中更脆弱的一种：协议表是从应用包恢复的，没有文档，应用更新就可能失效。在你的明确授权下，插件只在内存中解封凭据，不把解密后的 token 持久化到磁盘。解密后会清零可变的解封密钥缓冲区，但 token 缓冲区会缓存复用，直到刷新或释放时才清零。Authorization 请求头还会生成无法可靠清零的 JavaScript 字符串副本，因此不保证内存中所有秘密副本均已擦除。共享会话映射在过期或淘汰时删除引用，不覆盖所存的值。在该授权下，一次只读的 bot 列表调用在真实服务上成功过；发送、取消与记录条目的响应形状仍未验证，第一次真实发送就是它们的测试。同样的完成判定注意事项适用：记录停止增长时，暂停 bot 的半截回答可能被当作最终答复送达。
 
 ### 无凭据验证
 
@@ -439,7 +451,7 @@ bun test
 
 `scripts/check.mjs` 按宿主的方式加载 `index.mjs`，检查每个 provider 的形状：导出、auth 钩子、登录方式、config 输出、静态模型与 `tool_call: false` 声明——覆盖全部六个 provider。`--stubs` 额外在 `child_process`、`fetch` 与 `WebSocket` 上安装哨兵，用不完整与合成的凭据驱动每个 provider 的 loader，并遍历每个 OAuth authorize/callback，断言没有 provider 越出进程之外，且 `grok-bot` 在应用缺席时明确失败。
 
-本包含共享运行时测试：`bun test` 运行 `lib/` 与 `providers/` 下共置的 `*.test.mjs` 套件（11 个文件），覆盖请求仿真核心、记录折叠、会话映射，以及各 provider 的驱动器、队列、隧道、CDP、直连与 token 路径。
+本包含共享运行时测试：`bun test` 发现并运行 `lib/`、`providers/` 与 `scripts/` 下共置的 `*.test.mjs` 套件，覆盖包检查与测试夹具，以及请求仿真核心、记录折叠、会话映射，以及各 provider 的驱动器、队列、隧道、CDP、直连与 token 路径。
 
 `scripts/fake-cloud.mjs` 在仅环回的地址上为四家厂商（OpenAI、Cursor、Devin、Codex CLI 夹具）提供合成成功路径；`--self-test` 断言这四条路径。
 
@@ -482,7 +494,7 @@ MAGPIE=/path/to/magpie sh scripts/try.sh --metadata-only
 | CDP bot 列表桥返回形状与登录探测字段 | 来自包读取的合成形状 | 第一次真实 attach |
 | 应用更新导致的漂移（桥/UI） | 固有存在 | 时间；失败信息会说明 provider 需要更新 |
 | 每个 provider 的真实厂商兼容性 | 本次运行未完成任何已通过认证的厂商调用 | 每个 provider 的第一次真实使用 |
-| `.cmd` shim 情形 | 本机不可复现——其 `codex` 是真正的二进制，而非 npm shim | 一台 `codex` 实为 npm shim 的机器：每次请求都因折叠提示词的换行而失败 |
+| 缺少标准 npm JavaScript 入口的自定义 Windows shim 布局 | 解析器支持 `codex.exe` 与标准 npm 布局；不覆盖其他包装器 | 在对应机器上验证包装器解析与 stdin 处理 |
 
 ## License
 
