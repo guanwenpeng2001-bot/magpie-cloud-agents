@@ -82,6 +82,47 @@ test.skipIf(process.platform !== "win32")("npm cmd-only installations launch wit
   expect(JSON.parse(result.stdout)).toEqual({ args, input: prompt })
 })
 
+for (const [diffBytes, noiseBytes] of [[1024 * 1024 + 4096, 0], [600 * 1024, 600 * 1024], [2 * 1024 * 1024, 0], [100, 2 * 1024 * 1024]]) {
+  test(`large diff remains successful: ${diffBytes} stdout and ${noiseBytes} stderr`, async () => {
+    const diffFixture = join(directory, "large-diff.mjs")
+    writeFileSync(diffFixture, 'process.stdout.write("x".repeat(Number(process.argv[2]))); process.stderr.write("n".repeat(Number(process.argv[3])));')
+    let captured
+    const cli = async (args, options) => {
+      if (args[0] === "login") return reply("Logged in")
+      if (args[1] === "exec") return reply("task_abc123")
+      if (args[1] === "status") return reply("[READY] Complete")
+      captured = await _internal.spawnCodex([diffFixture, String(diffBytes), String(noiseBytes)], { ...options, env: { PATH: directory } })
+      return captured
+    }
+    const loader = await makeCodexCloud({}, { cli }).auth.loader(async () => auth)
+    const response = await loader.fetch(endpoint, request())
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    const text = body.choices[0].message.content
+    expect(text).toContain("x".repeat(Math.min(diffBytes, 102400)))
+    expect(text.includes("[diff truncated at 100 KiB]")).toBe(diffBytes > 102400)
+    expect(Buffer.byteLength(captured.stdout)).toBeLessThanOrEqual(102404)
+    expect(Buffer.byteLength(captured.stderr)).toBeLessThanOrEqual(65536)
+  })
+}
+
+test("bounded diff capture preserves UTF-8 prefixes and drains both streams", async () => {
+  const unicodeFixture = join(directory, "unicode-diff.mjs")
+  writeFileSync(unicodeFixture, 'process.stdout.write("界".repeat(500000)); process.stderr.write("界".repeat(500000));')
+  const result = await _internal.spawnCodex([unicodeFixture], { env: { PATH: directory }, retainDiff: true })
+  expect(result.code).toBe(0)
+  expect(result.stdout).toBe("界".repeat(Math.floor(102404 / 3)))
+  expect(result.stderr).toBe("界".repeat(Math.floor(65536 / 3)))
+})
+
+test("bounded diff capture still times out an endless producer", async () => {
+  const endlessFixture = join(directory, "endless-diff.mjs")
+  writeFileSync(endlessFixture, 'setInterval(() => { process.stdout.write("x".repeat(65536)); process.stderr.write("n".repeat(65536)); }, 1)')
+  const children = new Set()
+  await expect(_internal.spawnCodex([endlessFixture], { env: { PATH: directory }, retainDiff: true, children, timeoutMs: 200 })).rejects.toMatchObject({ code: "CODEX_CLI_TIMEOUT" })
+  expect(children.size).toBe(0)
+})
+
 test("taskOf extracts plain task ids and URLs", () => {
   expect(_internal.taskOf("Created task_01J9ZK3F2M8Q").ref).toBe("task_01J9ZK3F2M8Q")
   expect(_internal.taskOf("queued https://chatgpt.com/codex/tasks/task_abc123").ref).toBe("task_abc123")

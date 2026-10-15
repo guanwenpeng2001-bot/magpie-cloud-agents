@@ -54,7 +54,7 @@ function codexCommand(env) {
 }
 
 const MAX_OUTPUT_BYTES = 1024 * 1024
-function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, children, cwd = tmpdir(), stdin } = {}) {
+function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, children, cwd = tmpdir(), stdin, retainDiff = false } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return }
     let child, timer, stopped, settled = false
@@ -81,8 +81,19 @@ function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, childr
     child.stdout.setEncoding("utf8")
     child.stderr.setEncoding("utf8")
     let outputBytes = 0
+    const retained = { stdout: 0, stderr: 0 }
     const append = (stream, data) => {
       if (stopped) return
+      if (retainDiff) {
+        // Four extra bytes preserve evidence of truncation across a UTF-8 boundary.
+        const remaining = (stream === "stdout" ? 102404 : 65536) - retained[stream]
+        if (remaining === 0) return
+        const prefix = trimBytes(data, remaining)
+        retained[stream] += Math.min(Buffer.byteLength(data), remaining)
+        if (stream === "stdout") stdout += prefix
+        else stderr += prefix
+        return
+      }
       outputBytes += Buffer.byteLength(data)
       if (outputBytes > MAX_OUTPUT_BYTES) {
         stop(Object.assign(chatError(502, "the codex CLI output exceeded 1 MiB"), { code: "CODEX_CLI_OUTPUT_LIMIT" }))
@@ -265,7 +276,7 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
       const state = stateOf(result.stdout, run.prompt)
       if (state !== "succeeded") return { state, progress }
       let diff
-      try { diff = checkExit(await cli(["cloud", "diff", run.ref], { signal, children: run.children, timeoutMs: 3000 })).stdout }
+      try { diff = checkExit(await cli(["cloud", "diff", run.ref], { signal, children: run.children, timeoutMs: 3000, retainDiff: true })).stdout }
       catch (error) {
         if (!signal?.aborted && error.code === "CODEX_CLI_TIMEOUT") return { state: "running", progress: progress + "\nDiff retrieval timed out; waiting to retry the same task" }
         // The CLI exits 1 with this sentence for a completed task that produced no diff; that is a
