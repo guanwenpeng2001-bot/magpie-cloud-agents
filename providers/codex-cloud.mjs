@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { readFileSync, existsSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, errorResponse } from "../lib/errors.mjs"
-import { sessionOf, SESSION_HEADER } from "../lib/sessions.mjs"
+import { chatHeaders } from "../lib/chat-headers.mjs"
 
 const ID = "codex-cloud"
 const NAME = "Codex Cloud (codex CLI)"
@@ -38,7 +38,23 @@ const trimBytes = (text, maximum) => {
   return bytes.toString("utf8", 0, end)
 }
 
-function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, children, cwd = tmpdir() } = {}) {
+function codexCommand(env) {
+  if (process.platform !== "win32") return { command: "codex", prefix: [] }
+  const path = Object.entries(env).find(([key]) => key.toLowerCase() === "path")?.[1] ?? ""
+  for (const directory of path.split(";").filter(Boolean)) {
+    const root = directory.replace(/^"|"$/g, "")
+    const executable = join(root, "codex.exe")
+    if (existsSync(executable)) return { command: executable, prefix: [] }
+    if (existsSync(join(root, "codex.cmd"))) {
+      const entry = join(root, "node_modules", "@openai", "codex", "bin", "codex.js")
+      if (existsSync(entry)) return { command: process.execPath, prefix: [entry] }
+    }
+  }
+  return { command: "codex", prefix: [] }
+}
+
+const MAX_OUTPUT_BYTES = 1024 * 1024
+function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, children, cwd = tmpdir(), stdin } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return }
     let child, timer, stopped, settled = false
@@ -56,18 +72,36 @@ function spawnCodex(args, { signal, timeoutMs = 30000, env = process.env, childr
     const aborted = () => stop(signal.reason)
     // The CLI infers the cloud task's git branch from its own cwd; a git checkout here would
     // override the vendor's repo default branch, so children run in a neutral non-git directory.
-    try { child = spawn("codex", args, { env, cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }) }
+    try {
+      const { command, prefix } = codexCommand(env)
+      child = spawn(command, [...prefix, ...args], { env, cwd, shell: false, windowsHide: true, stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"] })
+    }
     catch (error) { finish(error.code === "ENOENT" ? chatError(401, MISSING, "kept") : error); return }
     children?.add(child)
     child.stdout.setEncoding("utf8")
     child.stderr.setEncoding("utf8")
-    child.stdout.on("data", data => { stdout += data })
-    child.stderr.on("data", data => { stderr += data })
+    let outputBytes = 0
+    const append = (stream, data) => {
+      if (stopped) return
+      outputBytes += Buffer.byteLength(data)
+      if (outputBytes > MAX_OUTPUT_BYTES) {
+        stop(Object.assign(chatError(502, "the codex CLI output exceeded 1 MiB"), { code: "CODEX_CLI_OUTPUT_LIMIT" }))
+        return
+      }
+      if (stream === "stdout") stdout += data
+      else stderr += data
+    }
+    child.stdout.on("data", data => append("stdout", data))
+    child.stderr.on("data", data => append("stderr", data))
     child.once("error", error => finish(error.code === "ENOENT" ? chatError(401, MISSING, "kept") : error))
     child.once("close", code => finish(stopped, { code, stdout, stderr }))
     signal?.addEventListener("abort", aborted, { once: true })
     timer = setTimeout(() => stop(Object.assign(chatError(502, "the codex CLI timed out"), { code: "CODEX_CLI_TIMEOUT" })), timeoutMs)
     if (signal?.aborted) aborted()
+    if (stdin !== undefined) {
+      child.stdin.on("error", error => { if (error.code !== "EPIPE" && !stopped) stop(error) })
+      child.stdin.end(stdin)
+    }
   })
 }
 
@@ -196,7 +230,7 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
       const attempts = options.codexCloud?.attempts ?? 1
       if (!Number.isInteger(attempts) || attempts < 1) throw chatError(400, "codexCloud.attempts must be a positive integer")
       const run = { children: new Set(), prompt }
-      const execute = () => cli(["cloud", "exec", "--env", env, "--attempts", String(attempts), "--", prompt], { signal, children: run.children })
+      const execute = () => cli(["cloud", "exec", "--env", env, "--attempts", String(attempts), "--", "-"], { signal, children: run.children, stdin: prompt })
       let created
       try { created = checkExit(await execute()) }
       catch (error) {
@@ -309,11 +343,7 @@ export function makeCodexCloud(options = {}, { cli = spawnCodex, now = Date.now,
       config.provider[ID] = { name: NAME, npm: "@ai-sdk/openai-compatible", api: BASE, ...was, models: { ...MODELS, ...(was.models ?? {}) } }
     },
     provider: { id: ID, async models(provider) { return provider.models } },
-    async "chat.headers"(input, output) {
-      if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
-      const session = sessionOf(input)
-      if (session) output.headers[SESSION_HEADER] = session
-    },
+    "chat.headers": chatHeaders(ID),
   }
 }
 

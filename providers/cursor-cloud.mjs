@@ -2,7 +2,8 @@ import { createHash } from "node:crypto"
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, FollowupRejected } from "../lib/errors.mjs"
 import { fetchWithTimeout } from "../lib/http.mjs"
-import { sessionOf, SESSION_HEADER, SessionMap } from "../lib/sessions.mjs"
+import { chatHeaders } from "../lib/chat-headers.mjs"
+import { SessionMap } from "../lib/sessions.mjs"
 
 const ID = "cursor-cloud"
 const NAME = "Cursor Cloud Agents"
@@ -246,11 +247,7 @@ export function makeCursorCloud(options = {}) {
       const was = config.provider[ID] ?? {}
       config.provider[ID] = { name: NAME, npm: CHAT, api: BASE, ...was, models: { ...MODELS, ...(was.models ?? {}) } }
     },
-    async "chat.headers"(input, output) {
-      if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
-      const session = sessionOf(input)
-      if (session) output.headers[SESSION_HEADER] = session
-    },
+    "chat.headers": chatHeaders(ID),
     provider: {
       id: ID,
       async models(provider, { auth } = {}) {
