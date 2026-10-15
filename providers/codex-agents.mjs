@@ -2,7 +2,8 @@ import { createHash } from "node:crypto"
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, FollowupRejected } from "../lib/errors.mjs"
 import { fetchWithTimeout } from "../lib/http.mjs"
-import { canonical, sessionOf, SESSION_HEADER } from "../lib/sessions.mjs"
+import { chatHeaders } from "../lib/chat-headers.mjs"
+import { canonical } from "../lib/sessions.mjs"
 
 const ID = "codex-agents"
 const NAME = "Codex Agents API"
@@ -203,11 +204,7 @@ export function makeCodexAgents(options = {}) {
         return live ? { ...provider.models, ...MODELS, ...live } : provider.models || MODELS
       },
     },
-    async "chat.headers"(input, output) {
-      if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
-      const session = sessionOf(input)
-      if (session) output.headers[SESSION_HEADER] = session
-    },
+    "chat.headers": chatHeaders(ID),
   }
 }
 

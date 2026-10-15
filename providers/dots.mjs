@@ -1,6 +1,6 @@
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, errorResponse } from "../lib/errors.mjs"
-import { SESSION_HEADER, sessionOf } from "../lib/sessions.mjs"
+import { chatHeaders } from "../lib/chat-headers.mjs"
 import { DotsQueue, mintToken } from "./dots-queue.mjs"
 import { startMcp } from "./dots-mcp.mjs"
 import { DotsTunnel, dotsFailure, DOTS_FAILURES } from "./dots-tunnel.mjs"
@@ -200,7 +200,7 @@ export function makeDotsDriver(input, options = {}, dependencies = {}) {
         } catch (error) { return { outcome: "failed", message: error.message } }
       },
     },
-    "chat.headers": async (input, output) => { const session = sessionOf(input); if (session) output.headers[SESSION_HEADER] = session },
+    "chat.headers": chatHeaders(ID),
     async config(config) {
       config.provider ??= {}
       const was = config.provider[ID] ?? {}

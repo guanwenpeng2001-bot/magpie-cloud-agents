@@ -1,6 +1,6 @@
 import { emulate } from "../lib/emulate.mjs"
 import { chatError, errorResponse } from "../lib/errors.mjs"
-import { sessionOf, SESSION_HEADER } from "../lib/sessions.mjs"
+import { chatHeaders } from "../lib/chat-headers.mjs"
 import { createGrokBotCdp } from "./grok-bot-cdp.mjs"
 
 const ID = "grok-bot"
@@ -51,11 +51,7 @@ export function makeGrokBotDriver(input, options = {}, dependencies = {}) {
         return { baseURL: BASE, fetch }
       },
     },
-    "chat.headers": async (request, output) => {
-      if (request?.model?.providerID !== ID && request?.provider?.info?.id !== ID) return
-      const session = sessionOf(request)
-      if (session) { output.headers ??= {}; output.headers[SESSION_HEADER] = session }
-    },
+    "chat.headers": chatHeaders(ID),
     async config(config) {
       config.provider ??= {}
       const previous = config.provider[ID] ?? {}

@@ -1,5 +1,5 @@
 import { expect, test, afterAll } from "bun:test"
-import { mkdtempSync, writeFileSync, copyFileSync, rmSync, readFileSync, existsSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, rmSync, readFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { makeCodexCloud, _internal } from "./codex-cloud.mjs"
@@ -53,6 +53,76 @@ test("a run-cap timeout kills the child process and rejects with a 502", async (
   catch (error) { killed = error }
   expect(killed?.status).toBe(502)
 })
+test("spawn pipes prompts larger than Windows argv limits without alteration", async () => {
+  const stdinFixture = join(directory, "stdin.mjs")
+  writeFileSync(stdinFixture, 'const chunks = []; for await (const chunk of process.stdin) chunks.push(chunk); process.stdout.write(Buffer.concat(chunks));')
+  const prompt = '中文 & %PATH% "quotes"\n'.repeat(5000)
+  const result = await _internal.spawnCodex([stdinFixture], { env: { PATH: directory }, stdin: prompt })
+  expect(result.stdout).toBe(prompt)
+})
+
+for (const stream of ["stdout", "stderr"]) test(`spawn rejects excessive ${stream} and removes the child`, async () => {
+  const floodFixture = join(directory, `flood-${stream}.mjs`)
+  writeFileSync(floodFixture, `process.${stream}.write('x'.repeat(2 * 1024 * 1024)); setInterval(() => {}, 1000)`)
+  const children = new Set()
+  await expect(_internal.spawnCodex([floodFixture], { env: { PATH: directory }, children, timeoutMs: 2000 })).rejects.toMatchObject({ code: "CODEX_CLI_OUTPUT_LIMIT", status: 502 })
+  expect(children.size).toBe(0)
+})
+
+test.skipIf(process.platform !== "win32")("npm cmd-only installations launch without a shell", async () => {
+  const npmDirectory = join(directory, "npm with spaces & chars")
+  const bin = join(npmDirectory, "node_modules", "@openai", "codex", "bin")
+  mkdirSync(bin, { recursive: true })
+  writeFileSync(join(npmDirectory, "codex.cmd"), "@exit /b 91")
+  writeFileSync(join(bin, "codex.js"), 'const chunks = []; for await (const chunk of process.stdin) chunks.push(chunk); console.log(JSON.stringify({ args: process.argv.slice(2), input: Buffer.concat(chunks).toString() }))')
+  const prompt = "中文 %PATH% & echo unexpected\n".repeat(3000)
+  const args = ["cloud", "exec", "--env", "env_fake", "--", "-"]
+  const result = await _internal.spawnCodex(args, { env: { Path: npmDirectory }, stdin: prompt })
+  expect(result.code).toBe(0)
+  expect(JSON.parse(result.stdout)).toEqual({ args, input: prompt })
+})
+
+for (const [diffBytes, noiseBytes] of [[1024 * 1024 + 4096, 0], [600 * 1024, 600 * 1024], [2 * 1024 * 1024, 0], [100, 2 * 1024 * 1024]]) {
+  test(`large diff remains successful: ${diffBytes} stdout and ${noiseBytes} stderr`, async () => {
+    const diffFixture = join(directory, "large-diff.mjs")
+    writeFileSync(diffFixture, 'process.stdout.write("x".repeat(Number(process.argv[2]))); process.stderr.write("n".repeat(Number(process.argv[3])));')
+    let captured
+    const cli = async (args, options) => {
+      if (args[0] === "login") return reply("Logged in")
+      if (args[1] === "exec") return reply("task_abc123")
+      if (args[1] === "status") return reply("[READY] Complete")
+      captured = await _internal.spawnCodex([diffFixture, String(diffBytes), String(noiseBytes)], { ...options, env: { PATH: directory } })
+      return captured
+    }
+    const loader = await makeCodexCloud({}, { cli }).auth.loader(async () => auth)
+    const response = await loader.fetch(endpoint, request())
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    const text = body.choices[0].message.content
+    expect(text).toContain("x".repeat(Math.min(diffBytes, 102400)))
+    expect(text.includes("[diff truncated at 100 KiB]")).toBe(diffBytes > 102400)
+    expect(Buffer.byteLength(captured.stdout)).toBeLessThanOrEqual(102404)
+    expect(Buffer.byteLength(captured.stderr)).toBeLessThanOrEqual(65536)
+  })
+}
+
+test("bounded diff capture preserves UTF-8 prefixes and drains both streams", async () => {
+  const unicodeFixture = join(directory, "unicode-diff.mjs")
+  writeFileSync(unicodeFixture, 'process.stdout.write("界".repeat(500000)); process.stderr.write("界".repeat(500000));')
+  const result = await _internal.spawnCodex([unicodeFixture], { env: { PATH: directory }, retainDiff: true })
+  expect(result.code).toBe(0)
+  expect(result.stdout).toBe("界".repeat(Math.floor(102404 / 3)))
+  expect(result.stderr).toBe("界".repeat(Math.floor(65536 / 3)))
+})
+
+test("bounded diff capture still times out an endless producer", async () => {
+  const endlessFixture = join(directory, "endless-diff.mjs")
+  writeFileSync(endlessFixture, 'setInterval(() => { process.stdout.write("x".repeat(65536)); process.stderr.write("n".repeat(65536)); }, 1)')
+  const children = new Set()
+  await expect(_internal.spawnCodex([endlessFixture], { env: { PATH: directory }, retainDiff: true, children, timeoutMs: 200 })).rejects.toMatchObject({ code: "CODEX_CLI_TIMEOUT" })
+  expect(children.size).toBe(0)
+})
+
 test("taskOf extracts plain task ids and URLs", () => {
   expect(_internal.taskOf("Created task_01J9ZK3F2M8Q").ref).toBe("task_01J9ZK3F2M8Q")
   expect(_internal.taskOf("queued https://chatgpt.com/codex/tasks/task_abc123").ref).toBe("task_abc123")
@@ -75,19 +145,20 @@ for (const word of ["fail", "failed", "failure", "error", "errors", "cancel", "c
 for (const word of ["expire", "expired", "expiration"]) test(`expired vocabulary: ${word}`, () => expect(_internal.stateOf(word)).toBe("expired"))
 for (const word of ["unfinished", "incomplete", "queued", "pending", "running", "working", "unknown"]) test(`nonterminal vocabulary: ${word}`, () => expect(_internal.stateOf(word)).toBe("running"))
 
-test("create argv keeps the full prompt as one argument and account metadata wins", async () => {
+test("create sends the full prompt through stdin and account metadata wins", async () => {
   const script = scripted([reply("created task_abc123")])
   const driver = _internal.makeDriver({ codexCloud: { env: "option", attempts: 2 } }, script.cli)
   const prompt = 'line one\n"quotes"; $(not-a-command) & --model other'
   const run = await driver.create({ metadata: { env: "account" } }, { prompt, model: "ignored" })
   expect(run.ref).toBe("task_abc123")
-  expect(script.calls[0].args).toEqual(["cloud", "exec", "--env", "account", "--attempts", "2", "--", prompt])
+  expect(script.calls[0].args).toEqual(["cloud", "exec", "--env", "account", "--attempts", "2", "--", "-"])
+  expect(script.calls[0].options.stdin).toBe(prompt)
   expect(driver.followUp).toBeUndefined()
 })
 test("create falls back to codexCloud.env and defaults attempts to one", async () => {
   const script = scripted([reply("task_abc123")])
   await _internal.makeDriver({ codexCloud: { env: "option" } }, script.cli).create({}, { prompt: "hi" })
-  expect(script.calls[0].args).toEqual(["cloud", "exec", "--env", "option", "--attempts", "1", "--", "hi"])
+  expect(script.calls[0].args).toEqual(["cloud", "exec", "--env", "option", "--attempts", "1", "--", "-"])
 })
 const stateFile = join(directory, ".codex-global-state.json")
 const cloudState = JSON.stringify({
@@ -298,9 +369,9 @@ test("single-turn chat creates fresh tasks with folded full history and resends 
   expect((await loader.fetch(endpoint, request(messages))).status).toBe(200)
   const creates = script.calls.filter(call => call.args[1] === "exec")
   expect(creates).toHaveLength(2)
-  expect(creates[1].args.at(-1)).toContain("fix it")
-  expect(creates[1].args.at(-1)).toContain("first answer")
-  expect(creates[1].args.at(-1)).toContain("add tests")
+  expect(creates[1].options.stdin).toContain("fix it")
+  expect(creates[1].options.stdin).toContain("first answer")
+  expect(creates[1].options.stdin).toContain("add tests")
 })
 test("static pseudo-model and guarded session header require no CLI", async () => {
   const plugin = makeCodexCloud({}, scripted([])), config = {}
