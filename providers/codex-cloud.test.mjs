@@ -668,6 +668,21 @@ test("an exit-1 [ERROR] status is a terminal failed poll, not a throw", async ()
   const script = scripted([reply(liveCaptures.error, 1)])
   expect(await _internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).toMatchObject({ state: "failed" })
 })
+// Measured live (2026-10-15): `codex cloud status <ref>` exits 1 while rendering [PENDING] for a
+// healthy in-progress task, so the recognized in-progress bracket tokens must be trusted on
+// non-zero exit exactly the way [ERROR] already is; everything else on exit 1 still throws.
+for (const token of ["PENDING", "QUEUED", "RUNNING", "WORKING", "STARTING", "IN PROGRESS"]) test(`an exit-1 [${token}] status stays a running poll, not a 502`, async () => {
+  const script = scripted([reply(`[${token}] Pong\ncodex-usage-float  •  17s ago\nno diff`, 1)])
+  expect(await _internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).toEqual({ state: "running", progress: `[${token}] Pong\ncodex-usage-float  •  17s ago\nno diff` })
+})
+test("an exit-1 unrecognized bracket status still throws 502", async () => {
+  const script = scripted([reply(liveCaptures.pending.replace("[PENDING]", "[MYSTERY]"), 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).rejects.toMatchObject({ status: 502 })
+})
+test("an exit-1 prose running status still throws 502", async () => {
+  const script = scripted([reply("task_abc123  fix the failing test  [in progress]", 1)])
+  await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).rejects.toMatchObject({ status: 502 })
+})
 test("exit-1 logged-out status output still throws 401", async () => {
   const script = scripted([reply("Not logged in", 1)])
   await expect(_internal.makeDriver({}, script.cli).poll({}, { ref: "task_abc123" })).rejects.toMatchObject({ status: 401 })

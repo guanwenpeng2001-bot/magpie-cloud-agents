@@ -101,6 +101,15 @@ function continues(rest) {
 // 2026-10-14: `[PENDING] Pong`, `[READY] Pong`, `[ERROR] Pong`, each followed by metadata lines);
 // it decides the line's state outright, and an unrecognized token stays nonterminal.
 const bracketStates = { ready: "succeeded", done: "succeeded", completed: "succeeded", succeeded: "succeeded", finished: "succeeded", error: "failed", failed: "failed", cancelled: "failed", canceled: "failed", expired: "expired", pending: "running", queued: "running", running: "running", working: "running", starting: "running", "in progress": "running" }
+// Whether stdout's first line opens with a bracket token that authoritatively means in-progress.
+// Measured live (2026-10-15): `codex cloud status <ref>` exits 1 while rendering [PENDING] for a
+// healthy task, so these tokens are trusted on non-zero exit; an unrecognized token is not.
+const leadingInProgress = text => {
+  const bracketed = /^\s*\[([A-Za-z][A-Za-z ]*)\]/.exec(text)
+  if (!bracketed) return false
+  const token = bracketed[1].trim().toLowerCase()
+  return Object.hasOwn(bracketStates, token) && bracketStates[token] === "running"
+}
 function stateOf(text, prompt = "") {
   const states = []
   const echoed = new Set(prompt.split(/\r?\n/).map(line => line.trim()).filter(Boolean))
@@ -210,10 +219,12 @@ function makeDriver(options, cli, statePaths = codexStatePaths()) {
       const result = await cli(["cloud", "status", run.ref], { signal, children: run.children })
       const progress = outputOf(result)
       // The real CLI exits 1 for a failed task while still printing a parseable status line, so a
-      // leading [ERROR] token is terminal even on non-zero exit; classified refusals keep flowing
-      // to checkExit.
+      // leading [ERROR] token is terminal even on non-zero exit, and it exits 1 for a healthy
+      // in-progress task while rendering [PENDING], so a recognized in-progress bracket token is
+      // trusted the same way; classified refusals and everything else keep flowing to checkExit.
       if (result.code !== 0 && !loggedOut(progress) && !NO_CLOUD_ENVIRONMENT.test(progress) && !STALE_ENVIRONMENT.test(progress)) {
         if (/not found|no such task/i.test(progress)) return { state: "failed", progress }
+        if (leadingInProgress(result.stdout)) return { state: "running", progress }
         if (stateOf(result.stdout, run.prompt) === "failed") return { state: "failed", progress }
       }
       checkExit(result)
