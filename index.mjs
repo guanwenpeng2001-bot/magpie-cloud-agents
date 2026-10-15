@@ -29,7 +29,7 @@ function validateOptions(options) {
   for (const name of ["apiBase", "codexCloud", "codexAgents", "cursorCloud", "devinCloud", "dots", "dotsApp", "grokBot"]) {
     if (options[name] != null) object(options[name], name)
   }
-  for (const [provider, base] of Object.entries(options.apiBase ?? {})) url(base, `apiBase.${provider}`)
+  for (const [provider, base] of Object.entries(options.apiBase ?? {})) { if (base != null) url(base, `apiBase.${provider}`) }
   if (options.codexCloud?.env != null && typeof options.codexCloud.env !== "string") invalid("codexCloud.env", "a string")
   if (options.codexCloud?.attempts != null) number(options.codexCloud.attempts, "codexCloud.attempts", false, true)
   if (options.devinCloud?.maxAcuLimit != null) number(options.devinCloud.maxAcuLimit, "devinCloud.maxAcuLimit", true)
