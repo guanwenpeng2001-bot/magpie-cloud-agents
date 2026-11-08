@@ -1,6 +1,6 @@
 # magpie-cloud-agents
 
-An installable Magpie package that exposes six vendor cloud-agent services as OpenAI-compatible chat providers: OpenAI Codex Cloud and the Codex Agents API, Cursor Cloud Agents, Devin Cloud, ChatGPT Dots, and the Grok Bot desktop app.
+An installable Magpie package that exposes seven vendor cloud-agent services as OpenAI-compatible chat providers: OpenAI Codex Cloud and the Codex Agents API, Cursor Cloud Agents, Devin Cloud, ChatGPT Dots, the Grok Bot desktop app, and Qoder Cloud Agents.
 
 **Not a one-click wrapper.** Every model in this package declares `tool_call: false`, every turn is billable cloud work on the vendor side, and the two heaviest providers require real setup on this machine or in your ChatGPT account. Read the provider sections before signing in, and never enter a real credential into a prompt meant for testing.
 
@@ -32,7 +32,7 @@ magpie plugin --json
 magpie plugin list
 ```
 
-You should see six providers, all `not signed in`. Sign-in methods and static models:
+You should see seven providers, all `not signed in`. Sign-in methods and static models:
 
 | Provider | Display name | Sign-in | Static models |
 |---|---|---|---|
@@ -42,6 +42,7 @@ You should see six providers, all `not signed in`. Sign-in methods and static mo
 | `devin-cloud` | Devin Cloud | `devin`: API key (`apk_…`); `codeium`: Codeium / Cognition credential (`cog_…`) | `devin-session` (Devin); Codeium models for `codeium` |
 | `dots` | ChatGPT Dot | Drive the signed-in ChatGPT desktop app (default), or bundled tunnel plus a one-time connector paste | `dot` |
 | `grok-bot` | Grok Bot (xAI desktop) | OAuth auto flows: drive the installed app (default), or direct Connect protocol | `app-bot` |
+| `qoder-cloud` | Qoder Cloud Agents | Qoder personal access token (PAT) | `ultimate`, `auto` |
 
 Remove with `magpie plugin rm <the exact spec you added>`. `dots` and `grok-bot` expose no API-key method; `dots` offers app-drive first (the default) and tunnel setup second.
 
@@ -57,7 +58,7 @@ A session-affinity header `x-magpie-cloud-agents-session` ties follow-up turns t
 
 ## Options
 
-Set package options with `magpie plugin options <spec> '<json>'`. Every entry function validates the shared options before calling its provider factory. **One invalid known configuration value rejects the entire spec: all six providers fail to load**, even when the invalid option belongs to just one provider. Errors identify the option path. Unrecognized ordinary option properties are ignored, so a typo can silently leave the default in effect. However, every non-null entry under `apiBase` is validated as an absolute HTTP(S) URL even if its provider key is unknown; an invalid value there also rejects the entire spec and prevents all six providers from loading.
+Set package options with `magpie plugin options <spec> '<json>'`. Every entry function validates the shared options before calling its provider factory. **One invalid known configuration value rejects the entire spec: all seven providers fail to load**, even when the invalid option belongs to just one provider. Errors identify the option path. Unrecognized ordinary option properties are ignored, so a typo can silently leave the default in effect. However, every non-null entry under `apiBase` is validated as an absolute HTTP(S) URL even if its provider key is unknown; an invalid value there also rejects the entire spec and prevents all seven providers from loading.
 
 Validation follows each provider's unset/default semantics: for example, `codexCloud.env` accepts `null`, an empty string or whitespace to allow discovery; `apiBase.<provider>` accepts `null` as unset but rejects an empty string; `dots.publicUrl` and `dots.tunnelCommand` accept `null` or `""` as unset, but reject whitespace-only strings. Empty strings are not a universal way to clear numeric or URL options.
 
@@ -70,7 +71,7 @@ Available options:
 | `progress` | `true` | Emit progress chunks as `reasoning_content` |
 | `maxRunMinutes` | `30` | Per-run cap; expiry returns HTTP 504 with a rejoin instruction |
 | `maxPromptBytes` | `262144` | Fold cap; see How a turn works |
-| `apiBase` | provider-id map | Override the vendor base URL (used by `codex-agents`, `cursor-cloud`, `devin-cloud`) |
+| `apiBase` | provider-id map | Override the vendor base URL (used by `codex-agents`, `cursor-cloud`, `devin-cloud`, `qoder-cloud`) |
 | `codexCloud.env` / `codexCloud.attempts` | — / `1` | Environment id override (after account/input `env`, before discovery) / `--attempts` passed to `codex cloud exec` |
 | `cursorCloud.repos` | — | Repositories sent with agent creation |
 | `devinCloud.maxAcuLimit` | — | `max_acu_limit` sent with session creation; `0` or omitted leaves Devin's default |
@@ -85,6 +86,8 @@ Available options:
 | `grokBot.keepAliveMinutes` | `1` | Idle minutes before Magpie closes an app instance it launched itself |
 | `grokBot.launchTimeoutMs` | `10000` | How long app launch may take |
 | `grokBot.ghostMode` | `true` | `x-ghost-mode: true` header on direct-protocol requests |
+| `qoderCloud.agentId` / `qoderCloud.environmentId` | auto-provisioned | Reuse an existing Qoder agent / environment instead of find-or-create by name |
+| `qoderCloud.selfHosted` | — (cloud) | `{ cwd, tools? }`: run in Qoder's self-hosted mode — model in Qoder cloud, tools executed **on this machine** under `cwd`. See the provider section |
 
 CDP debug ports have no authentication: while a port is open, any local process can control the signed-in app, read its content, and submit requests as you. Loopback binding prevents remote access but does not isolate other local programs. Both app drivers disconnect after one idle minute by default; configure `dotsApp.keepAliveMinutes` or `grokBot.keepAliveMinutes` to change this interval. Active turns prevent idle cleanup. Normal host shutdown disposes connections and stops only identity-verified managed processes; forced termination cannot run cleanup. Attaching to an app you started never closes that app or its debug port, so quit that app yourself when debugging is no longer needed.
 
@@ -191,6 +194,19 @@ When no debug-enabled window is available, Magpie opens a tagged managed window 
 
 **Mechanism 2: direct Connect protocol.** **Account risk: this mode (`grok-bot-direct` / token path) uses the app's web-session credential to access undocumented interfaces. It may violate the vendor's Terms of Service and lead to account suspension or a ban. Prefer the default CDP app-drive mode (`grok-bot`).** Reads the installed app's sealed sign-in from its profile and speaks the app's own protocol to its backend, with redirects refused and the host pinned. It is the more fragile of the two: the protocol tables were recovered from the app bundle, not documented, and can break on an app update. Under your explicit authorization, the plugin unwraps the credential in memory and does not persist the decrypted token to disk. It clears the mutable unwrapped key buffers after decryption, but caches the token buffer for reuse until refresh or disposal, when that buffer is zeroed. Authorization headers also create JavaScript string copies that cannot be reliably zeroed; this is not a guarantee that all secret copies are erased from memory. Shared session maps remove references on expiry or eviction rather than overwriting their stored values. Under that authorization, one read-only bot listing succeeded against the live service; send, cancel and transcript-entry response shapes remain unverified, and the first real send is their test. The same completion caveat applies: a paused bot's partial answer may be delivered as final when the transcript stops growing.
 
+### qoder-cloud — Qoder Cloud Agents
+
+Uses the official `qca-sdk` ManagedClient against `https://api.qoder.com/api/v1/cloud` (override with `apiBase["qoder-cloud"]`). **Billing:** every turn runs a real cloud session billed in Qoder credits; check spend in Qoder's own surfaces.
+
+**Sign in.** `magpie plugin login qoder-cloud` with a Qoder personal access token (qoder.com → settings → PAT).
+
+**Provisioning.** Sessions require an agent and an environment. Unless `qoderCloud.agentId` / `qoderCloud.environmentId` pin existing ones, the driver finds-or-creates them by fixed names (`magpie-cloud-agents:<model>` and `magpie-cloud-agents:cloud` / `:self-hosted`), with `always_allow` permission policy so turns never pause on tool confirmations this plugin cannot answer. Provisioned ids are cached per credential for an hour. The cloud environment is created with `networking: unrestricted` — Qoder otherwise defaults to limited networking silently.
+
+**Per turn.** A session is created with the folded prompt as `initial_events`; follow-ups on an idle session send only the new user messages. Events stream over the SDK's resumable SSE (cursor-resumed) with polling fallback; `session.status_idle` + `end_turn` completes the turn, the last `agent.message` is the answer. `session.error` with a non-retrying status, `requires_action`, and cancellation are terminal failures with the session id in the message. Cancellation calls Qoder's session-cancel endpoint.
+
+**Self-hosted (opt-in).** Set `qoderCloud.selfHosted: { "cwd": "/abs/path", "tools": ["bash","read","glob","grep"] }` (tools default to those four). The environment becomes `self_hosted`: Qoder runs the model, this plugin executes `agent.tool_use` events locally under `cwd` and posts `user.tool_result` back. **This executes model-generated commands on your machine** — bash is not sandboxed beyond a 2-minute kill timer; file tools are symlink-aware confined to `cwd`; unknown/disabled tools get an error result instead of hanging the session. The Work API (poll/ack/heartbeat) is not used; the event loop alone drives execution, matching the pattern proven by Qoder's own BYOC examples. Self-hosted environments support no session resources or environment variables.
+
+
 ## Verify without credentials
 
 ```sh
@@ -200,7 +216,7 @@ bun scripts/fake-cloud.mjs --self-test
 bun test
 ```
 
-`scripts/check.mjs` loads `index.mjs` exactly as the host does and checks the shape of every provider: exports, auth hooks, sign-in methods, config output, static models and the `tool_call: false` declaration — all six providers. `--stubs` additionally installs sentinels over `child_process`, `fetch` and `WebSocket`, drives every provider's loader with incomplete and synthetic credentials, and walks each OAuth authorize/callback, asserting that no provider reaches outside the process and that `grok-bot` fails closed when the app is absent.
+`scripts/check.mjs` loads `index.mjs` exactly as the host does and checks the shape of every provider: exports, auth hooks, sign-in methods, config output, static models and the `tool_call: false` declaration — all seven providers. `--stubs` additionally installs sentinels over `child_process`, `fetch` and `WebSocket`, drives every provider's loader with incomplete and synthetic credentials, and walks each OAuth authorize/callback, asserting that no provider reaches outside the process and that `grok-bot` fails closed when the app is absent.
 
 Shared-runtime tests are included: `bun test` discovers co-located `*.test.mjs` suites across `lib/`, `providers/` and `scripts/`, covering package checks and fixtures as well as the request-emulation core, transcript folding, session maps, and each provider's driver, queue, tunnel, CDP, direct and token paths.
 
@@ -238,6 +254,7 @@ Everything below is unverified, stated plainly. None of it was tested, and nothi
 | Whether your ChatGPT account has Dots enabled | Not checkable from this machine | Your setup; sign-in fails with the no-Dot message |
 | ChatGPT connector acceptance and subscription renewal | Needs a real connector | Your setup; renewal is the 24-hour cycle above |
 | Real Cloudflare download, proxy/antivirus behaviour and the real binary checksum | No binary was downloaded during development; the pin matches the published digest | Your first sign-in |
+| ~~Qoder live session shapes~~ | **Live-verified with a real PAT**: cloud turn, same-session follow-up (codeword recall), live model list, and a self-hosted Bash round-trip (cloud model read a local marker file via the event loop, no Work API) all passed | done |
 | Real public edge connectivity | No tunnel was started | Your first sign-in health check |
 | Real gateway removal on logout and forced-exit child cleanup | No real host teardown was exercised | `magpie plugin logout dots` on your machine |
 | The CDP send path (`desktopMount.submitPrompt` dispatch) | Designed and identified; never exercised against an account | One authorized test send |
@@ -281,7 +298,7 @@ magpie plugin --json
 magpie plugin list
 ```
 
-应看到六个 provider，均为 `not signed in`。登录方式与静态模型：
+应看到七个 provider，均为 `not signed in`。登录方式与静态模型：
 
 | Provider | 显示名 | 登录方式 | 静态模型 |
 |---|---|---|---|
@@ -291,6 +308,7 @@ magpie plugin list
 | `devin-cloud` | Devin Cloud | `devin`：API key（`apk_…`）；`codeium`：Codeium / Cognition 凭据（`cog_…`） | `devin-session`（Devin）；`codeium` 使用 Codeium 模型 |
 | `dots` | ChatGPT Dot | 驱动已登录的 ChatGPT 桌面应用（默认），或内置隧道加一次性连接器配置 | `dot` |
 | `grok-bot` | Grok Bot (xAI desktop) | OAuth 自动流程：驱动已装应用（默认）或直连 Connect 协议 | `app-bot` |
+| `qoder-cloud` | Qoder Cloud Agents | Qoder 个人访问令牌（PAT） | `ultimate`、`auto` |
 
 卸载使用 `magpie plugin rm <你添加时输入的原样 spec>`。`dots` 与 `grok-bot` 没有 API-key 登录方式；`dots` 首先提供 app-drive（默认），其次是隧道设置流程。
 
@@ -306,7 +324,7 @@ magpie plugin list
 
 ### 选项
 
-通过 `magpie plugin options <spec> '<json>'` 设置包选项。每个入口函数都会先校验共享选项，再调用 provider 工厂。**一个已知配置项的值无效，就会拒绝整个 spec，导致全部六个 provider 加载失败**，即使该选项只属于其中一个 provider。错误会指出选项路径。普通的未知选项属性会被忽略，拼写错误可能让默认值继续生效。但 `apiBase` 下每个非 null 条目都会接受绝对 HTTP(S) URL 校验，即使其 provider 键不被识别；其中的无效值同样会拒绝整个 spec，导致全部六个 provider 加载失败。
+通过 `magpie plugin options <spec> '<json>'` 设置包选项。每个入口函数都会先校验共享选项，再调用 provider 工厂。**一个已知配置项的值无效，就会拒绝整个 spec，导致全部七个 provider 加载失败**，即使该选项只属于其中一个 provider。错误会指出选项路径。普通的未知选项属性会被忽略，拼写错误可能让默认值继续生效。但 `apiBase` 下每个非 null 条目都会接受绝对 HTTP(S) URL 校验，即使其 provider 键不被识别；其中的无效值同样会拒绝整个 spec，导致全部七个 provider 加载失败。
 
 入口校验遵循各 provider 的 unset/默认值语义：例如 `codexCloud.env` 接受 `null`、空串或纯空白字符串以允许发现环境；`apiBase.<provider>` 接受 `null` 作为未设置，但拒绝空串；`dots.publicUrl` 与 `dots.tunnelCommand` 接受 `null` 或 `""` 作为未设置，但拒绝纯空白字符串。不能把空串当作清空所有数值或 URL 选项的通用方式。
 
@@ -319,7 +337,7 @@ magpie plugin list
 | `progress` | `true` | 以 `reasoning_content` 输出进度块 |
 | `maxRunMinutes` | `30` | 单次运行上限；超时返回 HTTP 504 并附重连指引 |
 | `maxPromptBytes` | `262144` | 折叠上限；见上一节 |
-| `apiBase` | 按 provider 的映射 | 覆盖厂商基础 URL（`codex-agents`、`cursor-cloud`、`devin-cloud` 使用） |
+| `apiBase` | 按 provider 的映射 | 覆盖厂商基础 URL（`codex-agents`、`cursor-cloud`、`devin-cloud`、`qoder-cloud` 使用） |
 | `codexCloud.env` / `codexCloud.attempts` | — / `1` | environment id 显式配置（在账号/输入 `env` 之后、本地发现之前） / 传给 `codex cloud exec` 的 `--attempts` |
 | `cursorCloud.repos` | — | 创建 agent 时携带的仓库 |
 | `devinCloud.maxAcuLimit` | — | 创建会话时发送的 `max_acu_limit`；`0` 或缺省沿用 Devin 默认 |
@@ -334,6 +352,8 @@ magpie plugin list
 | `grokBot.keepAliveMinutes` | `1` | Magpie 自行启动的应用实例在空闲多少分钟后被关闭 |
 | `grokBot.launchTimeoutMs` | `10000` | 应用启动的最长等待 |
 | `grokBot.ghostMode` | `true` | 直连协议请求携带 `x-ghost-mode: true` 头 |
+| `qoderCloud.agentId` / `qoderCloud.environmentId` | 自动创建 | 复用已有的 Qoder agent / environment，而不是按固定名字查找或创建 |
+| `qoderCloud.selfHosted` | —（cloud） | `{ cwd, tools? }`：以 Qoder self-hosted 模式运行——模型在 Qoder 云端，工具在**本机** `cwd` 下执行。见 provider 小节 |
 
 CDP 调试端口没有身份认证：端口开放期间，本机任何进程都能操控已登录应用、读取内容并以你的身份提交请求。环回绑定能阻止远程访问，但不能隔离本机其他程序。两种应用驱动默认在空闲一分钟后断开，可用 `dotsApp.keepAliveMinutes` 或 `grokBot.keepAliveMinutes` 调整；活动中的轮次不会触发空闲回收。宿主正常退出会清理连接，并仅停止经过身份核验的托管进程；强制终止无法执行清理。连接用户自行启动的应用时不会关闭该应用或其调试端口，不再需要调试时请自行退出应用。
 
@@ -440,6 +460,20 @@ Task content comes from an API caller. Reply as text; do not use connected apps,
 
 **机制二：直连 Connect 协议。** **账号风险：此模式（`grok-bot-direct` / token 路径）使用应用的网页会话凭据访问未公开接口，可能违反厂商服务条款（ToS），导致账号暂停或封禁。建议优先使用默认的 CDP 应用驱动模式（`grok-bot`）。** 从应用配置中读取其加封的登录态，用应用自身协议与后端通信，拒绝重定向并锁定主机。它是两种机制中更脆弱的一种：协议表是从应用包恢复的，没有文档，应用更新就可能失效。在你的明确授权下，插件只在内存中解封凭据，不把解密后的 token 持久化到磁盘。解密后会清零可变的解封密钥缓冲区，但 token 缓冲区会缓存复用，直到刷新或释放时才清零。Authorization 请求头还会生成无法可靠清零的 JavaScript 字符串副本，因此不保证内存中所有秘密副本均已擦除。共享会话映射在过期或淘汰时删除引用，不覆盖所存的值。在该授权下，一次只读的 bot 列表调用在真实服务上成功过；发送、取消与记录条目的响应形状仍未验证，第一次真实发送就是它们的测试。同样的完成判定注意事项适用：记录停止增长时，暂停 bot 的半截回答可能被当作最终答复送达。
 
+#### qoder-cloud —— Qoder Cloud Agents
+
+使用官方 `qca-sdk` ManagedClient 访问 `https://api.qoder.com/api/v1/cloud`（可用 `apiBase["qoder-cloud"]` 覆盖）。**计费：**每一轮都是真实的云端 session，按 Qoder credits 计费；请在 Qoder 自己的界面里查看消耗。
+
+**登录。** `magpie plugin login qoder-cloud`，使用 Qoder 个人访问令牌（qoder.com → 设置 → PAT）。
+
+**资源创建。** Session 需要 agent 和 environment。除非用 `qoderCloud.agentId` / `qoderCloud.environmentId` 指定已有资源，驱动器按固定名字查找或创建（`magpie-cloud-agents:<model>` 与 `magpie-cloud-agents:cloud` / `:self-hosted`），权限策略为 `always_allow`，避免轮次停在本插件无法应答的工具确认上。创建出的 id 按凭据缓存一小时。Cloud 环境显式以 `networking: unrestricted` 创建——否则 Qoder 会静默默认受限网络。
+
+**每轮行为。** 折叠提示词作为 `initial_events` 创建 session；空闲 session 上的后续轮只发送新增用户消息。事件经 SDK 的可恢复 SSE（按游标续传）流式读取，轮询兜底；`session.status_idle` + `end_turn` 结束轮次，最后一条 `agent.message` 即答复。非重试态的 `session.error`、`requires_action` 与取消都是终局失败，消息中带 session id。取消调用 Qoder 的 session-cancel 端点。
+
+**Self-hosted（显式启用）。** 设置 `qoderCloud.selfHosted: { "cwd": "/abs/path", "tools": ["bash","read","glob","grep"] }`（tools 默认即这四个）。环境变为 `self_hosted`：模型在 Qoder 云端推理，本插件在本机 `cwd` 下执行 `agent.tool_use` 事件并回贴 `user.tool_result`。**这会在你的机器上执行模型生成的命令**——bash 除 2 分钟强杀定时器外没有沙箱；文件工具以 symlink 感知的方式圈定在 `cwd` 内；未知/未启用工具返回错误结果而不是挂起会话。不使用 Work API（poll/ack/heartbeat）；纯事件循环驱动执行，与 Qoder 官方 BYOC 示例验证过的模式一致。Self-hosted 环境不支持 session resources 与环境变量。
+
+**已实测（真实 PAT）：**cloud 轮次、同 session 后续轮（暗号回忆）、在线模型列表、self-hosted Bash 往返（云端模型经事件循环读取本地标记文件，未用 Work API）全部通过。
+
 ### 无凭据验证
 
 ```sh
@@ -449,7 +483,7 @@ bun scripts/fake-cloud.mjs --self-test
 bun test
 ```
 
-`scripts/check.mjs` 按宿主的方式加载 `index.mjs`，检查每个 provider 的形状：导出、auth 钩子、登录方式、config 输出、静态模型与 `tool_call: false` 声明——覆盖全部六个 provider。`--stubs` 额外在 `child_process`、`fetch` 与 `WebSocket` 上安装哨兵，用不完整与合成的凭据驱动每个 provider 的 loader，并遍历每个 OAuth authorize/callback，断言没有 provider 越出进程之外，且 `grok-bot` 在应用缺席时明确失败。
+`scripts/check.mjs` 按宿主的方式加载 `index.mjs`，检查每个 provider 的形状：导出、auth 钩子、登录方式、config 输出、静态模型与 `tool_call: false` 声明——覆盖全部七个 provider。`--stubs` 额外在 `child_process`、`fetch` 与 `WebSocket` 上安装哨兵，用不完整与合成的凭据驱动每个 provider 的 loader，并遍历每个 OAuth authorize/callback，断言没有 provider 越出进程之外，且 `grok-bot` 在应用缺席时明确失败。
 
 本包含共享运行时测试：`bun test` 发现并运行 `lib/`、`providers/` 与 `scripts/` 下共置的 `*.test.mjs` 套件，覆盖包检查与测试夹具，以及请求仿真核心、记录折叠、会话映射，以及各 provider 的驱动器、队列、隧道、CDP、直连与 token 路径。
 

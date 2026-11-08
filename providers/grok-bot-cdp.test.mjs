@@ -409,7 +409,7 @@ test("review F2 implemented gate distinguishes missing installation from scaffol
   const gate = Bun.spawn([process.execPath, "scripts/check.mjs", "--stubs"], { stdout: "pipe", stderr: "pipe", env: { ...process.env, MAGPIE_CLOUD_AGENTS_DEBUG: "0", ProgramFiles: "Z:\\missing", LOCALAPPDATA: "Z:\\missing", PATH: "Z:\\missing" } })
   const output = await new Response(gate.stdout).text(); const errors = await new Response(gate.stderr).text()
   expect({ code: await gate.exited, errors }).toEqual({ code: 0, errors: "" })
-  expect(output).toContain("implemented: grok-bot; scaffold: 5")
+  expect(output).toContain("implemented: grok-bot; scaffold: 6")
 })
 
 test("launched process identity is pinned before PID reuse", async () => {
