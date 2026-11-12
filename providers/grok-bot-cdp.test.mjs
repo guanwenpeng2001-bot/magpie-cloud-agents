@@ -684,3 +684,30 @@ test("CDP sign-in verifies installation and launches a local managed window", as
     expect(fake.spawns).toHaveLength(1)
   } finally { fake.close() }
 })
+
+test("darwin teardown refuses untagged, malformed and changed process identities", async () => {
+  const tag = "999:12345678-1234-4234-8234-123456789abc"
+  const executable = "/Applications/Grok Bot.app/Contents/MacOS/Grok Bot"
+  for (const managedTag of [undefined, "bad", tag]) {
+    const stdout = `321 Tue Oct 27 18:48:37 2026 ${executable}${managedTag ? ` --magpie-grok-managed=${managedTag}` : ""}`
+    const killed = []
+    const stopper = processDependencies("Grok Bot.exe", "magpie-grok-managed", {
+      platform: "darwin", executeProcess: async () => ({ stdout }), spawnProcess: () => ({ stdout }),
+      killProcess: (...args) => killed.push(args),
+    })
+    const [row] = await stopper.processes()
+    const candidates = managedTag === tag
+      ? [{ ...row, pid: 322 }, { ...row, executable: "/other" }, { ...row, created: "changed" }, { ...row, managedTag: "998:12345678-1234-4234-8234-123456789abc" }]
+      : [row]
+    for (const candidate of candidates) {
+      await stopper.stopManaged(candidate)
+      stopper.stopManagedSync(candidate)
+    }
+    expect(killed).toEqual([])
+    if (managedTag === tag) {
+      await stopper.stopManaged(row)
+      stopper.stopManagedSync(row)
+      expect(killed).toEqual([[321, "SIGTERM"], [321, "SIGTERM"]])
+    }
+  }
+})
