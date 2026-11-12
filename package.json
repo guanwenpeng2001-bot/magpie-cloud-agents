@@ -1,6 +1,6 @@
 {
   "name": "magpie-cloud-agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Seven vendor cloud agents as Magpie providers: OpenAI Codex Cloud and the Codex Agents API, Cursor Cloud Agents, Devin Cloud, ChatGPT Dots, the Grok Bot desktop app, and Qoder Cloud Agents.",
   "type": "module",
   "main": "./index.mjs",
