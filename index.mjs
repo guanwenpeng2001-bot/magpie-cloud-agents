@@ -4,6 +4,7 @@ import { makeCursorCloud } from "./providers/cursor-cloud.mjs"
 import { makeDevinCloud } from "./providers/devin-cloud.mjs"
 import { makeDotsDriver } from "./providers/dots.mjs"
 import { makeGrokBotDriver } from "./providers/grok-bot.mjs"
+import { makeQoderCloud } from "./providers/qoder-cloud.mjs"
 
 import { debug } from "./lib/log.mjs"
 
@@ -26,7 +27,7 @@ function validateOptions(options) {
   if (options.progress != null && typeof options.progress !== "boolean") invalid("progress", "a boolean")
   if (options.maxRunMinutes != null) number(options.maxRunMinutes, "maxRunMinutes")
   if (options.maxPromptBytes != null) number(options.maxPromptBytes, "maxPromptBytes", false, true)
-  for (const name of ["apiBase", "codexCloud", "codexAgents", "cursorCloud", "devinCloud", "dots", "dotsApp", "grokBot"]) {
+  for (const name of ["apiBase", "codexCloud", "codexAgents", "cursorCloud", "devinCloud", "dots", "dotsApp", "grokBot", "qoderCloud"]) {
     if (options[name] != null) object(options[name], name)
   }
   for (const [provider, base] of Object.entries(options.apiBase ?? {})) { if (base != null) url(base, `apiBase.${provider}`) }
@@ -45,6 +46,16 @@ function validateOptions(options) {
     if (settings.reattachPorts != null && (!Array.isArray(settings.reattachPorts) || settings.reattachPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535))) invalid(`${name}.reattachPorts`, "an array of ports from 1 to 65535")
   }
   if (options.grokBot?.ghostMode != null && typeof options.grokBot.ghostMode !== "boolean") invalid("grokBot.ghostMode", "a boolean")
+  for (const name of ["qoderCloud"]) {
+    const settings = options[name]
+    if (settings == null) continue
+    for (const key of ["agentId", "environmentId"]) if (settings[key] != null) text(settings[key], `${name}.${key}`)
+    if (settings.selfHosted != null) {
+      object(settings.selfHosted, `${name}.selfHosted`)
+      text(settings.selfHosted.cwd, `${name}.selfHosted.cwd`)
+      if (settings.selfHosted.tools != null && (!Array.isArray(settings.selfHosted.tools) || !settings.selfHosted.tools.length || settings.selfHosted.tools.some(tool => !["bash", "read", "glob", "grep"].includes(String(tool).toLowerCase())))) invalid(`${name}.selfHosted.tools`, "a non-empty array of bash/read/glob/grep")
+    }
+  }
   const dots = options.dots ?? options
   const prefix = options.dots ? "dots." : ""
   if (dots.taskTtlMinutes != null) number(dots.taskTtlMinutes, `${prefix}taskTtlMinutes`)
@@ -76,5 +87,6 @@ export async function CursorCloudPlugin(input, options) { return initialize("cur
 export async function DevinCloudPlugin(input, options) { return initialize("devin-cloud", options, makeDevinCloud) }
 export async function DotsPlugin(input, options) { return initialize("dots", options, settings => makeDotsDriver(input, settings)) }
 export async function GrokBotPlugin(input, options) { return initialize("grok-bot", options, settings => makeGrokBotDriver(input, settings)) }
+export async function QoderCloudPlugin(input, options) { return initialize("qoder-cloud", options, makeQoderCloud) }
 
 export const _internal = {}

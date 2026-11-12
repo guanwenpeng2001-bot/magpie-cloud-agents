@@ -2,7 +2,7 @@
 // does and checks the shape of what each plugin function returns: the
 // assertions the community gate enforces (auth.provider, auth.loader,
 // non-empty auth.methods with authorize on every oauth entry, config
-// producing npm + non-empty models) plus, for this package, the six
+// producing npm + non-empty models) plus, for this package, the seven
 // expected provider ids with their display names and static models, and
 // the no-helper-export rule (S1: an exported helper is invoked as a plugin
 // and its throw poisons the load — internals hang off `_internal`).
@@ -43,6 +43,11 @@ const EXPECTED = {
     id: "grok-bot",
     name: "Grok Bot (xAI desktop)",
     models: { "app-bot": "App bot (the currently selected bot)" },
+  },
+  QoderCloudPlugin: {
+    id: "qoder-cloud",
+    name: "Qoder Cloud Agents",
+    models: { ultimate: "Qoder Ultimate", auto: "Qoder Auto" },
   },
 }
 
@@ -133,7 +138,7 @@ for (const [fnName, fn] of Object.entries(mod)) {
       const response = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "app-bot", messages: [{ role: "user", content: "gate" }] }) })
       if (response.status !== 502 || response.headers.get("X-Magpie-Sign-In") !== "kept" || (await response.json()).error.message !== result.error) throw new Error("implemented transport error contract failed")
       if ((await (await isolated.auth.methods[1].authorize()).callback()).type !== "failed" || operations !== 0) throw new Error("implemented transport isolation failed")
-      console.log("implemented: grok-bot; scaffold: 5 candidates checked by sandbox behavior; app operations: 0")
+      console.log("implemented: grok-bot; scaffold: 6 candidates checked by sandbox behavior; app operations: 0")
     } else if (process.argv.includes("--stubs")) {
       const credential = auth.methods[0].type === "api" ? { type: "api", key: "sandbox-only" } : { type: "oauth", env: "sandbox" }
       const loader = await auth.loader(async () => credential)

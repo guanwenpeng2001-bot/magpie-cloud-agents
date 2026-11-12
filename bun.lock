@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "magpie-cloud-agents",
+      "dependencies": {
+        "qca-sdk": "0.15.0",
+      },
+    },
+  },
+  "packages": {
+    "qca-sdk": ["qca-sdk@0.15.0", "", { "dependencies": { "ws": "^8.22.0" } }, "sha512-lhE42qXe+CYzjuKgvkqeiy4V/v2VRyR6U2NwPFl1dqXRmdhUikyOLzqH8XkK2LG/DFHhr/Bv9nabDolLLow3iQ=="],
+
+    "ws": ["ws@8.22.1", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-oyL6OPYme/CmiFvNuGzeoxCJ4nOrZE2O1FwM9MWM1AsGri6nLXB2pg+lNA8aLeXMSav0J6eIVS1j6vUPzUtK9g=="],
+  }
+}
